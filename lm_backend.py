@@ -125,6 +125,8 @@ LEAK_PHRASES = (
 )
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
+_REASONING_START = re.compile(
+    r"\s*(thinking process|thought process|analyze the request|reasoning:)", re.I)
 _SENT_SPLIT = re.compile(r"(?<=[.!?…])\s+|\n+")
 _PAIR = re.compile(r"«[^»]*»\s*→\s*«[^»]*»")
 _LEAK = re.compile("|".join(re.escape(p) for p in LEAK_PHRASES), re.I)
@@ -168,8 +170,24 @@ def clean_reply(text, forbidden=None):
     text = _THINK_BLOCK.sub("", str(text or ""))
     if re.search(r"<think>", text, re.I):
         text = re.split(r"<think>", text, maxsplit=1, flags=re.I)[0]
+    # Qwen-модели часто выводят рассуждение без тегов: «Thinking Process: ...».
+    # Если есть закрывающий тег — берём всё после него; иначе ответа нет.
+    if re.search(r"</think>", text, re.I):
+        text = re.split(r"</think>", text, flags=re.I)[-1]
+    elif _REASONING_START.match(text):
+        return ""
     text = strip_leaks(text, forbidden)
     return _LABEL.sub("", text, count=1).strip()
+
+
+RAW_CHATML = os.environ.get("BRAIN_LM_RAW_CHATML", "1") != "0"
+
+
+def chatml_prompt(messages):
+    """Промпт в формате ChatML с пустым блоком рассуждения для ответа."""
+    parts = [f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages]
+    parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    return "".join(parts)
 
 
 def _finish(text, truncated):
@@ -260,6 +278,28 @@ class LMBackend:
     # ---------- потоковая генерация ----------
 
     def _stream_llamacpp(self, messages, should_stop):
+        if RAW_CHATML:
+            # Пустой блок <think> в конце промпта отключает рассуждение у Qwen3-подобных
+            # моделей. Иначе модель пишет «Thinking Process…», а ответ полностью вырезается.
+            it = self.llm.create_completion(
+                prompt=chatml_prompt(messages),
+                max_tokens=RUNTIME["max_tokens"],
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+                stream=True,
+                repeat_penalty=1.1,
+                stop=["<|im_end|>", "<|endoftext|>"],
+            )
+            for chunk in it:
+                if should_stop():
+                    break
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("text") or ""
+                if delta:
+                    yield delta
+            return
         it = self.llm.create_chat_completion(
             messages=messages,
             max_tokens=RUNTIME["max_tokens"],
@@ -287,6 +327,7 @@ class LMBackend:
                 "temperature": TEMPERATURE,
                 "top_p": TOP_P,
                 "stream": True,
+                "chat_template_kwargs": {"enable_thinking": False},
             },
             ensure_ascii=False,
         ).encode("utf-8")

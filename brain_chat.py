@@ -45,7 +45,7 @@ GROUP_W = 1.2
 
 # ---- уровень 3: адаптация всей сети ----
 ADAPT_UP = 0.04
-ADAPT_DOWN = 0.01
+ADAPT_DOWN = 0.002
 REGROUP_EVERY = 20
 
 THRESH = 1.0
@@ -57,7 +57,9 @@ SPARK_P = 0.06
 ISO_LIMIT = 60
 PRUNE = 0.06
 HEBB_RATE = 0.05
-LINK_DECAY = 0.995
+# Затухание за один вызов step() (вызывается каждый кадр): ~0.988 в секунду при 60 FPS,
+# связь без подкрепления уходит к PRUNE примерно за 3 минуты.
+LINK_DECAY = 0.9998
 SIM_DT = 0.1
 TIMELINE = 10.0
 MAX_WORDS = 12
@@ -730,7 +732,7 @@ class Brain:
     def consolidate(self):
         pruned = 0
         for k in list(self.links):
-            w = self.links[k] * 0.95
+            w = self.links[k] * 0.98
             if w < PRUNE:
                 del self.links[k]
                 pruned += 1
@@ -1390,6 +1392,9 @@ def main():
                             sys_msg("Нет последнего ответа.")
                         elif msg == "/good":
                             brain._reinforce_answer(last_answer)
+                            if last_user_msg:
+                                # связь вопрос→ответ: создаётся, если её не было
+                                brain.train_words(tokenize(last_user_msg, limit=None) + last_answer)
                             if last_lm is not None:
                                 LMBackend.log_feedback(last_lm[0], last_lm[1], +1)
                                 episodes.add(last_lm[0], last_lm[1])

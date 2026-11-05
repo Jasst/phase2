@@ -26,6 +26,13 @@ STABLE = 0.6                  # доля совпадения, при котор
 LEARN_MIN = 0.12              # ниже этого оценки ответ не обучает граф
 REVISE_ROUNDS = max(0, int(os.environ.get("BRAIN_REVISE", "1")))
 W_SUPPORT, W_STAB, W_LEN = 0.5, 0.3, 0.2
+# Мысль подсказывается LM только если она опирается на граф вопроса.
+# Иначе случайные ассоциации сбивают модель и попадают в ответ.
+HINT_MIN_SUPPORT = float(os.environ.get("BRAIN_HINT_MIN", "0.15"))
+# Приветствия и small talk не нуждаются в графе.
+_GREET = re.compile(
+    r"^\s*(привет|здравствуй\w*|добрый\s+(день|вечер|утро)|доброе\s+утро|хай|hi|hello)\b",
+    re.I)
 
 _WORD = re.compile(r"[^\W_]+")
 
@@ -115,7 +122,12 @@ class Answerer:
         return self.mind.support(seeds, tokens(text))
 
     def begin(self, question, target):
-        thought, seeds = self.think(question, target)
+        if _GREET.match(str(question)):
+            thought, seeds = None, []
+        else:
+            thought, seeds = self.think(question, target)
+            if thought is not None and thought.support < HINT_MIN_SUPPORT:
+                thought = None
         return {"q": question, "seeds": seeds, "thought": thought, "stage": 0,
                 "best": None, "best_score": -1.0}
 
@@ -159,8 +171,8 @@ class Answerer:
             words = st["thought"].words
         else:
             return None
-        if words and score >= LEARN_MIN:
-            self.learn(st["q"], words)
+        # Автообучения нет: непроверенный ответ (LM или граф) не закрепляется.
+        # Закрепление только по явному /good или /teach (см. learn()).
         return text, score, from_lm
 
     def learn(self, question, words):
