@@ -54,11 +54,31 @@ def _env_float(name, default):
         return float(default)
 
 
+def _norm_path(path):
+    """Нормализует путь к модели: убирает лишние пробелы/кавычки и двойные backslash'и.
+
+    В Python r"..." уже означает «сырая» строка, поэтому писать в ней `\\\\` не нужно —
+    получается буквальный путь с двумя символами `\\`, который Windows не находит.
+    """
+    path = str(path).strip().strip('"').strip("'")
+    while "\\\\" in path:            # E:\\\\models -> E:\models
+        path = path.replace("\\\\", "\\")
+    return os.path.normpath(path) if path else path
+
+
 BACKEND = os.environ.get("BRAIN_LM_BACKEND", "llamacpp").strip().lower()
-MODEL_PATH = os.environ.get(
+MODEL_PATH = _norm_path(os.environ.get(
     "BRAIN_LM_PATH",
-    r"E:\\models\\lmstudio-community\\Qwen3.5-9B-GGUF\\Qwen3.5-9B-Q8_0.gguf",
-)
+    r"E:\models\lmstudio-community\Qwen3.5-9B-GGUF\Qwen3.5-9B-Q8_0.gguf",
+))
+# Если путь всё равно не найден (например, диск E: недоступен), пробуем найти модель
+# среди подключённых дисков по относительной части пути.
+if BACKEND == "llamacpp" and not os.path.isfile(MODEL_PATH):
+    for _drive in ("C:", "D:", "E:", "F:"):
+        _cand = _norm_path(_drive + "\\" + MODEL_PATH.split(":", 1)[-1].lstrip("\\/"))
+        if _cand != MODEL_PATH and os.path.isfile(_cand):
+            MODEL_PATH = _cand
+            break
 N_CTX = _env_int("BRAIN_LM_CTX", 4096)
 N_GPU_LAYERS = _env_int("BRAIN_LM_GPU_LAYERS", -1)
 N_THREADS = _env_int("BRAIN_LM_THREADS", 0) or None
@@ -96,6 +116,29 @@ def set_option(name, value):
         value = int(value)
     RUNTIME[name] = value
     return value
+
+
+def _lmstudio_url():
+    """Адрес LM Studio без суффикса /chat/completions (для проверки доступности)."""
+    url = LMSTUDIO_URL
+    for suffix in ("/chat/completions", "/completions"):
+        if url.endswith(suffix):
+            return url[: -len(suffix)]
+    return url.rstrip("/")
+
+
+def _lmstudio_available(timeout=2.0):
+    """True, если сервер LM Studio отвечает (модель при этом может быть не загружена)."""
+    base = _lmstudio_url()
+    if not base.endswith("/v1"):
+        base += "/v1"
+    for path in ("/models", "/health"):
+        try:
+            with urllib.request.urlopen(base + path, timeout=timeout):
+                return True
+        except Exception:                              # noqa: BLE001
+            continue
+    return False
 
 
 SYSTEM_PROMPT = (
@@ -205,8 +248,11 @@ class LMBackend:
         self.history = []
         self._gen_lock = threading.Lock()
         self.llm = None
+        self.active_model = None        # имя модели, которое реально работает в LM Studio
         self.last_stats = None          # (токенов, секунд)
         self.last_truncated = False     # ответ оборван лимитом времени/токенов
+
+        self.backend_used = BACKEND    # реально работающий бэкенд (может смениться при откате)
 
         if BACKEND == "llamacpp":
             if not os.path.isfile(MODEL_PATH):
@@ -220,18 +266,44 @@ class LMBackend:
                 ) from exc
 
             print(f"[LM] загрузка модели: {MODEL_PATH}")
-            kwargs = dict(
-                model_path=MODEL_PATH,
-                n_ctx=N_CTX,
-                n_gpu_layers=N_GPU_LAYERS,
-                verbose=False,
-            )
-            if N_THREADS:
-                kwargs["n_threads"] = N_THREADS
-            if CHAT_FORMAT:
-                kwargs["chat_format"] = CHAT_FORMAT
-            self.llm = Llama(**kwargs)
-            self.name = os.path.basename(MODEL_PATH)
+            # -1 = «все слои на GPU»; если CUDA нет (или её не хватило), уменьшаем до 0.
+            attempts = []
+            if N_GPU_LAYERS and N_GPU_LAYERS > 0:
+                attempts.append(N_GPU_LAYERS)
+            else:
+                attempts.extend([N_GPU_LAYERS, 0])   # -1 (авто), затем чистый CPU
+            error = None
+            for layers in attempts:
+                kwargs = dict(
+                    model_path=MODEL_PATH,
+                    n_ctx=N_CTX,
+                    n_gpu_layers=layers,
+                    verbose=False,
+                )
+                if N_THREADS:
+                    kwargs["n_threads"] = N_THREADS
+                if CHAT_FORMAT:
+                    kwargs["chat_format"] = CHAT_FORMAT
+                try:
+                    self.llm = Llama(**kwargs)
+                    error = None
+                    break
+                except Exception as exc:               # noqa: BLE001
+                    error = exc
+                    print(f"[LM] не удалось загрузить (n_gpu_layers={layers}): {exc}")
+            if error is not None:
+                # Не роняем весь чат: переходим на LM Studio, если сервер запущен.
+                if _lmstudio_available():
+                    print("[LM] откат на BRAIN_LM_BACKEND=lmstudio")
+                    self.backend_used = "lmstudio"
+                    self.name = f"LM Studio ({LMSTUDIO_MODEL})"
+                else:
+                    raise RuntimeError(
+                        f"не удалось загрузить GGUF ({error}); "
+                        "запустите сервер в LM Studio или укажите BRAIN_LM_PATH правильно."
+                    ) from error
+            else:
+                self.name = os.path.basename(MODEL_PATH)
 
         elif BACKEND == "lmstudio":
             self.name = f"LM Studio ({LMSTUDIO_MODEL})"
@@ -319,9 +391,50 @@ class LMBackend:
                 yield delta
 
     def _stream_lmstudio(self, messages, should_stop):
+        last_error = None
+        for model in self._model_candidates():
+            if should_stop():
+                return
+            started = False
+            try:
+                for delta in self._lmstudio_request(messages, should_stop, model):
+                    started = True
+                    yield delta
+                self.active_model = model or self.active_model
+                return
+            except RuntimeError as exc:
+                # 4xx обычно означает «модель не загружена / неверное имя»: пробуем следующее.
+                if started or not any(k in str(exc).lower() for k in
+                                      ("http 4", "not loaded", "no model")):
+                    raise
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+
+    def _model_candidates(self):
+        """Имя модели из окружения + реальные имена моделей, доступные в LM Studio."""
+        names = []
+        for candidate in (self.active_model, LMSTUDIO_MODEL):
+            if candidate and candidate not in names:
+                names.append(candidate)
+        base = _lmstudio_url()
+        if not base.endswith("/v1"):
+            base += "/v1"
+        try:
+            with urllib.request.urlopen(base + "/models", timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8", errors="replace"))
+            for item in data.get("data") or []:
+                ident = item.get("id") or item.get("model") or ""
+                if ident and ident not in names:
+                    names.append(ident)
+        except Exception:                              # noqa: BLE001
+            pass
+        return names or [""]
+
+    def _lmstudio_request(self, messages, should_stop, model):
         payload = json.dumps(
             {
-                "model": LMSTUDIO_MODEL,
+                "model": model,
                 "messages": messages,
                 "max_tokens": RUNTIME["max_tokens"],
                 "temperature": TEMPERATURE,
@@ -391,7 +504,7 @@ class LMBackend:
                     return True
                 return False
 
-            source = (self._stream_llamacpp if BACKEND == "llamacpp"
+            source = (self._stream_llamacpp if self.backend_used == "llamacpp"
                       else self._stream_lmstudio)
             # Фрагменты системного промпта: ответ, который их повторяет, очищается.
             forbidden = shingles(messages[0]["content"])

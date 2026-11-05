@@ -221,7 +221,20 @@ def start_lm():
         backend = LMBackend()
     except Exception as e:
         return None, f"LM недоступна ({e}); отвечает только граф."
-    return LMWorker(backend), f"LM подключена: {backend.name}."
+    return LMWorker(backend), f"LM подключена: {backend.name} [{backend.backend_used}]."
+
+
+def restart_lm(lm):
+    """Переподключает LM (/lm). Возвращает (worker|None, статус, был_сменён_ли_состояние)."""
+    old_backend = lm.backend if lm is not None else None
+    try:
+        backend = LMBackend()
+    except Exception as e:                       # старый worker остаётся в работе
+        return lm, f"LM недоступна ({e}); отвечает только граф.", False
+    worker = LMWorker(backend)
+    if old_backend is not None:
+        backend.history = list(old_backend.history)   # диалог не теряется
+    return worker, f"LM подключена: {backend.name} [{backend.backend_used}].", True
 
 
 class Slider:
