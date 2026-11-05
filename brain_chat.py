@@ -1029,8 +1029,59 @@ def wrap_lines(entries, font, width):
     return lines
 
 
-def draw_panel(screen, fonts, rect, entries, scroll):
-    """Окно с прокруткой. scroll — сколько строк отмотано от низа."""
+VIEW = {}                       # имя панели -> размеры и строки последней отрисовки
+SEL = {"panel": None, "a": None, "b": None, "drag": False}
+SEL_BG = (72, 98, 142)
+
+
+def _char_at(font, s, x):
+    """Индекс символа в строке s, ближайший к горизонтальной позиции x (пиксели)."""
+    best, best_d = 0, None
+    for i in range(len(s) + 1):
+        d = abs(font.size(s[:i])[0] - x)
+        if best_d is None or d < best_d:
+            best, best_d = i, d
+    return best
+
+
+def point_at(name, pos):
+    """(индекс строки, индекс символа) под курсором внутри панели name, или None."""
+    v = VIEW.get(name)
+    if not v or not v["lines"] or v["rows"] <= 0:
+        return None
+    rect, pad = v["rect"], v["pad"]
+    row = max(0, min(v["rows"] - 1, (pos[1] - (rect.y + pad)) // 20))
+    idx = v["start"] + row
+    s, font = v["lines"][idx]
+    x = pos[0] - (rect.x + pad)
+    return (idx, _char_at(font, s, x) if s else 0)
+
+
+def panel_at(pos):
+    for name, rect in (("think", THINK_RECT), ("chat", CHAT_RECT)):
+        if rect.collidepoint(pos):
+            return name
+    return None
+
+
+def selected_text():
+    """Выделенный текст (может охватывать несколько строк)."""
+    name, a, b = SEL["panel"], SEL["a"], SEL["b"]
+    if not name or a is None or b is None or a == b or name not in VIEW:
+        return ""
+    lo, hi = sorted([a, b])
+    lines = VIEW[name]["lines"]
+    out = []
+    for li in range(lo[0], hi[0] + 1):
+        s = lines[li][0]
+        sc = lo[1] if li == lo[0] else 0
+        ec = hi[1] if li == hi[0] else len(s)
+        out.append(s[sc:ec])
+    return "\n".join(out)
+
+
+def draw_panel(screen, fonts, rect, entries, scroll, name=""):
+    """Окно с прокруткой и выделением мышью. scroll — сколько строк отмотано от низа."""
     rounded(screen, rect, PANEL, BORDER, 10)
     pad = 10
     width = rect.w - 2 * pad - 10
@@ -1041,7 +1092,26 @@ def draw_panel(screen, fonts, rect, entries, scroll):
     end = len(lines) - scroll
     start = max(0, end - max_rows)
 
+    VIEW[name] = {
+        "rect": rect, "pad": pad, "start": start, "rows": end - start,
+        "lines": [(s, fonts["title"] if head else fonts["chat"]) for s, col, head in lines],
+    }
+
     screen.set_clip(rect.inflate(-4, -4))
+    sel = SEL["panel"] == name and SEL["a"] is not None and SEL["b"] is not None \
+        and SEL["a"] != SEL["b"]
+    if sel:
+        lo, hi = sorted([SEL["a"], SEL["b"]])
+        for li in range(max(start, lo[0]), min(end, hi[0] + 1)):
+            s, f = VIEW[name]["lines"][li]
+            sc = lo[1] if li == lo[0] else 0
+            ec = hi[1] if li == hi[0] else len(s)
+            x1 = rect.x + pad + f.size(s[:sc])[0]
+            x2 = rect.x + pad + f.size(s[:ec])[0]
+            if li < hi[0]:
+                x2 += 6                       # метка переноса строки
+            y0 = rect.y + pad + (li - start) * 20
+            pygame.draw.rect(screen, SEL_BG, (x1, y0, max(4, x2 - x1), 20))
     y = rect.y + pad
     for s, col, head in lines[start:end]:
         if s:
@@ -1070,10 +1140,12 @@ def draw_chat(screen, thoughts, chat, text, fonts, now, progress, sliders, scrol
     pygame.draw.line(screen, BORDER, (x0, 0), (x0, H), 1)
 
     header(screen, fonts, "МЫСЛИ", x0 + 18, 12, C_THOUGHT)
-    scroll["think"] = draw_panel(screen, fonts, THINK_RECT, thoughts, scroll["think"])
+    screen.blit(fonts["word"].render("выделите мышью · Ctrl+C копирует", True, DIM), (x0 + 100, 16))
+    scroll["think"] = draw_panel(screen, fonts, THINK_RECT, thoughts, scroll["think"], "think")
 
     header(screen, fonts, "ЧАТ", x0 + 18, 326, ACCENT_HI)
-    scroll["chat"] = draw_panel(screen, fonts, CHAT_RECT, chat, scroll["chat"])
+    screen.blit(fonts["word"].render("выделите мышью · Ctrl+C копирует", True, DIM), (x0 + 100, 330))
+    scroll["chat"] = draw_panel(screen, fonts, CHAT_RECT, chat, scroll["chat"], "chat")
 
     for i, s in enumerate(sliders):
         s.draw(screen, fonts, x0 + 18, H - 204 + i * 32, CHAT_W - 36)
@@ -1192,6 +1264,19 @@ def main():
             elif e.type == pygame.KEYDOWN:
                 if e.key == pygame.K_ESCAPE:
                     running = False
+                elif e.key == pygame.K_c and pygame.key.get_mods() & pygame.KMOD_CTRL \
+                        and selected_text():
+                    body = selected_text()
+                    if copy_to_clipboard(body):
+                        sys_msg(f"Скопировано: {len(body)} симв.")
+                    else:
+                        sys_msg("Буфер обмена недоступен. Текст сохранён: /copy")
+                elif e.key == pygame.K_a and pygame.key.get_mods() & pygame.KMOD_CTRL \
+                        and panel_at(pygame.mouse.get_pos()):
+                    pname = panel_at(pygame.mouse.get_pos())
+                    lines = VIEW[pname]["lines"]
+                    SEL.update(panel=pname, a=(0, 0),
+                               b=(len(lines) - 1, len(lines[-1][0])), drag=False)
                 elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                     msg = text.strip()
                     text = ""
@@ -1424,10 +1509,22 @@ def main():
                     if s.hit(e.pos):
                         dragging = i
                         s.set_from_x(e.pos[0])
+                if dragging is None:
+                    pname = panel_at(e.pos)
+                    if pname:
+                        p = point_at(pname, e.pos)
+                        SEL.update(panel=pname, a=p, b=p, drag=True)
+                    else:
+                        SEL.update(panel=None, a=None, b=None, drag=False)
             elif e.type == pygame.MOUSEMOTION and dragging is not None:
                 sliders[dragging].set_from_x(e.pos[0])
+            elif e.type == pygame.MOUSEMOTION and SEL["drag"]:
+                p = point_at(SEL["panel"], e.pos)
+                if p is not None:
+                    SEL["b"] = p
             elif e.type == pygame.MOUSEBUTTONUP and e.button == 1:
                 dragging = None
+                SEL["drag"] = False
             elif e.type == pygame.TEXTINPUT:
                 text += e.text
 

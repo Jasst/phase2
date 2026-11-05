@@ -1,5 +1,17 @@
 === МЫСЛИ СЕТИ (последние) ===
+выводит ability выводит ability
+выводит ability выводит ability
+мысль (вся сеть, оценка 0.10): менять isn looking менять
+isn делу привет
+мысль (вся сеть, оценка 0.12): specific сон добавляют against thinking
+делу лишнее делу привет
+specific сон строку specific строку сон
+привет isn there looking
 
 === ЧАТ ===
-Система: Загружена сеть: 426 нейронов, 4 связей. Напишите /help — список команд.
+Система: Загружена сеть: 437 нейронов, 0 связей. Напишите /help — список команд.
 Система: LM недоступна (Failed to load model from file: E:\\models\\lmstudio-community\\Qwen3.5-9B-GGUF\\Qwen3.5-9B-Q8_0.gguf); отвечает только граф.
+Вы: привет
+Сеть: менять isn looking менять
+Вы: привет
+Сеть: specific сон добавляют against thinking

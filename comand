@@ -1,1 +1,4 @@
-Compress-Archive -Path brain_chat.py, mind.py -DestinationPath brain_project.zip -Force
+$x=Get-ChildItem -Recurse -File -Force|?{$_.FullName -notmatch '\\\.venv\\|\\__pycache__\\|\\\.idea\\|\\\.git\\|\\node_modules\\|\\corpus\\' -and $_.Name -notmatch '\.gguf$|\.bin$|\.safetensors$|\.pyc$|^(log|brain_log|session_log)\.txt$|^\.env$|^brain_state\.json$'};Add-Type -AssemblyName System.IO.Compression,System.IO.Compression.FileSystem;$p=Join-Path (Get-Location) 'phase2_for_ai.zip';if(Test-Path $p){rm $p -Force};$z=[IO.Compression.ZipFile]::Open($p,'Create');$r=(Get-Location).Path;$x|%{[IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z,$_.FullName,$_.FullName.Substring($r.Length+1).Replace('\','/'))|Out-Null};$z.Dispose();"Файлов: $($x.Count), размер: {0:N0} KB" -f ((Get-Item $p).Length/1KB)
+
+
+Add-Type -AssemblyName System.IO.Compression.FileSystem;([IO.Compression.ZipFile]::OpenRead((Resolve-Path phase2_for_ai.zip))).Entries|Select FullName,Length|ft -AutoSize
