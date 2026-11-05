@@ -93,6 +93,8 @@ HELP_LINES = [
     "Сеть: /neurons N — лимит нейронов; /groups — смысловые группы; /save, /load, /reset.",
     "Модель: /ctx N — символов контекста; /history N — сколько обменов помнит;",
     "        /time N — секунд на ответ (0 — без лимита); /tokens N — длина ответа.",
+    "LLM: кнопка «LM: вкл / выкл» в шапке чата — клик переключает режим; "
+    "/lm on|off — то же из строки ввода.",
     "Состояние: /mind — что происходит в сети и какие настройки заданы.",
     "Копирование: /copy — мысли и чат в буфер обмена и в файл session_log.txt; /log — только файл.",
     "Значение без числа показывает текущую настройку, например /time.",
@@ -126,17 +128,21 @@ HOT_NODE = 30               # кадров подсветки нейрона п�
 HOT_LINK = 20               # кадров подсветки связи (~2 с)
 
 
-
 SESSION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_log.txt")
 WHO_NAMES = {"you": "Вы", "net": "Сеть", "sys": "Система", "thought": "Мысль"}
 
 
 def session_text(chat, thoughts, n_chat=120, n_think=60):
-    """Текст журнала: последние мысли сети и последние реплики чата."""
+    """Текст журнала: последние мысли сети и последние реплики чата.
+
+    ИЗМ: поддерживает 3-элементные записи [who, text, score].
+    """
     lines = ["=== МЫСЛИ СЕТИ (последние) ==="]
     lines += [str(t) for _, t in thoughts[-n_think:]]
     lines += ["", "=== ЧАТ ==="]
-    lines += [f"{WHO_NAMES.get(w, w)}: {t}" for w, t in chat[-n_chat:]]
+    # ИЗМ: было `for w, t in chat[-n_chat:]`. Записи могут содержать оценку.
+    lines += [f"{WHO_NAMES.get(item[0], item[0])}: {item[1]}"
+              for item in chat[-n_chat:]]
     return "\n".join(lines) + "\n"
 
 
@@ -533,11 +539,11 @@ class Brain:
 
     # ---------- уровень 3: адаптация всей сети к фразе ----------
 
-    def adapt(self, seq):
-        """Фраза перестраивает сеть: связи внутри группы крепнут,
-        между группами слабеют, центры групп сдвигаются к словам фразы."""
+    def adapt(self, seq, confidence=1.0):
         if not seq:
             return
+        up = ADAPT_UP * confidence
+        down = ADAPT_DOWN * confidence
         id2w = {n.id: n.word for n in self.neurons.values() if n.word}
         for k in list(self.links):
             a, b = k
@@ -548,12 +554,11 @@ class Brain:
             if ga is None or gb is None:
                 continue
             w = self.links[k]
-            w = min(2.0, w + ADAPT_UP) if ga == gb else w * (1 - ADAPT_DOWN)
+            w = min(2.0, w + up) if ga == gb else w * (1 - down)
             if w < PRUNE:
                 del self.links[k]
             else:
                 self.links[k] = w
-
         for w in seq:
             g = self.wgroup.get(w)
             if g is None:
@@ -561,7 +566,7 @@ class Brain:
             cen = self.gcent.setdefault(g, {})
             for other in seq:
                 if other != w:
-                    cen[other] = cen.get(other, 0.0) + ADAPT_UP
+                    cen[other] = cen.get(other, 0.0) + up
 
     # ---------- динамика (фон) ----------
 
@@ -718,15 +723,16 @@ class Brain:
             self.adapt(prompt + answer)
         return answer
 
-    def _reinforce_answer(self, answer):
-        """/good и диалог: цепочка ответа усиливается."""
+    def _reinforce_answer(self, answer, weight=1.0):
+        """weight 0..1 — уверенность в ответе. 1.0 = старый режим."""
         for a, b in zip(answer, answer[1:]):
             na, nb = self.words.get(a), self.words.get(b)
             if na is None or nb is None:
                 continue
             k = key(na, nb)
+            gain = HEBB_RATE * 2 * weight
             if k in self.links:
-                self.links[k] = min(2.0, self.links[k] + HEBB_RATE * 2)
+                self.links[k] = min(2.0, self.links[k] + gain)
             self.bigram[(a, b)] = self.bigram.get((a, b), 0) + 1
 
     def punish(self, answer):
@@ -872,6 +878,65 @@ def node_base(brain, n):
     return LAYER_COLORS[n.layer]
 
 
+# NEW: оболочка выпуклой оболочки группы (monotone chain)
+def convex_hull(points):
+    """Оболочка группы. Точки CCW. Возвращает список вершин."""
+    pts = sorted(set(points))
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+# NEW: рисует полупрозрачные оболочки смысловых групп
+def draw_group_hulls(screen, brain, surface):
+    """Показывает границы смысловых групп — где какая тема «живёт» в сети."""
+    surface.fill((0, 0, 0, 0))
+    by_group = {}
+    for w, g in brain.wgroup.items():
+        nid = brain.words.get(w)
+        if nid is None or nid not in brain.neurons:
+            continue
+        n = brain.neurons[nid]
+        by_group.setdefault(g, []).append((n.r, n.c))
+
+    for g, cells in by_group.items():
+        if len(cells) < 2:
+            continue
+        col = GROUP_COLORS[g % len(GROUP_COLORS)]
+        pts = [cell_xy(r, c) for r, c in cells]
+        hull = convex_hull(pts)
+        if len(hull) < 2:
+            continue
+        if len(hull) == 2:
+            pygame.draw.line(surface, (*col, 40), *hull, 22)
+            pygame.draw.line(surface, (*col, 75), *hull, 1)
+            continue
+        cx = sum(p[0] for p in hull) / len(hull)
+        cy = sum(p[1] for p in hull) / len(hull)
+        expanded = []
+        for x, y in hull:
+            dx, dy = x - cx, y - cy
+            L = math.hypot(dx, dy) or 1.0
+            expanded.append((x + dx / L * 12, y + dy / L * 12))
+        pygame.draw.polygon(surface, (*col, 22), expanded)
+        pygame.draw.polygon(surface, (*col, 60), expanded, 1)
+    screen.blit(surface, (0, 0))
+
+
 def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info_extra=""):
     """Сеть: связи, свечение, частицы, подписи. focus — нейрон под курсором."""
     links_layer, glow = layers
@@ -928,6 +993,8 @@ def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info
         pygame.draw.circle(glow, col, (int(pos[0]), int(pos[1])), 4 if speak else 2)
     screen.blit(glow, (0, 0), special_flags=pygame.BLEND_ADD)
 
+    # NEW: подписи с защитой от наложений. Подпись под фокусом рисуется всегда.
+    drawn_label_rects = []
     for n in brain.neurons.values():
         x, y = cell_xy(n.r, n.c)
         hot = max(0.0, 1 - (tick - n.fired_at) / HOT_NODE)
@@ -935,15 +1002,21 @@ def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info
         core = tuple(min(255, int(v + (255 - v) * hot)) for v in base)
         R = (5 if n.word else 3) + 2 * hot
         pygame.draw.circle(screen, core, (int(x), int(y)), int(R))
-        if n.id == focus:
+        is_focus = n.id == focus
+        if is_focus:
             pygame.draw.circle(screen, C_FOCUS, (int(x), int(y)), int(R) + 4, 2)
-        if n.word and (hot > 0.15 or n.id == focus or n.id in nbrs
+        if n.word and (is_focus or hot > 0.15 or n.id in nbrs
                        or len(brain.neurons) <= LABEL_ALL):
             surf = cache.get(n.word)
             if surf is None:
                 surf = fonts["word"].render(n.word, True, (206, 212, 222))
                 cache[n.word] = surf
-            screen.blit(surf, (int(x) + 8, int(y) - 8))
+            rect = surf.get_rect(topleft=(int(x) + 8, int(y) - 8))
+            # Наложения: подпись фокуса важнее, её рисуем всегда.
+            if not is_focus and any(rect.colliderect(r) for r in drawn_label_rects):
+                continue
+            drawn_label_rects.append(rect)
+            screen.blit(surf, rect)
 
     info_rect = pygame.Rect(12, 10, 560, 26)
     rounded(screen, info_rect, PANEL, BORDER, 8)
@@ -977,32 +1050,51 @@ def nearest_neuron(brain, mx, my, radius=12.0):
     return best
 
 
-def draw_overlay(screen, fonts, brain, side, coh_hist, focus, mouse, now):
-    """Индикатор активного полушария, график согласованности, подсказка."""
-    box = pygame.Rect(12, H - 136, 250, 124)
+# ИЗМ: новая версия принимает mind вместо side. Верхняя часть панели
+# показывает топ-слова из fieldL/fieldR — видно, что каждое полушарие
+# реально «думает» прямо сейчас.
+def draw_overlay(screen, fonts, brain, mind, coh_hist, focus, mouse, now):
+    """Панель полушарий, sparkline согласованности, подсказка под курсором."""
+    box = pygame.Rect(12, H - 186, 340, 174)
     rounded(screen, box, PANEL, BORDER, 8)
-    screen.blit(fonts["title"].render("ПОЛУШАРИЯ", True, MUTED), (box.x + 12, box.y + 9))
-    for i, (label, tag) in enumerate((("левое", "L"), ("правое", "R"))):
-        cx, cy = box.x + 56 + i * 140, box.y + 40
-        on = side == tag
-        if on:
-            halo = C_NET if tag == "L" else C_THOUGHT
-            pulse = 3.0 * math.sin(now * 8.0)
-            pygame.draw.circle(screen, tuple(int(v * 0.3) for v in halo),
-                               (cx, cy), int(22 + pulse))
-        pygame.draw.circle(screen, ACCENT_HI if on else ACCENT_DIM, (cx, cy), 14)
-        screen.blit(fonts["word"].render(label, True, MUTED), (cx - 16, cy + 20))
+    screen.blit(fonts["title"].render("ПОЛУШАРИЯ", True, MUTED), (box.x + 12, box.y + 6))
 
-    spark = pygame.Rect(box.x + 12, box.y + 92, box.w - 24, 24)
+    col_w = (box.w - 36) // 2
+    sides = [
+        ("ЛЕВОЕ", "анализ", mind.fieldL, mind.last_side == "L"),
+        ("ПРАВОЕ", "блуждание", mind.fieldR, mind.last_side == "R"),
+    ]
+    for i, (name, sub, field, active) in enumerate(sides):
+        cx = box.x + 12 + i * (col_w + 12)
+        head_col = ACCENT_HI if active else MUTED
+        bg = PANEL_2 if active else PANEL
+        pygame.draw.rect(screen, bg, (cx, box.y + 26, col_w, 108), border_radius=6)
+        screen.blit(fonts["word"].render(name, True, head_col), (cx + 6, box.y + 28))
+        screen.blit(fonts["word"].render(sub, True, DIM), (cx + 6, box.y + 42))
+        top = sorted(field.items(), key=lambda x: -x[1])[:5]
+        if top:
+            mx = top[0][1] or 1.0
+            y = box.y + 60
+            for w, v in top:
+                if v < 0.05:
+                    continue
+                bw = int((col_w - 16) * min(1.0, v / mx))
+                bar = ACCENT if active else ACCENT_DIM
+                pygame.draw.rect(screen, bar, (cx + 8, y, max(2, bw), 12),
+                                 border_radius=2)
+                screen.blit(fonts["word"].render(w, True, TEXT), (cx + 12, y))
+                y += 16
+
     screen.blit(fonts["word"].render("согласованность полей", True, DIM),
-                (spark.x, spark.y - 14))
+                (box.x + 12, box.y + 140))
+    spark = pygame.Rect(box.x + 12, box.y + 152, box.w - 24, 18)
     pygame.draw.rect(screen, TRACK, spark, border_radius=3)
     if len(coh_hist) >= 2:
-        step = spark.w / (max(len(coh_hist), 2) - 1)   # график растягивается по данным
+        step = spark.w / (max(len(coh_hist), 2) - 1)
         pts = []
         for i, v in enumerate(coh_hist):
             x = spark.right - (len(coh_hist) - 1 - i) * step
-            y = spark.bottom - 3 - max(0.0, min(1.0, v)) * (spark.h - 6)
+            y = spark.bottom - 2 - max(0.0, min(1.0, v)) * (spark.h - 4)
             pts.append((x, y))
         pygame.draw.lines(screen, ACCENT, False, pts, 2)
 
@@ -1026,13 +1118,19 @@ def draw_overlay(screen, fonts, brain, side, coh_hist, focus, mouse, now):
             screen.blit(fonts["ui"].render(t, True, col), (tip.x + 10, tip.y + 8 + i * 18))
 
 
+# ИЗМ: поддерживает как 2-элементные [who, text], так и 3-элементные
+# [who, text, score]. Для ответа сети рисуется «Сеть · опора X.XX».
 def wrap_lines(entries, font, width):
-    """Раскладывает записи в строки: (текст, цвет, заголовок?)."""
     lines = []
-    for who, msg in entries:
+    for item in entries:
+        who, msg = item[0], item[1]
+        score = item[2] if len(item) > 2 else None
         if who != "thought":
             col = {"you": C_YOU, "net": C_NET, "sys": C_SYS}[who]
-            label = {"you": "Вы", "net": "Сеть", "sys": "•"}[who]
+            if who == "net" and score is not None:
+                label = f"Сеть · опора {score:.2f}"
+            else:
+                label = {"you": "Вы", "net": "Сеть", "sys": "•"}[who]
             lines.append((label, col, True))
             body_col = DIM if who == "sys" else TEXT
         else:
@@ -1047,10 +1145,10 @@ def wrap_lines(entries, font, width):
 VIEW = {}                       # имя панели -> размеры и строки последней отрисовки
 SEL = {"panel": None, "a": None, "b": None, "drag": False}
 SEL_BG = (72, 98, 142)
+LM_BTN_RECT = pygame.Rect(0, 0, 0, 0)   # NEW: кликабельная кнопка LM
 
 
 def _char_at(font, s, x):
-    """Индекс символа в строке s, ближайший к горизонтальной позиции x (пиксели)."""
     best, best_d = 0, None
     for i in range(len(s) + 1):
         d = abs(font.size(s[:i])[0] - x)
@@ -1060,7 +1158,6 @@ def _char_at(font, s, x):
 
 
 def point_at(name, pos):
-    """(индекс строки, индекс символа) под курсором внутри панели name, или None."""
     v = VIEW.get(name)
     if not v or not v["lines"] or v["rows"] <= 0:
         return None
@@ -1080,7 +1177,6 @@ def panel_at(pos):
 
 
 def selected_text():
-    """Выделенный текст (может охватывать несколько строк)."""
     name, a, b = SEL["panel"], SEL["a"], SEL["b"]
     if not name or a is None or b is None or a == b or name not in VIEW:
         return ""
@@ -1096,7 +1192,6 @@ def selected_text():
 
 
 def draw_panel(screen, fonts, rect, entries, scroll, name=""):
-    """Окно с прокруткой и выделением мышью. scroll — сколько строк отмотано от низа."""
     rounded(screen, rect, PANEL, BORDER, 10)
     pad = 10
     width = rect.w - 2 * pad - 10
@@ -1124,7 +1219,7 @@ def draw_panel(screen, fonts, rect, entries, scroll, name=""):
             x1 = rect.x + pad + f.size(s[:sc])[0]
             x2 = rect.x + pad + f.size(s[:ec])[0]
             if li < hi[0]:
-                x2 += 6                       # метка переноса строки
+                x2 += 6
             y0 = rect.y + pad + (li - start) * 20
             pygame.draw.rect(screen, SEL_BG, (x1, y0, max(4, x2 - x1), 20))
     y = rect.y + pad
@@ -1149,29 +1244,59 @@ def draw_panel(screen, fonts, rect, entries, scroll, name=""):
     return scroll
 
 
-def draw_chat(screen, thoughts, chat, text, fonts, now, progress, sliders, scroll):
+# ИЗМ: бейдж LM превращён в кликабельную кнопку. Рамка кнопки сохраняется
+# в глобальном LM_BTN_RECT, чтобы обработчик кликов мог её поймать.
+def draw_chat(screen, thoughts, chat, text, fonts, now, progress, sliders, scroll,
+              lm_on, lm_available=True):
     x0 = NET_W
     pygame.draw.rect(screen, PANEL_BG, (x0, 0, CHAT_W, H))
     pygame.draw.line(screen, BORDER, (x0, 0), (x0, H), 1)
 
     header(screen, fonts, "МЫСЛИ", x0 + 18, 12, C_THOUGHT)
-    screen.blit(fonts["word"].render("выделите мышью · Ctrl+C копирует", True, DIM), (x0 + 100, 16))
+    screen.blit(fonts["word"].render("выделите мышью · Ctrl+C копирует", True, DIM),
+                (x0 + 100, 16))
     scroll["think"] = draw_panel(screen, fonts, THINK_RECT, thoughts, scroll["think"], "think")
 
     header(screen, fonts, "ЧАТ", x0 + 18, 326, ACCENT_HI)
-    screen.blit(fonts["word"].render("выделите мышью · Ctrl+C копирует", True, DIM), (x0 + 100, 330))
+    screen.blit(fonts["word"].render("Ctrl+C — копировать", True, DIM), (x0 + 100, 330))
+
+    # NEW: кнопка-тумблер LM
+    if not lm_available:
+        label, base_col = "LM: нет", DIM
+    elif lm_on:
+        label, base_col = "LM: вкл", (130, 190, 140)
+    else:
+        label, base_col = "LM: выкл", (210, 170, 110)
+
+    badge = fonts["title"].render(label, True, base_col)
+    pad_x, pill_h = 10, 22
+    pill_w = badge.get_width() + pad_x * 2
+    LM_BTN_RECT.x = x0 + CHAT_W - 18 - pill_w
+    LM_BTN_RECT.y = 323
+    LM_BTN_RECT.w = pill_w
+    LM_BTN_RECT.h = pill_h
+
+    hovered = lm_available and LM_BTN_RECT.collidepoint(pygame.mouse.get_pos())
+    bg_col = (46, 50, 60) if hovered else PANEL_2
+    border_col = (235, 238, 242) if hovered else base_col
+    pygame.draw.rect(screen, bg_col, LM_BTN_RECT, border_radius=10)
+    pygame.draw.rect(screen, border_col, LM_BTN_RECT, 1, border_radius=10)
+    ty = LM_BTN_RECT.y + (pill_h - badge.get_height()) // 2
+    screen.blit(badge, (LM_BTN_RECT.x + pad_x, ty))
+
     scroll["chat"] = draw_panel(screen, fonts, CHAT_RECT, chat, scroll["chat"], "chat")
 
     for i, s in enumerate(sliders):
         s.draw(screen, fonts, x0 + 18, H - 204 + i * 32, CHAT_W - 36)
 
     if progress is not None:
-        frac, label = progress
-        screen.blit(fonts["word"].render(label, True, MUTED), (x0 + 18, H - 110))
+        frac, label_p = progress
+        screen.blit(fonts["word"].render(label_p, True, MUTED), (x0 + 18, H - 110))
         bar = pygame.Rect(x0 + 18, H - 90, CHAT_W - 36, 5)
         pygame.draw.rect(screen, TRACK, bar, border_radius=3)
         if frac > 0:
-            pygame.draw.rect(screen, C_SPEAK, (bar.x, bar.y, max(4, int(bar.w * frac)), bar.h),
+            pygame.draw.rect(screen, C_SPEAK,
+                             (bar.x, bar.y, max(4, int(bar.w * frac)), bar.h),
                              border_radius=3)
 
     rounded(screen, INPUT_RECT, PANEL_2, BORDER, 10)
@@ -1185,11 +1310,17 @@ def draw_chat(screen, thoughts, chat, text, fonts, now, progress, sliders, scrol
     screen.blit(fonts["chat"].render(shown + caret, True, TEXT),
                 (INPUT_RECT.x + 12, INPUT_RECT.y + 10))
 
-
 def speech(words, entry, now, gap, live=False):
-    """Состояние озвучивания: слова по одному подсвечивают нейроны."""
     return {"words": list(words), "start": now, "shown": 0, "prev": None,
             "entry": entry, "gap": gap, "live": live}
+
+
+def _set_score(entry, score):
+    """ИЗМ: записывает оценку в 2-элементную запись, расширяя её до 3-элементной."""
+    if len(entry) >= 3:
+        entry[2] = score
+    else:
+        entry.append(score)
 
 
 # ---------- главный цикл ----------
@@ -1214,6 +1345,8 @@ def main():
     stars = [(random.uniform(0, NET_W), random.uniform(0, H), random.uniform(0, 6.28))
              for _ in range(160)]
     layers = (pygame.Surface((NET_W, H), pygame.SRCALPHA), pygame.Surface((NET_W, H)))
+    # NEW: слой для оболочек смысловых групп
+    group_layer = pygame.Surface((NET_W, H), pygame.SRCALPHA)
     cache = {}
 
     if os.path.exists(SAVE_PATH):
@@ -1234,13 +1367,14 @@ def main():
         Slider("зазор между словами", 30, lambda v: f"{gap_sec(v):.2f} с"),
     ]
     lm, lm_status = start_lm()
-    episodes = EpisodeMemory()             # подтверждённые пары вопрос→ответ
-    pending = None                         # ожидаемый ответ LM
-    last_user_msg = ""                     # текст последнего вопроса пользователя
-    last_support = None                    # самопроверка последнего ответа LM
-    coh_hist = deque(maxlen=COH_HIST)      # история согласованности полей
+    lm_on = True                          # NEW: включена ли LLM в текущем режиме
+    episodes = EpisodeMemory()
+    pending = None
+    last_user_msg = ""
+    last_support = None
+    coh_hist = deque(maxlen=COH_HIST)
     coh_acc = 0.0
-    last_lm = None                         # (вопрос, текст) последнего ответа LM
+    last_lm = None
     dragging = None
     thoughts = []
     scroll = {"think": 0, "chat": 0}
@@ -1254,7 +1388,7 @@ def main():
     resp = None
     last_answer = None
     msg_count = 0
-    prev_q, last_q = [], []                # слова прошлого и текущего вопроса
+    prev_q, last_q = [], []
 
     def sys_msg(msg):
         chat.append(["sys", msg])
@@ -1320,7 +1454,7 @@ def main():
                             sys_msg("Файл сохранения не найден.")
                     elif msg == "/sleep":
                         pruned, ngroups = brain.consolidate()
-                        for ep in episodes.items:          # эпизоды повторяются во сне
+                        for ep in episodes.items:
                             brain.train_words(tokenize(ep["q"], limit=None) + tokenize(ep["a"], limit=None))
                         sys_msg(f"Консолидация: удалено {pruned} связей, групп {ngroups}, "
                                 f"повторено эпизодов: {len(episodes.items)}.")
@@ -1336,10 +1470,37 @@ def main():
                                 f"время {RUNTIME['time_budget']:g} с, "
                                 f"длина {RUNTIME['max_tokens']} токенов")
                         sys_msg(f"нейроны: {len(brain.neurons)} из {MAX_NEURONS}")
+                        sys_msg(f"LLM: {'включена' if lm_on else 'выключена (только граф)'}")
                         if last_support is not None:
                             sys_msg(f"опора последнего ответа на граф: {last_support:.2f}")
                         if lm is not None and lm.backend.speed_text():
                             sys_msg(f"скорость LM: {lm.backend.speed_text()}")
+                    # NEW: /lm — включение/выключение LLM
+                    elif msg == "/lm" or msg.startswith("/lm "):
+                        parts = msg.split(None, 1)
+                        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+                        valid = True
+                        if arg in ("", "toggle", "t"):
+                            lm_on = not lm_on
+                        elif arg in ("on", "вкл", "1", "true"):
+                            lm_on = True
+                        elif arg in ("off", "выкл", "0", "false"):
+                            lm_on = False
+                        else:
+                            valid = False
+                            sys_msg(f"Формат: /lm [on|off]. Сейчас LLM "
+                                    f"{'вкл' if lm_on else 'выкл'}")
+                        if valid:
+                            if lm is None and lm_on:
+                                lm_on = False
+                                sys_msg("LM не подключена, переключение невозможно. "
+                                        "Отвечает граф.")
+                            else:
+                                if not lm_on and pending is not None:
+                                    pending["entry"][1] += " (отменено: LLM выкл)"
+                                    pending = None
+                                sys_msg("LLM: включена" if lm_on
+                                        else "LLM: выключена — отвечает только граф")
                     elif msg.startswith("/recall"):
                         query = msg[len("/recall"):].strip()
                         found = episodes.recall(query, k=3) if query else []
@@ -1375,7 +1536,7 @@ def main():
                             sys_msg("Формат: /assoc слово слово слово — эти слова свяжутся между собой.")
                         else:
                             brain.train_words(ids)
-                            brain.train_words(ids)          # повтор делает связь сильнее
+                            brain.train_words(ids)
                             brain.regroup()
                             sys_msg(f"Связано слов: {len(ids)} — {' '.join(ids)}.")
                     elif msg.split()[:1] and msg.split()[0] in TUNE_CMDS:
@@ -1406,7 +1567,6 @@ def main():
                         elif msg == "/good":
                             brain._reinforce_answer(last_answer)
                             if last_user_msg:
-                                # связь вопрос→ответ: создаётся, если её не было
                                 brain.train_words(tokenize(last_user_msg, limit=None) + last_answer)
                             if last_lm is not None:
                                 LMBackend.log_feedback(last_lm[0], last_lm[1], +1)
@@ -1460,11 +1620,11 @@ def main():
                             resp = None
                         if pending is not None:
                             pending["entry"][1] = "(заменено новым вопросом)"
-                            pending = None          # LMWorker отменит старую генерацию
+                            pending = None
                         chat.append(["you", msg])
                         scroll["chat"] = 0
                         cur = tokenize(msg, limit=None)
-                        brain.train_words(prev_q[-3:] + cur)     # контекст диалога тоже учится
+                        brain.train_words(prev_q[-3:] + cur)
                         prev_q = last_q = cur
                         last_user_msg = msg
                         target = max(1, int(round(sliders[1].value)))
@@ -1475,14 +1635,14 @@ def main():
                         entry = ["net", "думаю…"]
                         chat.append(entry)
                         gap = gap_sec(sliders[2].value)
-                        if lm is None and recalled and recalled[0][0] >= RECALL_STRONG:
-                            # граф без LM: проверенный прошлый ответ
+                        # ИЗМ: (lm is None or not lm_on) вместо (lm is None)
+                        if (lm is None or not lm_on) and recalled and recalled[0][0] >= RECALL_STRONG:
                             ep = recalled[0][1]
-                            st = answerer.begin(msg, target)     # мысль сети строится всегда
+                            st = answerer.begin(msg, target)
                             if st["thought"] is not None:
                                 thoughts.append(["thought", st["thought"].describe()])
                                 thoughts = thoughts[-300:]
-                            answerer.learn(msg, tokenize(ep["a"], limit=None))  # подтверждённое закрепляем
+                            answerer.learn(msg, tokenize(ep["a"], limit=None))
                             last_answer = tokenize(ep["a"], limit=None) or None
                             resp = speech(ep["a"].split(), entry, now, gap)
                         else:
@@ -1490,7 +1650,8 @@ def main():
                             if st["thought"] is not None:
                                 thoughts.append(["thought", st["thought"].describe()])
                                 thoughts = thoughts[-300:]
-                            if lm is not None:
+                            # ИЗМ: (lm is not None and lm_on)
+                            if lm is not None and lm_on:
                                 memory = [f"«{ep['q']}» → «{ep['a']}»"
                                           for sim, ep in recalled if sim >= RECALL_WEAK]
                                 q_req, note, remember = answerer.request(st)
@@ -1499,10 +1660,14 @@ def main():
                             else:
                                 final = answerer.final(st)
                                 if final:
-                                    reply_text, score, _ = final
+                                    reply_text, score, from_lm = final
                                     last_answer = tokenize(reply_text, limit=None) or None
                                     last_support = score
-                                    resp = speech(reply_text.split(), entry, now, gap)
+                                    # ↓ новое: адаптация и обучение взвешены по уверенности
+                                    if score > LEARN_MIN:  # из reasoning.py
+                                        brain.adapt(tokenize(st["q"]) + last_answer, confidence=min(1.0, score))
+                                        if last_user_msg:
+                                            answerer.learn(last_user_msg, last_answer, confidence=min(1.0, score))
                                 else:
                                     entry[1] = "пока не знаю этого. Научите: /teach ответ"
                     chat = chat[-300:]
@@ -1523,17 +1688,30 @@ def main():
                 elif CHAT_RECT.collidepoint(pos):
                     scroll["chat"] = max(0, scroll["chat"] + e.y * 3)
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
-                for i, s in enumerate(sliders):
-                    if s.hit(e.pos):
-                        dragging = i
-                        s.set_from_x(e.pos[0])
-                if dragging is None:
-                    pname = panel_at(e.pos)
-                    if pname:
-                        p = point_at(pname, e.pos)
-                        SEL.update(panel=pname, a=p, b=p, drag=True)
+                # NEW: клик по кнопке LM переключает режим (не мешает слайдерам/выделению)
+                if LM_BTN_RECT.collidepoint(e.pos):
+                    if lm is None:
+                        sys_msg("LM не подключена — переключение невозможно. "
+                                "Отвечает граф.")
                     else:
-                        SEL.update(panel=None, a=None, b=None, drag=False)
+                        lm_on = not lm_on
+                        if not lm_on and pending is not None:
+                            pending["entry"][1] += " (отменено: LLM выкл)"
+                            pending = None
+                        sys_msg("LLM: включена" if lm_on
+                                else "LLM: выключена — отвечает только граф")
+                else:
+                    for i, s in enumerate(sliders):
+                        if s.hit(e.pos):
+                            dragging = i
+                            s.set_from_x(e.pos[0])
+                    if dragging is None:
+                        pname = panel_at(e.pos)
+                        if pname:
+                            p = point_at(pname, e.pos)
+                            SEL.update(panel=pname, a=p, b=p, drag=True)
+                        else:
+                            SEL.update(panel=None, a=None, b=None, drag=False)
             elif e.type == pygame.MOUSEMOTION and dragging is not None:
                 sliders[dragging].set_from_x(e.pos[0])
             elif e.type == pygame.MOUSEMOTION and SEL["drag"]:
@@ -1545,22 +1723,31 @@ def main():
                 SEL["drag"] = False
             elif e.type == pygame.TEXTINPUT:
                 text += e.text
+            elif e.type == pygame.MOUSEMOTION and SEL["drag"]:
+                p = point_at(SEL["panel"], e.pos)
+                if p is not None:
+                    SEL["b"] = p
+            elif e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+                dragging = None
+                SEL["drag"] = False
+            elif e.type == pygame.TEXTINPUT:
+                text += e.text
 
         mind.think_every = think_sec(sliders[0].value)
-        # ---- фоновый поток мыслей: полушария думают сами ----
         thought = mind.tick(dt)
         if thought:
             thoughts.append(["thought", thought])
             thoughts = thoughts[-300:]
 
-        if lm is not None and pending is not None:
+        # ИЗМ: обрабатываем pending только при включённой LLM
+        if lm_on and pending is not None:
             partial_text = lm.partial(pending["req"])
             if partial_text:
                 pending["entry"][1] = partial_text
             res = lm.poll(pending["req"])
             if res is not None:
                 st = pending["state"]
-                if answerer.feed(st, res):                      # перепроверка: переписываем
+                if answerer.feed(st, res):
                     q_req, note, remember = answerer.request(st)
                     pending["req"] = lm.submit(q_req, (), (), note, remember)
                     pending["entry"][1] = "перепроверяю…"
@@ -1575,6 +1762,7 @@ def main():
                         if from_lm:
                             last_lm = (st["q"], reply_text)
                         entry_ref[1] = reply_text
+                        _set_score(entry_ref, score)
                         resp = speech(reply_text.split(), entry_ref, now,
                                       gap_sec(sliders[2].value), live=True)
                     else:
@@ -1599,7 +1787,7 @@ def main():
             done = resp["shown"] == len(words)
             if not resp.get("live"):
                 resp["entry"][1] = " ".join(words[:resp["shown"]]) + ("" if done else " …")
-            progress = None                          # служебный прогресс скрыт
+            progress = None
             if done and elapsed >= total:
                 resp = None
 
@@ -1617,10 +1805,15 @@ def main():
         mouse = pygame.mouse.get_pos()
         focus = nearest_neuron(brain, mouse[0], mouse[1])
         screen.blit(bg, (0, 0))
+        # NEW: оболочки групп — позади связей и узлов
+        draw_group_hulls(screen, brain, group_layer)
         draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=focus,
                    info_extra=f"   эпизодов {len(episodes.items)}")
-        draw_overlay(screen, fonts, brain, mind.last_side, coh_hist, focus, mouse, now)
-        draw_chat(screen, thoughts, chat, text, fonts, now, progress, sliders, scroll)
+        # ИЗМ: draw_overlay теперь принимает mind вместо side
+        draw_overlay(screen, fonts, brain, mind, coh_hist, focus, mouse, now)
+        # ИЗМ: передаём lm_on для бейджа
+        draw_chat(screen, thoughts, chat, text, fonts, now, progress, sliders, scroll,
+                  lm_on, lm_available=(lm is not None))
         pygame.display.flip()
 
     try:

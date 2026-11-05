@@ -26,9 +26,11 @@ STABLE = 0.6                  # доля совпадения, при котор
 LEARN_MIN = 0.12              # ниже этого оценки ответ не обучает граф
 REVISE_ROUNDS = max(0, int(os.environ.get("BRAIN_REVISE", "1")))
 W_SUPPORT, W_STAB, W_LEN = 0.5, 0.3, 0.2
-# Мысль подсказывается LM только если она опирается на граф вопроса.
-# Иначе случайные ассоциации сбивают модель и попадают в ответ.
-HINT_MIN_SUPPORT = float(os.environ.get("BRAIN_HINT_MIN", "0.15"))
+# ИЗМ: support() в mind.py стал «косинус + покрытие» — его типичные значения
+# выше, чем у чистого косинуса. Поднимаем порог, чтобы фильтр остался осмысленным.
+# При новой метрике: слабый ответ ~0.07, средний ~0.30, хороший ~0.53.
+# Порог 0.22 отсекает слабые и очень средние.
+HINT_MIN_SUPPORT = float(os.environ.get("BRAIN_HINT_MIN", "0.22"))
 # Приветствия и small talk не нуждаются в графе.
 _GREET = re.compile(
     r"^\s*(привет|здравствуй\w*|добрый\s+(день|вечер|утро)|доброе\s+утро|хай|hi|hello)\b",
@@ -83,7 +85,14 @@ class Answerer:
         return out
 
     def _recur(self, seeds, words, target):
-        """Черновик снова подаётся в сеть как контекст, пока не стабилизируется."""
+        """Уточнение: стабильное ядро сохраняется, хвост заменяется.
+
+        ИЗМ: старая версия полностью заменяла current на nxt. Если слово
+        подтверждалось на второй итерации, а потом выпадало — оно терялось
+        безвозвратно. Теперь слова, которые есть и в текущем, и в следующем
+        черновике, образуют ядро; хвост подстраивается под новое поколение.
+        Мысль реально сходится, а не скачет между двумя состояниями.
+        """
         current, stab = list(words), 0.0
         for _ in range(RECUR_ROUNDS):
             nxt, _ = self.mind.answer(self._ids(seeds + current[:4]), target)
@@ -91,7 +100,9 @@ class Answerer:
                 break
             a, c = set(nxt), set(current)
             stab = len(a & c) / max(1, len(a | c))
-            current = nxt
+            stable_core = [w for w in current if w in a]
+            new_extra = [w for w in nxt if w not in stable_core]
+            current = (stable_core + new_extra)[:target] or nxt
             if stab >= STABLE:
                 break
         return current, stab
@@ -175,8 +186,7 @@ class Answerer:
         # Закрепление только по явному /good или /teach (см. learn()).
         return text, score, from_lm
 
-    def learn(self, question, words):
-        """Подтверждённый ответ становится частью сети: вопрос и ответ связываются."""
+    def learn(self, question, words, confidence=1.0):
         q = tokens(question)
-        self.brain.train_words(q + words)        # новые слова становятся нейронами
-        self.brain._reinforce_answer(words)
+        self.brain.train_words(q + words)
+        self.brain._reinforce_answer(words, weight=confidence)

@@ -290,12 +290,17 @@ class Mind:
     # ---------- метакогниция: выбор лучшего варианта ----------
 
     def _context(self, seeds, adj):
-        """Контекст вопроса: сами слова и их окрестность в сети."""
+        """Контекст вопроса: сами слова + окрестность с затуханием.
+
+        ИЗМ: 1-хоп идёт с коэффициентом 0.7 (было 1.0). Это отделяет прямой
+        контекст от ассоциативного шума, из-за которого косинус «размазывался»
+        по всему словарю и support() плохо различал хорошие и слабые ответы.
+        """
         ctx = {}
         for s in seeds:
             ctx[s] = ctx.get(s, 0.0) + 1.0
             for w, v in self._nbrs(s, adj).items():
-                ctx[w] = ctx.get(w, 0.0) + v
+                ctx[w] = ctx.get(w, 0.0) + 0.7 * v
         return ctx
 
     def _update_topic(self, seeds, adj):
@@ -311,12 +316,26 @@ class Mind:
         self.topic = {w: v for w, v in self.topic.items() if v >= 0.01}
 
     def support(self, question_words, reply_words):
-        """Самопроверка: насколько ответ опирается на окрестность вопроса (0..1)."""
+        """Самопроверка: косинус темы + покрытие окрестности (0..1).
+
+        ИЗМ: старая версия была чистым косинусом. Одно попадание в тему
+        могло дать высокий support при куче мусора вокруг. Теперь косинус
+        смешан с покрытием: какая доля слов ответа вообще встречается
+        в окрестности вопроса. Ответ, где осмысленно связано каждое слово,
+        получает высокий балл; ответ из одного тематического + мусора — нет.
+        """
         seeds = [w for w in question_words if w in self.b.words]
-        reply = {w: 1.0 for w in reply_words if w in self.b.words}
-        if not seeds or not reply:
+        reply_known = [w for w in reply_words if w in self.b.words]
+        if not seeds or not reply_known:
             return 0.0
-        return cosine(reply, self._context(seeds, self.b.adjacency()))
+        adj = self.b.adjacency()
+        ctx = self._context(seeds, adj)
+        if not ctx:
+            return 0.0
+        cos = cosine({w: 1.0 for w in reply_known}, ctx)
+        nearby = set(ctx.keys())
+        coverage = sum(1 for w in reply_known if w in nearby) / len(reply_known)
+        return 0.55 * cos + 0.45 * coverage
 
     def answer(self, seed_ids, target=8):
         """Возвращает (слова, оценка ассоциативного сходства).
@@ -353,9 +372,14 @@ class Mind:
         if not cands:
             self.b.adapt(seeds)                  # незнакомый вопрос всё равно учит сеть
             return [], 0.0
-        conf, best = max(cands, key=lambda x: x[0])
-        # Не обучаем сеть на собственном непроверенном ответе.
-        # Закрепление выполняется только по явному /good или /teach.
+        # ИЗМ: калибровка уверенности через margin. Если топ-1 и топ-2
+        # почти равны, ответ выбирается «на грани» — уверенность завышена.
+        # Штрафуем такую ситуацию: при margin >= 0.25 — полный вес, иначе 0.55..1.0.
+        cands.sort(key=lambda x: -x[0])
+        conf, best = cands[0]
+        if len(cands) >= 2:
+            margin = conf - cands[1][0]
+            conf *= 0.55 + 0.45 * min(1.0, margin * 4.0)
         return best, conf
 
     def report(self):

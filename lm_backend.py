@@ -82,6 +82,7 @@ if BACKEND == "llamacpp" and not os.path.isfile(MODEL_PATH):
 N_CTX = _env_int("BRAIN_LM_CTX", 4096)
 N_GPU_LAYERS = _env_int("BRAIN_LM_GPU_LAYERS", -1)
 N_THREADS = _env_int("BRAIN_LM_THREADS", 0) or None
+VERBOSE = os.environ.get("BRAIN_LM_VERBOSE", "0") not in ("0", "", "false", "False")
 CHAT_FORMAT = os.environ.get("BRAIN_LM_CHAT_FORMAT", "").strip() or None
 LMSTUDIO_URL = os.environ.get(
     "BRAIN_LM_URL", "http://localhost:1234/v1/chat/completions"
@@ -278,7 +279,7 @@ class LMBackend:
                     model_path=MODEL_PATH,
                     n_ctx=N_CTX,
                     n_gpu_layers=layers,
-                    verbose=False,
+                    verbose=VERBOSE,
                 )
                 if N_THREADS:
                     kwargs["n_threads"] = N_THREADS
@@ -350,35 +351,14 @@ class LMBackend:
     # ---------- потоковая генерация ----------
 
     def _stream_llamacpp(self, messages, should_stop):
-        if RAW_CHATML:
-            # Пустой блок <think> в конце промпта отключает рассуждение у Qwen3-подобных
-            # моделей. Иначе модель пишет «Thinking Process…», а ответ полностью вырезается.
-            it = self.llm.create_completion(
-                prompt=chatml_prompt(messages),
-                max_tokens=RUNTIME["max_tokens"],
-                temperature=TEMPERATURE,
-                top_p=TOP_P,
-                stream=True,
-                repeat_penalty=1.1,
-                stop=["<|im_end|>", "<|endoftext|>"],
-            )
-            for chunk in it:
-                if should_stop():
-                    break
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("text") or ""
-                if delta:
-                    yield delta
-            return
-        it = self.llm.create_chat_completion(
-            messages=messages,
+        it = self.llm.create_completion(
+            prompt=chatml_prompt(messages),
             max_tokens=RUNTIME["max_tokens"],
             temperature=TEMPERATURE,
             top_p=TOP_P,
             stream=True,
-            repeat_penalty=1.1,
+            logprobs=5,  # ← НОВОЕ: топ-5 логитов на токен
+            stop=["<|im_end|>", "<|endoftext|>"],
         )
         for chunk in it:
             if should_stop():
@@ -386,8 +366,10 @@ class LMBackend:
             choices = chunk.get("choices") or []
             if not choices:
                 continue
-            delta = (choices[0].get("delta") or {}).get("content") or ""
+            delta = choices[0].get("text") or ""
+            lp = choices[0].get("logprobs") or {}
             if delta:
+                self._last_logprobs = lp  # ← сохраняем
                 yield delta
 
     def _stream_lmstudio(self, messages, should_stop):
