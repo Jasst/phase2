@@ -84,6 +84,10 @@ N_GPU_LAYERS = _env_int("BRAIN_LM_GPU_LAYERS", -1)
 N_THREADS = _env_int("BRAIN_LM_THREADS", 0) or None
 VERBOSE = os.environ.get("BRAIN_LM_VERBOSE", "0") not in ("0", "", "false", "False")
 CHAT_FORMAT = os.environ.get("BRAIN_LM_CHAT_FORMAT", "").strip() or None
+# Логиты нужны для дистилляции распределения LM в граф (distill_from_lm),
+# но требуют logits_all=True при загрузке — это +~2.5 ГБ памяти для 9B-модели
+# с n_ctx=4096. По умолчанию выключено; включается BRAIN_LM_LOGITS_ALL=1.
+LOGITS_ALL = os.environ.get("BRAIN_LM_LOGITS_ALL", "0") not in ("0", "", "false", "False")
 LMSTUDIO_URL = os.environ.get(
     "BRAIN_LM_URL", "http://localhost:1234/v1/chat/completions"
 )
@@ -249,11 +253,12 @@ class LMBackend:
         self.history = []
         self._gen_lock = threading.Lock()
         self.llm = None
-        self.active_model = None        # имя модели, которое реально работает в LM Studio
-        self.last_stats = None          # (токенов, секунд)
-        self.last_truncated = False     # ответ оборван лимитом времени/токенов
+        self.active_model = None  # имя модели, которое реально работает в LM Studio
+        self.last_stats = None  # (токенов, секунд)
+        self.last_truncated = False  # ответ оборван лимитом времени/токенов
+        self._collected_logprobs = []  # снимок логитов после последней генерации
 
-        self.backend_used = BACKEND    # реально работающий бэкенд (может смениться при откате)
+        self.backend_used = BACKEND  # реально работающий бэкенд (может смениться при откате)
 
         if BACKEND == "llamacpp":
             if not os.path.isfile(MODEL_PATH):
@@ -267,12 +272,14 @@ class LMBackend:
                 ) from exc
 
             print(f"[LM] загрузка модели: {MODEL_PATH}")
+            if LOGITS_ALL:
+                print("[LM] logits_all=True (для дистилляции распределения; +память)")
             # -1 = «все слои на GPU»; если CUDA нет (или её не хватило), уменьшаем до 0.
             attempts = []
             if N_GPU_LAYERS and N_GPU_LAYERS > 0:
                 attempts.append(N_GPU_LAYERS)
             else:
-                attempts.extend([N_GPU_LAYERS, 0])   # -1 (авто), затем чистый CPU
+                attempts.extend([N_GPU_LAYERS, 0])  # -1 (авто), затем чистый CPU
             error = None
             for layers in attempts:
                 kwargs = dict(
@@ -281,6 +288,11 @@ class LMBackend:
                     n_gpu_layers=layers,
                     verbose=VERBOSE,
                 )
+                # logits_all=True обязателен для create_completion(logprobs=N).
+                # Без него llama-cpp-python падает:
+                #   "logprobs is not supported for models created with logits_all=False"
+                if LOGITS_ALL:
+                    kwargs["logits_all"] = True
                 if N_THREADS:
                     kwargs["n_threads"] = N_THREADS
                 if CHAT_FORMAT:
@@ -289,7 +301,7 @@ class LMBackend:
                     self.llm = Llama(**kwargs)
                     error = None
                     break
-                except Exception as exc:               # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
                     error = exc
                     print(f"[LM] не удалось загрузить (n_gpu_layers={layers}): {exc}")
             if error is not None:
@@ -351,15 +363,21 @@ class LMBackend:
     # ---------- потоковая генерация ----------
 
     def _stream_llamacpp(self, messages, should_stop):
-        it = self.llm.create_completion(
+        self._collected_logprobs = []  # сбрасываем на каждый запрос
+        call_kwargs = dict(
             prompt=chatml_prompt(messages),
             max_tokens=RUNTIME["max_tokens"],
             temperature=TEMPERATURE,
             top_p=TOP_P,
             stream=True,
-            logprobs=5,  # ← НОВОЕ: топ-5 логитов на токен
             stop=["<|im_end|>", "<|endoftext|>"],
         )
+        # logprobs=5 запрашиваем ТОЛЬКО если модель загружена с logits_all=True.
+        # Иначе llama-cpp-python кидает:
+        #   "logprobs is not supported for models created with logits_all=False"
+        if LOGITS_ALL:
+            call_kwargs["logprobs"] = 5
+        it = self.llm.create_completion(**call_kwargs)
         for chunk in it:
             if should_stop():
                 break
@@ -367,9 +385,14 @@ class LMBackend:
             if not choices:
                 continue
             delta = choices[0].get("text") or ""
-            lp = choices[0].get("logprobs") or {}
             if delta:
-                self._last_logprobs = lp  # ← сохраняем
+                if LOGITS_ALL:
+                    # Собираем токены и их топ-логиты по всем чанкам.
+                    lp = choices[0].get("logprobs") or {}
+                    tokens_lp = lp.get("tokens") or []
+                    top_lp = lp.get("top_logprobs") or []
+                    for tok, tops in zip(tokens_lp, top_lp):
+                        self._collected_logprobs.append({"token": tok, "top": tops})
                 yield delta
 
     def _stream_lmstudio(self, messages, should_stop):
@@ -550,6 +573,7 @@ class LMWorker:
         self._result = None             # (id, итоговый текст)
         self._partial = (0, "")         # (id, текст по мере генерации)
         self._last_id = 0
+        self.last_logprobs = []
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -597,8 +621,8 @@ class LMWorker:
             answer = ""
             try:
                 for text, done in self.backend.stream(
-                    question, context, memory,
-                    should_stop=lambda: self._cancelled(request_id), note=note,
+                        question, context, memory,
+                        should_stop=lambda: self._cancelled(request_id), note=note,
                 ):
                     with self._lock:
                         if request_id == self._last_id:
@@ -614,3 +638,8 @@ class LMWorker:
                     if answer and remember:
                         self.backend.remember_exchange(question, answer)
                     self._result = (request_id, answer)
+                    # Снимок логитов под локом — их заберёт главный поток
+                    # через lm.last_logprobs и передаст в distill_from_lm().
+                    self.last_logprobs = list(
+                        getattr(self.backend, "_collected_logprobs", [])
+                    )

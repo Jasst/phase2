@@ -38,6 +38,17 @@ _GREET = re.compile(
 
 _WORD = re.compile(r"[^\W_]+")
 
+_ANSWER_LABEL = re.compile(r"\bОТВЕТ\s*:\s*", re.I)
+_ANSWER_LABEL_EN = re.compile(r"\bANSWER\s*:\s*", re.I)
+
+
+def _split_rationale(text):
+    """Делит текст на рациональ и финальный ответ по метке ОТВЕТ:/ANSWER:."""
+    for pat in (_ANSWER_LABEL, _ANSWER_LABEL_EN):
+        m = pat.search(text)
+        if m:
+            return text[:m.start()].strip(), text[m.end():].strip()
+    return "", text.strip()
 
 def tokens(text):
     return _WORD.findall(str(text).lower())
@@ -143,7 +154,6 @@ class Answerer:
                 "best": None, "best_score": -1.0}
 
     def request(self, st):
-        """Запрос к LM: (вопрос, добавка к системному промпту, запоминать?)."""
         th = st["thought"]
         if st["stage"] == 0:
             note = ""
@@ -152,7 +162,11 @@ class Answerer:
                 note = (f"Мысль сети ({where}): связанные по смыслу слова — "
                         f"{' '.join(th.words)}. Опирайся на них, если они согласуются "
                         "с вопросом. Если нет — ответь по существу и не выдумывай.")
-            return st["q"], note, True
+            q = (st["q"] + "\n\n"
+                           "Сначала кратко (1–2 предложения) опиши ход мысли, "
+                           "затем с новой строки напиши: ОТВЕТ: <твой ответ>")
+            return q, note, True
+        # ← НОВОЕ: ветка перепроверки
         prev = st["best"] or ""
         return (f"Вопрос: {st['q']}\nЧерновик ответа: {prev}\n"
                 "Проверь черновик: верен ли он и отвечает ли на вопрос. Если да — "
@@ -160,12 +174,13 @@ class Answerer:
                 ), "", False
 
     def feed(self, st, text):
-        """Принимает ответ LM. True — нужен следующий запрос (переписывание)."""
         text = (text or "").strip()
         if text:
-            score = self.judge(st["seeds"], text)
+            rationale, answer = _split_rationale(text)
+            st["rationale"] = rationale
+            score = self.judge(st["seeds"], answer)
             if st["best"] is None or score >= st["best_score"]:
-                st["best"], st["best_score"] = text, score
+                st["best"], st["best_score"] = answer, score
         st["stage"] += 1
         return st["best"] is not None and st["stage"] <= REVISE_ROUNDS
 
@@ -188,5 +203,22 @@ class Answerer:
 
     def learn(self, question, words, confidence=1.0):
         q = tokens(question)
-        self.brain.train_words(q + words)
+        self.brain.train_words(q + words, weight=confidence)  # ← weight
         self.brain._reinforce_answer(words, weight=confidence)
+
+    def distill_rationale(self, st, confidence=1.0):
+        """Дистиллирует ход мысли LM в граф, если он согласуется с вопросом."""
+        rationale = st.get("rationale", "")
+        if not rationale or not st["seeds"]:
+            return
+        rw = tokens(rationale)
+        if not rw:
+            return
+        r_score = self.mind.support(st["seeds"], rw)
+        if r_score < HINT_MIN_SUPPORT:
+            return
+        qw = tokens(st["q"])
+        w = min(1.0, r_score * confidence)
+        self.brain.train_words(qw + rw, weight=w)
+        self.brain.adapt(qw + rw, confidence=w)
+

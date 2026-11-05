@@ -11,8 +11,7 @@ import pygame
 from mind import Mind
 from lm_backend import LMBackend, LMWorker, RUNTIME, set_option
 from episodes import EpisodeMemory, RECALL_STRONG, RECALL_WEAK
-from reasoning import Answerer
-
+from reasoning import Answerer, LEARN_MIN
 W, H = 1280, 800
 CHAT_W = 420
 NET_W = W - CHAT_W
@@ -444,7 +443,7 @@ class Brain:
             ids.append(nid)
         return ids
 
-    def train_words(self, words):
+    def train_words(self, words, weight=1.0):
         ids = self._ids_for(words)
         for i in range(len(ids)):
             for j in range(i + 1, min(len(ids), i + 1 + TRAIN_WINDOW)):
@@ -452,12 +451,12 @@ class Brain:
                 if a == b:
                     continue
                 k = key(a, b)
-                gain = HEBB_RATE / (j - i)
+                gain = HEBB_RATE * weight / (j - i)  # ← умножено на weight
                 if k in self.links:
                     self.links[k] = min(2.0, self.links[k] + gain)
                 elif j == i + 1:
                     self.connect_words(self.neurons[a], self.neurons[b])
-                if j == i + 1:
+                if j == i + 1 and weight > 0.1:  # ← bigram только при весе
                     bk = (self.neurons[a].word, self.neurons[b].word)
                     self.bigram[bk] = self.bigram.get(bk, 0) + 1
         return ids
@@ -724,13 +723,41 @@ class Brain:
         return answer
 
     def _reinforce_answer(self, answer, weight=1.0):
-        """weight 0..1 — уверенность в ответе. 1.0 = старый режим."""
         for a, b in zip(answer, answer[1:]):
             na, nb = self.words.get(a), self.words.get(b)
             if na is None or nb is None:
                 continue
             k = key(na, nb)
             gain = HEBB_RATE * 2 * weight
+            if k in self.links:
+                self.links[k] = min(2.0, self.links[k] + gain)
+            if weight > 0.1:  # ← защита bigram
+                self.bigram[(a, b)] = self.bigram.get((a, b), 0) + 1
+
+    def distill_from_lm(self, answer_words, logprobs, weight=0.5):
+        """Мягкая дистилляция: связь (a→b) крепнет пропорционально тому,
+        насколько уверенно LM ставила b в топ-5 при генерации ответа."""
+        if not logprobs:
+            return
+        # Для каждого слова — максимальная вероятность, с которой оно было в топ-5
+        conf = {}
+        for item in logprobs:
+            tops = item.get("top") or {}
+            for tok, lp in tops.items():
+                w = _norm(tok)
+                if w:
+                    prob = math.exp(lp) if lp < 0 else 1.0
+                    if prob > conf.get(w, 0.0):
+                        conf[w] = prob
+        for a, b in zip(answer_words, answer_words[1:]):
+            na, nb = self.words.get(a), self.words.get(b)
+            if na is None or nb is None:
+                continue
+            prob = conf.get(b, 0.0)
+            if prob < 0.05:                    # слово почти не было в топе — не сигнал
+                continue
+            k = key(na, nb)
+            gain = HEBB_RATE * 2 * prob * weight
             if k in self.links:
                 self.links[k] = min(2.0, self.links[k] + gain)
             self.bigram[(a, b)] = self.bigram.get((a, b), 0) + 1
@@ -1746,6 +1773,7 @@ def main():
                 pending["entry"][1] = partial_text
             res = lm.poll(pending["req"])
             if res is not None:
+                lp = lm.last_logprobs if lm is not None else []  # ← захватываем до нового submit
                 st = pending["state"]
                 if answerer.feed(st, res):
                     q_req, note, remember = answerer.request(st)
@@ -1765,6 +1793,16 @@ def main():
                         _set_score(entry_ref, score)
                         resp = speech(reply_text.split(), entry_ref, now,
                                       gap_sec(sliders[2].value), live=True)
+                        # ↓ взвешенное обучение графа
+                        if score > LEARN_MIN and last_answer:
+                            conf = min(1.0, score)
+                            if from_lm and lp:
+                                brain.distill_from_lm(last_answer, lp)
+                            if from_lm:
+                                answerer.distill_rationale(st, confidence=conf)
+                            brain.adapt(tokenize(st["q"]) + last_answer, confidence=conf)
+                            if last_user_msg:
+                                answerer.learn(last_user_msg, last_answer, confidence=conf)
                     else:
                         entry_ref[1] = "пока не знаю этого. Научите: /teach ответ"
 

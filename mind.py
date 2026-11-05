@@ -82,7 +82,8 @@ class Mind:
         self.think_every = THINK_EVERY
         self.conf_min = CONF_MIN               # порог уверенности (меняется /conf)
         self.topic = {}                        # рабочая память: тема разговора
-        self.last_side = "R"                   # какое полушарие думало последним
+        self.last_side = "R"                  # какое полушарие думало последним
+        self.workspace = {}
 
     # ---------- утилиты ----------
 
@@ -166,6 +167,35 @@ class Mind:
             if self.recent[w] < 0.05:
                 del self.recent[w]
 
+    def _integrate(self):
+        """GWT: объединяем поля и активные группы в единое рабочее пространство."""
+        merged = {}
+        for w, v in self.fieldL.items():
+            merged[w] = merged.get(w, 0.0) + v
+        for w, v in self.fieldR.items():
+            merged[w] = merged.get(w, 0.0) + v
+        # вклад активных групп (метод _group_activity определён в Brain, не в Mind)
+        for g, act in self.b._group_activity(merged).items():
+            if act < 0.1:
+                continue
+            for w, gg in self.b.wgroup.items():
+                if gg == g:
+                    merged[w] = merged.get(w, 0.0) + GROUP_W * act
+        for w in set(self.workspace) | set(merged):
+            self.workspace[w] = 0.5 * self.workspace.get(w, 0.0) + 0.5 * merged.get(w, 0.0)
+        self.workspace = {w: v for w, v in self.workspace.items() if v >= 0.02}
+
+    def integration(self):
+        """Грубый аналог Φ: насколько распределения полей пересекаются (0..1)."""
+        if not self.fieldL or not self.fieldR:
+            return 0.0
+        def dist(f):
+            s = sum(f.values()) or 1.0
+            return {w: v / s for w, v in f.items()}
+        p, q = dist(self.fieldL), dist(self.fieldR)
+        keys = set(p) | set(q)
+        return sum(math.sqrt(p.get(w, 0.0) * q.get(w, 0.0)) for w in keys)
+
     # ---------- полушария ----------
 
     def _right(self, adj):
@@ -203,6 +233,7 @@ class Mind:
             g = self.b.wgroup.get(w)
             if g is not None:
                 s += GROUP_W * act.get(g, 0.0)
+            s += 0.7 * self.workspace.get(w, 0.0)  # ← GWT
             s -= 2.0 * self.recent.get(w, 0.0)
             s += TOPIC_W * self.topic.get(w, 0.0)
             cands[w] = s
@@ -229,6 +260,7 @@ class Mind:
             self._mirror(self.fieldL if side == "R" else self.fieldR, word, adj)
 
         self._decay()
+        self._integrate()  # ← новое
         if (adapt and self.steps % ADAPT_EVERY == 0
                 and len(self.stream) >= 4 and self.b.wgroup):
             self.b.adapt(list(self.stream)[-ADAPT_EVERY:])
@@ -357,7 +389,8 @@ class Mind:
             snapshot = (
                 collections.deque(self.stream, maxlen=STREAM_LEN),
                 dict(self.fieldL), dict(self.fieldR), dict(self.recent),
-                dict(self.topic), self.steps, self.turn, self.since_emit,
+                dict(self.topic), dict(self.workspace), self.steps,
+                self.turn, self.since_emit,
                 set(self.b.forced), self.last_side,
             )
             try:
@@ -365,12 +398,12 @@ class Mind:
                         if w not in seeds]
             finally:
                 (self.stream, self.fieldL, self.fieldR, self.recent, self.topic,
-                 self.steps, self.turn, self.since_emit, self.b.forced,
-                 self.last_side) = snapshot
+                 self.workspace, self.steps, self.turn, self.since_emit,
+                 self.b.forced, self.last_side) = snapshot
             if cand:
                 cands.append((cosine({w: 1.0 for w in cand}, ctx), cand))
         if not cands:
-            self.b.adapt(seeds)                  # незнакомый вопрос всё равно учит сеть
+            self.b.adapt(seeds)  # незнакомый вопрос всё равно учит сеть
             return [], 0.0
         # ИЗМ: калибровка уверенности через margin. Если топ-1 и топ-2
         # почти равны, ответ выбирается «на грани» — уверенность завышена.
@@ -390,5 +423,6 @@ class Mind:
         return [f"поток: {tail}",
                 f"тема: {topic}",
                 f"согласованность полей: {self.coherence():.2f}",
+                f"интеграция (Φ≈): {self.integration():.2f}",  # ← новое
                 f"последнее полушарие: {side}",
                 f"шагов мышления: {self.steps}"]
