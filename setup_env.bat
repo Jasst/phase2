@@ -7,7 +7,7 @@ set PY=C:\Users\PC\AppData\Local\Programs\Python\Python313\python.exe
 if not exist "%PY%" set PY=py -3.13
 
 echo [1/4] Удаляю старое виртуальное окружение...
-if exist .venv_rmdir /s /q .venv
+if exist .venv rmdir /s /q .venv
 
 echo [2/4] Создаю новое .venv...
 %PY% -m venv .venv || goto :err
