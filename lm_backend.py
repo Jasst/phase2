@@ -6,21 +6,29 @@
 
 Что умеет этот слой:
   * потоковая генерация: текст появляется по мере генерации (stream());
-  * отмена устаревших запросов: если пользователь задал новый вопрос,
-    старая генерация прерывается на ближайшем токене;
-  * эпизоды памяти передаются в промпт как доверенные прошлые ответы;
+  * очистка ответа: служебные подсказки графа, которые модель могла повторить,
+    вырезаются (strip_leaks), пользователь видит только сам ответ;
+  * раздельные настройки, которые можно менять во время работы (RUNTIME):
+      context_chars — сколько символов прошлого диалога и подсказок передаётся модели;
+      history       — сколько прошлых обменов помнится;
+      time_budget   — сколько секунд отводится на один ответ (0 — без лимита);
+      max_tokens    — максимальная длина ответа в токенах;
+  * отмена устаревших запросов: новый вопрос прерывает предыдущую генерацию;
   * статистика скорости (токенов/с) доступна в last_stats.
 
-Переменные окружения:
+Переменные окружения (значения по умолчанию в скобках):
   BRAIN_LM_BACKEND     llamacpp (по умолчанию) | lmstudio
   BRAIN_LM_PATH        путь к .gguf (для llamacpp)
-  BRAIN_LM_CTX         размер контекста (по умолчанию 4096)
-  BRAIN_LM_GPU_LAYERS  слои на GPU, -1 — все (по умолчанию)
-  BRAIN_LM_THREADS     потоки CPU для llama.cpp (по умолчанию авто)
-  BRAIN_LM_CHAT_FORMAT шаблон чата (например chatml); по умолчанию из метаданных GGUF
+  BRAIN_LM_CTX         размер окна модели при загрузке (4096); задаётся до запуска
+  BRAIN_LM_GPU_LAYERS  слои на GPU, -1 — все (-1)
+  BRAIN_LM_THREADS     потоки CPU для llama.cpp (авто)
+  BRAIN_LM_CHAT_FORMAT шаблон чата, например chatml (из метаданных GGUF)
   BRAIN_LM_URL, BRAIN_LM_NAME  для LM Studio
-  BRAIN_LM_MAX_TOKENS, BRAIN_LM_TEMPERATURE, BRAIN_LM_TOP_P, BRAIN_LM_HISTORY,
-  BRAIN_LM_TIMEOUT
+  BRAIN_LM_MAX_TOKENS  длина ответа в токенах (220)
+  BRAIN_LM_CONTEXT_CHARS  контекст диалога в символах (6000)
+  BRAIN_LM_HISTORY     прошлых обменов в контексте (3)
+  BRAIN_LM_TIME_BUDGET секунд на ответ, 0 — без лимита (60)
+  BRAIN_LM_TEMPERATURE, BRAIN_LM_TOP_P, BRAIN_LM_TIMEOUT
 """
 
 import json
@@ -60,29 +68,98 @@ LMSTUDIO_URL = os.environ.get(
 )
 LMSTUDIO_MODEL = os.environ.get("BRAIN_LM_NAME", "qwen3.5-9b")
 
-MAX_NEW_TOKENS = _env_int("BRAIN_LM_MAX_TOKENS", 220)
 TEMPERATURE = _env_float("BRAIN_LM_TEMPERATURE", 0.7)
 TOP_P = _env_float("BRAIN_LM_TOP_P", 0.9)
-HISTORY_TURNS = max(0, _env_int("BRAIN_LM_HISTORY", 3))
 REQUEST_TIMEOUT = _env_int("BRAIN_LM_TIMEOUT", 180)
+
+# Настройки, которые пользователь меняет во время работы (/ctx, /history, /time, /tokens).
+RUNTIME = {
+    "context_chars": _env_int("BRAIN_LM_CONTEXT_CHARS", 6000),
+    "history": max(0, _env_int("BRAIN_LM_HISTORY", 3)),
+    "time_budget": max(0.0, _env_float("BRAIN_LM_TIME_BUDGET", 60.0)),
+    "max_tokens": max(16, _env_int("BRAIN_LM_MAX_TOKENS", 220)),
+}
+# Допустимые пределы (минимум, максимум).
+LIMITS = {
+    "context_chars": (500, 30000),
+    "history": (0, 20),
+    "time_budget": (0.0, 600.0),
+    "max_tokens": (16, 2048),
+}
+
+
+def set_option(name, value):
+    """Меняет настройку RUNTIME в допустимых пределах. Возвращает новое значение."""
+    lo, hi = LIMITS[name]
+    value = max(lo, min(hi, value))
+    if name in ("context_chars", "history", "max_tokens"):
+        value = int(value)
+    RUNTIME[name] = value
+    return value
+
 
 SYSTEM_PROMPT = (
     "Ты собеседник в чате. Отвечай по-русски, связно и по делу, "
-    "обычно в 1–3 предложения. Ассоциации из памяти рассматривай "
-    "как подсказки, а не как гарантированно верные факты. /no_think"
+    "обычно в 1–3 предложения. Служебные подсказки ниже нужны только тебе: "
+    "никогда не пересказывай их, не цитируй и не упоминай в ответе. "
+    "Ассоциации из памяти — возможные подсказки, а не гарантированно верные факты. "
+    "/no_think"
 )
-MEMORY_NOTE = (
-    "Проверенные прошлые ответы (им можно доверять больше ассоциаций): "
-)
+MEMORY_NOTE = "Проверенные прошлые ответы (им можно доверять больше ассоциаций): "
 LOG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "dialog_log.jsonl"
 )
 
+# Фразы, которые появляются только из служебных подсказок. Предложение, где они
+# встретились, в ответ не попадает. Общих слов здесь нет, чтобы не резать обычную речь.
+LEAK_PHRASES = (
+    "ассоциации графовой",
+    "ассоциации из памяти",
+    "проверенные прошлые",
+    "мысль сети",
+    "черновик ответа",
+    "проверь черновик",
+    "опирайся на них",
+    "служебн",
+    "/no_think",
+)
+
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
+_SENT_SPLIT = re.compile(r"(?<=[.!?…])\s+|\n+")
+_PAIR = re.compile(r"«[^»]*»\s*→\s*«[^»]*»")
+_LEAK = re.compile("|".join(re.escape(p) for p in LEAK_PHRASES), re.I)
+_LABEL = re.compile(r"^\s*(ответ|черновик|вопрос)\s*:\s*", re.I)
+_END = re.compile(r"[.!?…]")
 
 
-def clean_reply(text):
-    """Удаляет think-блоки и обрезает незавершённый блок рассуждений."""
+_WORD = re.compile(r"[^\W_]+")
+
+
+def shingles(text, n=4):
+    """Множество фрагментов из n слов подряд (нижний регистр)."""
+    words = _WORD.findall(str(text).lower())
+    return {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+
+def strip_leaks(text, forbidden=None):
+    """Убирает предложения, которые повторяют служебные подсказки.
+
+    forbidden — фрагменты из 4 слов подряд, взятые из системного промпта.
+    Если предложение содержит такой фрагмент, оно считается пересказом инструкции.
+    """
+    kept = []
+    for part in _SENT_SPLIT.split(text):
+        part = part.strip()
+        if not part or _LEAK.search(part) or _PAIR.search(part):
+            continue
+        if forbidden and shingles(part) & forbidden:
+            continue
+        kept.append(part)
+    return " ".join(kept)
+
+
+def clean_reply(text, forbidden=None):
+    """Удаляет think-блоки, обрезает незавершённое рассуждение и служебные фрагменты."""
     if isinstance(text, list):
         # Некоторые OpenAI-совместимые серверы возвращают content-массив.
         text = "".join(
@@ -91,7 +168,18 @@ def clean_reply(text):
     text = _THINK_BLOCK.sub("", str(text or ""))
     if re.search(r"<think>", text, re.I):
         text = re.split(r"<think>", text, maxsplit=1, flags=re.I)[0]
-    return text.strip()
+    text = strip_leaks(text, forbidden)
+    return _LABEL.sub("", text, count=1).strip()
+
+
+def _finish(text, truncated):
+    """Если ответ оборван лимитом времени или токенов, обрывает его по последней точке."""
+    if not truncated:
+        return text
+    ends = list(_END.finditer(text))
+    if ends:
+        return text[:ends[-1].end()]
+    return text
 
 
 class LMBackend:
@@ -100,6 +188,7 @@ class LMBackend:
         self._gen_lock = threading.Lock()
         self.llm = None
         self.last_stats = None          # (токенов, секунд)
+        self.last_truncated = False     # ответ оборван лимитом времени/токенов
 
         if BACKEND == "llamacpp":
             if not os.path.isfile(MODEL_PATH):
@@ -133,6 +222,25 @@ class LMBackend:
 
     # ---------- промпт ----------
 
+    def _history_messages(self, used):
+        """Прошлые обмены, самые новые первыми, пока укладываются в бюджет контекста."""
+        n = RUNTIME["history"]
+        if n <= 0:
+            return []
+        budget = RUNTIME["context_chars"]
+        picked = []
+        for user_text, assistant_text in reversed(self.history[-n:]):
+            size = len(user_text) + len(assistant_text)
+            if picked and used + size > budget:
+                break
+            picked.append((user_text, assistant_text))
+            used += size
+        messages = []
+        for user_text, assistant_text in reversed(picked):
+            messages.append({"role": "user", "content": user_text})
+            messages.append({"role": "assistant", "content": assistant_text})
+        return messages
+
     def _messages(self, question, ctx, memory=(), note=""):
         system = SYSTEM_PROMPT
         clean_ctx = [str(x).strip() for x in ctx if str(x).strip()]
@@ -143,24 +251,22 @@ class LMBackend:
             system += " " + MEMORY_NOTE + " ".join(clean_mem[:3])
         if note:
             system += " " + str(note).strip()
+        used = len(system)
         messages = [{"role": "system", "content": system}]
-        for user_text, assistant_text in self.history[-HISTORY_TURNS:]:
-            messages.append({"role": "user", "content": user_text})
-            messages.append({"role": "assistant", "content": assistant_text})
+        messages += self._history_messages(used)
         messages.append({"role": "user", "content": str(question)})
         return messages
 
     # ---------- потоковая генерация ----------
 
     def _stream_llamacpp(self, messages, should_stop):
-        extra = {"repeat_penalty": 1.1}
         it = self.llm.create_chat_completion(
             messages=messages,
-            max_tokens=MAX_NEW_TOKENS,
+            max_tokens=RUNTIME["max_tokens"],
             temperature=TEMPERATURE,
             top_p=TOP_P,
             stream=True,
-            **extra,
+            repeat_penalty=1.1,
         )
         for chunk in it:
             if should_stop():
@@ -177,7 +283,7 @@ class LMBackend:
             {
                 "model": LMSTUDIO_MODEL,
                 "messages": messages,
-                "max_tokens": MAX_NEW_TOKENS,
+                "max_tokens": RUNTIME["max_tokens"],
                 "temperature": TEMPERATURE,
                 "top_p": TOP_P,
                 "stream": True,
@@ -220,43 +326,59 @@ class LMBackend:
                     yield delta
 
     def stream(self, question, ctx=(), memory=(), should_stop=lambda: False, note=""):
-        """Генератор (текст, готово). Текст — весь ответ, очищенный от think.
+        """Генератор (текст, готово). Текст — весь ответ, очищенный от служебного.
 
         should_stop() проверяется на каждом фрагменте: при True генерация
-        прерывается, а накопленный текст отдаётся с готово=True.
+        прерывается. Лимит времени (RUNTIME['time_budget']) действует так же.
         """
         if not str(question).strip():
+            self.last_truncated = False
             yield "", True
             return
         with self._gen_lock:
             messages = self._messages(question, list(ctx or ()), list(memory or ()), note)
+            budget = RUNTIME["time_budget"]
+            t0 = time.time()
+            deadline = t0 + budget if budget > 0 else None
+            timed_out = {"v": False}
+
+            def stop():
+                if should_stop():
+                    return True
+                if deadline is not None and time.time() > deadline:
+                    timed_out["v"] = True
+                    return True
+                return False
+
             source = (self._stream_llamacpp if BACKEND == "llamacpp"
                       else self._stream_lmstudio)
-            raw, count, t0 = "", 0, time.time()
-            for delta in source(messages, should_stop):
+            # Фрагменты системного промпта: ответ, который их повторяет, очищается.
+            forbidden = shingles(messages[0]["content"])
+            raw, count = "", 0
+            for delta in source(messages, stop):
                 raw += delta
                 count += 1
-                yield clean_reply(raw), False
+                yield clean_reply(raw, forbidden), False
             self.last_stats = (count, time.time() - t0)
-            yield clean_reply(raw), True
+            self.last_truncated = timed_out["v"] or count >= RUNTIME["max_tokens"]
+            yield _finish(clean_reply(raw, forbidden), self.last_truncated), True
 
     def generate(self, question, ctx=(), memory=(), remember=True):
         """Совместимый вариант без потока: вернуть готовый ответ."""
         reply = ""
         for reply, done in self.stream(question, ctx, memory):
             pass
-        if remember and reply and HISTORY_TURNS > 0:
+        if remember and reply and RUNTIME["history"] > 0:
             self.remember_exchange(question, reply)
         return reply
 
     def remember_exchange(self, question, reply):
         """Сохраняет только актуальный обмен в короткую историю диалога."""
-        if not reply or HISTORY_TURNS <= 0:
+        n = RUNTIME["history"]
+        if not reply or n <= 0:
             return
         with self._gen_lock:
-            self.history = (
-                self.history + [(str(question), str(reply))]
-            )[-HISTORY_TURNS:]
+            self.history = (self.history + [(str(question), str(reply))])[-n:]
 
     def speed_text(self):
         if not self.last_stats:

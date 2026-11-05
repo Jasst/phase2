@@ -6,3 +6,4 @@
 /phase1
 /phase2
 *.zip
+.env

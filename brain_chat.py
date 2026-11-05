@@ -9,7 +9,7 @@ from collections import deque
 import pygame
 
 from mind import Mind
-from lm_backend import LMBackend, LMWorker
+from lm_backend import LMBackend, LMWorker, RUNTIME, set_option
 from episodes import EpisodeMemory, RECALL_STRONG, RECALL_WEAK
 from reasoning import Answerer
 
@@ -50,7 +50,8 @@ REGROUP_EVERY = 20
 
 THRESH = 1.0
 DECAY = 0.72
-MAX_NEURONS = 450
+MAX_NEURONS = max(100, min(2000, int(os.environ.get("BRAIN_MAX_NEURONS", "700"))))
+NEURON_LIMITS = (100, 2000)
 GROW_P = 0.08
 SPARK_P = 0.06
 ISO_LIMIT = 60
@@ -73,6 +74,27 @@ REPEAT_PEN = 2.5
 BIGRAM_W = 1.0
 LINK_W = 1.5
 MIN_SCORE = 0.05
+
+# Команды, меняющие настройки модели: команда -> (параметр, подпись, единица)
+TUNE_CMDS = {
+    "/ctx": ("context_chars", "контекст диалога", "симв."),
+    "/history": ("history", "помнит прошлых обменов", "шт."),
+    "/time": ("time_budget", "время на ответ", "с (0 — без лимита)"),
+    "/tokens": ("max_tokens", "длина ответа модели", "токенов"),
+}
+
+HELP_LINES = [
+    "Напишите вопрос обычными словами — сеть подумает и ответит.",
+    "Оценка ответа: /good — верно, /bad — неверно, /teach текст — правильный ответ.",
+    "Обучение: /assoc слово слово… — связать слова между собой; /train файл.txt — учить по тексту.",
+    "Память: /recall текст — найти похожие прошлые вопросы; /sleep — повторить память.",
+    "Сеть: /neurons N — лимит нейронов; /groups — смысловые группы; /save, /load, /reset.",
+    "Модель: /ctx N — символов контекста; /history N — сколько обменов помнит;",
+    "        /time N — секунд на ответ (0 — без лимита); /tokens N — длина ответа.",
+    "Состояние: /mind — что происходит в сети и какие настройки заданы.",
+    "Копирование: /copy — мысли и чат в буфер обмена и в файл session_log.txt; /log — только файл.",
+    "Значение без числа показывает текущую настройку, например /time.",
+]
 
 NB8 = [(a, b) for a in (-1, 0, 1) for b in (-1, 0, 1) if (a, b) != (0, 0)]
 
@@ -101,6 +123,35 @@ COH_HIST = 120               # точек на графике согласова
 HOT_NODE = 30               # кадров подсветки нейрона после спайка (~3 с)
 HOT_LINK = 20               # кадров подсветки связи (~2 с)
 
+
+
+SESSION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_log.txt")
+WHO_NAMES = {"you": "Вы", "net": "Сеть", "sys": "Система", "thought": "Мысль"}
+
+
+def session_text(chat, thoughts, n_chat=120, n_think=60):
+    """Текст журнала: последние мысли сети и последние реплики чата."""
+    lines = ["=== МЫСЛИ СЕТИ (последние) ==="]
+    lines += [str(t) for _, t in thoughts[-n_think:]]
+    lines += ["", "=== ЧАТ ==="]
+    lines += [f"{WHO_NAMES.get(w, w)}: {t}" for w, t in chat[-n_chat:]]
+    return "\n".join(lines) + "\n"
+
+
+def write_session(chat, thoughts, path=SESSION_PATH):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(session_text(chat, thoughts))
+    return path
+
+
+def copy_to_clipboard(text):
+    """Кладёт текст в буфер обмена. False, если буфер недоступен в этой системе."""
+    try:
+        pygame.scrap.init()
+        pygame.scrap.put(pygame.SCRAP_TEXT, text.encode("utf-8"))
+        return True
+    except Exception:
+        return False
 
 
 def key(a, b):
@@ -1057,6 +1108,7 @@ def speech(words, entry, now, gap, live=False):
 # ---------- главный цикл ----------
 
 def main():
+    global MAX_NEURONS
     pygame.init()
     screen = pygame.display.set_mode((W, H))
     pygame.display.set_caption("Brain Chat")
@@ -1106,8 +1158,7 @@ def main():
     thoughts = []
     scroll = {"think": 0, "chat": 0}
 
-    chat = [["sys", status + " Команды: /save /load /reset /sleep /groups /mind "
-                           "/temp N /conf N /good /bad /teach текст /recall текст /train путь"]]
+    chat = [["sys", status + " Напишите /help — список команд."]]
     text = ""
     acc = 0.0
     now = 0.0
@@ -1180,6 +1231,11 @@ def main():
                         for line in mind.report():
                             sys_msg(line)
                         sys_msg(f"эпизодов в памяти: {len(episodes.items)}")
+                        sys_msg(f"модель: контекст {RUNTIME['context_chars']} симв., "
+                                f"помнит {RUNTIME['history']} обмена, "
+                                f"время {RUNTIME['time_budget']:g} с, "
+                                f"длина {RUNTIME['max_tokens']} токенов")
+                        sys_msg(f"нейроны: {len(brain.neurons)} из {MAX_NEURONS}")
                         if last_support is not None:
                             sys_msg(f"опора последнего ответа на граф: {last_support:.2f}")
                         if lm is not None and lm.backend.speed_text():
@@ -1191,6 +1247,49 @@ def main():
                             sys_msg("Ничего похожего в памяти нет.")
                         for sim, ep in found:
                             sys_msg(f"[{sim:.2f}] {ep['q']} → {ep['a']}")
+                    elif msg == "/copy":
+                        body = session_text(chat, thoughts)
+                        path = write_session(chat, thoughts)
+                        if copy_to_clipboard(body):
+                            sys_msg(f"Скопировано в буфер обмена. Файл: {path}")
+                        else:
+                            sys_msg(f"Буфер обмена недоступен. Текст сохранён в файл: {path}")
+                    elif msg == "/log":
+                        path = write_session(chat, thoughts)
+                        sys_msg(f"Журнал сохранён: {path}")
+                    elif msg == "/help":
+                        for line in HELP_LINES:
+                            sys_msg(line)
+                    elif msg.split()[:1] == ["/neurons"]:
+                        parts = msg.split()
+                        if len(parts) == 2 and parts[1].isdigit():
+                            MAX_NEURONS = max(NEURON_LIMITS[0], min(NEURON_LIMITS[1], int(parts[1])))
+                            sys_msg(f"Лимит нейронов: {MAX_NEURONS}. "
+                                    f"Сейчас: {len(brain.neurons)}.")
+                        else:
+                            sys_msg(f"Лимит нейронов: {MAX_NEURONS} (сейчас {len(brain.neurons)}). "
+                                    f"Формат: /neurons 700")
+                    elif msg.split()[:1] == ["/assoc"]:
+                        ids = tokenize(msg[len("/assoc"):], limit=None)
+                        if len(ids) < 2:
+                            sys_msg("Формат: /assoc слово слово слово — эти слова свяжутся между собой.")
+                        else:
+                            brain.train_words(ids)
+                            brain.train_words(ids)          # повтор делает связь сильнее
+                            brain.regroup()
+                            sys_msg(f"Связано слов: {len(ids)} — {' '.join(ids)}.")
+                    elif msg.split()[:1] and msg.split()[0] in TUNE_CMDS:
+                        cmd = msg.split()[0]
+                        name, label, unit = TUNE_CMDS[cmd]
+                        arg = msg[len(cmd):].strip().replace(",", ".")
+                        if arg:
+                            try:
+                                new = set_option(name, float(arg))
+                                sys_msg(f"{label}: {new:g} {unit}")
+                            except ValueError:
+                                sys_msg(f"Формат: {cmd} число (например {cmd} 30)")
+                        else:
+                            sys_msg(f"{label}: {RUNTIME[name]:g} {unit}")
                     elif msg.startswith("/temp"):
                         parts = msg.split()
                         if len(parts) == 2:
@@ -1411,6 +1510,10 @@ def main():
 
     try:
         save_brain(brain)
+    except OSError:
+        pass
+    try:
+        write_session(chat, thoughts)
     except OSError:
         pass
     pygame.quit()
