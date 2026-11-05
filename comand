@@ -1,0 +1,1 @@
+Compress-Archive -Path brain_chat.py, mind.py -DestinationPath brain_project.zip -Force

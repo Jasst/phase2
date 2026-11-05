@@ -1,0 +1,1420 @@
+import json
+import math
+import os
+import random
+import re
+import time
+from collections import deque
+
+import pygame
+
+from mind import Mind
+from lm_backend import LMBackend, LMWorker
+from episodes import EpisodeMemory, RECALL_STRONG, RECALL_WEAK
+from reasoning import Answerer
+
+W, H = 1280, 800
+CHAT_W = 420
+NET_W = W - CHAT_W
+GRID = 50
+CELL = min(NET_W, H) / GRID
+OX = (NET_W - GRID * CELL) / 2
+OY = (H - GRID * CELL) / 2
+
+SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brain_state.json")
+AUTOSAVE_SEC = 60.0
+
+# ---- уровень 1: слои нейронов ----
+G_IN, G_ASSOC, G_INTEG, G_OUT = 0, 1, 2, 3
+LAYER_NAMES = ["вход (слова)", "ассоциации", "интегратор", "речь (выход)"]
+LAYER_COLORS = [(170, 184, 204), (130, 146, 168), (154, 144, 176), (196, 176, 150)]
+GROUP_GAIN = [1.0, 0.9, 1.1, 1.0]
+SUPER_W = [0.3, 0.6, 1.0, 1.4]
+
+# ---- уровень 2: смысловые группы слов ----
+GROUP_COLORS = [
+    (196, 124, 124), (204, 162, 112), (200, 192, 116), (150, 188, 134),
+    (122, 184, 164), (122, 168, 198), (132, 146, 186), (160, 134, 186),
+    (186, 134, 172), (168, 170, 176), (206, 152, 152), (152, 198, 168),
+    (130, 194, 198), (208, 190, 152), (160, 152, 192), (226, 228, 234),
+]
+GROUP_MAX = 16
+GROUP_NEW_T = 0.2
+REGROUP_ITERS = 3
+GROUP_W = 1.2
+
+# ---- уровень 3: адаптация всей сети ----
+ADAPT_UP = 0.04
+ADAPT_DOWN = 0.01
+REGROUP_EVERY = 20
+
+THRESH = 1.0
+DECAY = 0.72
+MAX_NEURONS = 450
+GROW_P = 0.08
+SPARK_P = 0.06
+ISO_LIMIT = 60
+PRUNE = 0.06
+HEBB_RATE = 0.05
+LINK_DECAY = 0.995
+SIM_DT = 0.1
+TIMELINE = 10.0
+MAX_WORDS = 12
+MAX_LINK_DIST = 9
+BRIDGE_P = 0.7
+TRAIN_WINDOW = 3
+TEMP_DEFAULT = 0.7
+NOISE_COUNT = 12
+NOISE_P = 0.05
+NOISE_GAIN = 0.5
+GEN_STEPS = 8
+GEN_DECAY = 0.6
+REPEAT_PEN = 2.5
+BIGRAM_W = 1.0
+LINK_W = 1.5
+MIN_SCORE = 0.05
+
+NB8 = [(a, b) for a in (-1, 0, 1) for b in (-1, 0, 1) if (a, b) != (0, 0)]
+
+BG = (13, 14, 17)
+PANEL_BG = (19, 21, 26)
+PANEL = (24, 26, 32)
+PANEL_2 = (32, 35, 43)
+BORDER = (46, 50, 60)
+TRACK = (42, 46, 55)
+TEXT = (236, 238, 241)
+MUTED = (182, 190, 201)
+DIM = (120, 128, 140)
+ACCENT = (138, 156, 184)
+ACCENT_HI = (214, 222, 235)
+ACCENT_DIM = (84, 98, 122)
+DANGER = (229, 84, 79)
+C_SPEAK = (222, 200, 140)
+C_PULSE = (120, 140, 170)
+C_YOU = (168, 190, 222)
+C_NET = (206, 210, 220)
+C_SYS = DIM
+C_THOUGHT = (150, 158, 172)
+C_FOCUS = (236, 200, 120)     # подсветка нейрона под курсором
+LABEL_ALL = 140              # при таком размере сети подписи видны у всех слов
+COH_HIST = 120               # точек на графике согласованности
+HOT_NODE = 30               # кадров подсветки нейрона после спайка (~3 с)
+HOT_LINK = 20               # кадров подсветки связи (~2 с)
+
+
+
+def key(a, b):
+    return (a, b) if a < b else (b, a)
+
+
+def cell_xy(r, c):
+    return (OX + (c + 0.5) * CELL, OY + (r + 0.5) * CELL)
+
+
+def ctrl_point(p1, p2, a, b):
+    mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    L = math.hypot(dx, dy) or 1.0
+    off = ((a * 31 + b * 17) % 9 - 4) * 0.06 * L
+    return (mx - dy / L * off, my + dx / L * off)
+
+
+def bez(p1, c, p2, t):
+    u = 1 - t
+    return (u * u * p1[0] + 2 * u * t * c[0] + t * t * p2[0],
+            u * u * p1[1] + 2 * u * t * c[1] + t * t * p2[1])
+
+
+def cosine(a, b):
+    """Косинусное сходство двух разреженных векторов (dict)."""
+    if not a or not b:
+        return 0.0
+    if len(a) > len(b):
+        a, b = b, a
+    dot = sum(v * b.get(k, 0.0) for k, v in a.items())
+    na = math.sqrt(sum(v * v for v in a.values()))
+    nb = math.sqrt(sum(v * v for v in b.values()))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def tokenize(text, limit=MAX_WORDS):
+    words = re.findall(r"[^\W_]+", text.lower())
+    return words[:limit] if limit else words
+
+
+def wrap(text, font, width):
+    lines, line = [], ""
+    for word in text.split(" "):
+        test = (line + " " + word).strip()
+        if font.size(test)[0] <= width:
+            line = test
+        else:
+            if line:
+                lines.append(line)
+            line = word
+    lines.append(line)
+    return lines
+
+
+def _norm(word):
+    """Слово из ответа LM (с пунктуацией) -> ключ словаря графа."""
+    toks = tokenize(word, limit=None)
+    return toks[0] if toks else None
+
+
+def start_lm():
+    """Подключает LM; при ошибке чат продолжает работать на графе."""
+    try:
+        backend = LMBackend()
+    except Exception as e:
+        return None, f"LM недоступна ({e}); отвечает только граф."
+    return LMWorker(backend), f"LM подключена: {backend.name}."
+
+
+class Slider:
+    """Ползунок 0..100 в панели чата (тёмная тема)."""
+
+    def __init__(self, label, value, to_text):
+        self.label = label
+        self.value = float(value)
+        self.to_text = to_text
+        self.rect = None
+
+    def hit(self, pos):
+        return self.rect is not None and self.rect.inflate(0, 14).collidepoint(pos)
+
+    def set_from_x(self, x):
+        t = (x - self.rect.x) / self.rect.w
+        self.value = max(0.0, min(100.0, t * 100.0))
+
+    def draw(self, screen, fonts, x, y, w):
+        self.rect = pygame.Rect(x, y + 18, w, 6)
+        screen.blit(fonts["word"].render(self.label, True, MUTED), (x, y))
+        txt = fonts["word"].render(self.to_text(self.value), True, TEXT)
+        screen.blit(txt, (x + w - txt.get_width(), y))
+        pygame.draw.rect(screen, TRACK, self.rect, border_radius=3)
+        fw = int(self.rect.w * self.value / 100)
+        if fw > 0:
+            pygame.draw.rect(screen, ACCENT, (self.rect.x, self.rect.y, fw, self.rect.h),
+                             border_radius=3)
+        k = (self.rect.x + fw, self.rect.centery)
+        pygame.draw.circle(screen, PANEL_2, k, 8)
+        pygame.draw.circle(screen, ACCENT_HI, k, 5)
+
+
+def think_sec(v):
+    return 2.0 - v / 100.0 * 1.85     # 0 — медленно, 100 — почти непрерывно
+
+
+def gap_sec(v):
+    return 0.05 + v / 100.0 * 2.95    # зазор между словами речи
+
+
+class Neuron:
+    __slots__ = ("id", "r", "c", "word", "layer", "pot", "thr", "fired_at", "iso")
+
+    def __init__(self, nid, r, c, word, layer):
+        self.id, self.r, self.c, self.word, self.layer = nid, r, c, word, layer
+        self.pot = 0.0
+        self.thr = THRESH
+        self.fired_at = -999
+        self.iso = 0
+
+
+class Brain:
+    def __init__(self):
+        self.temp = TEMP_DEFAULT
+        self._clear()
+        self.center = self.add_free(GRID // 2, GRID // 2, None, G_OUT)
+        self.add_noise()
+
+    def _clear(self):
+        self.neurons = {}
+        self.grid = {}
+        self.words = {}
+        self.links = {}
+        self.bigram = {}
+        self.inhib = {}
+        self.noisy = set()
+        self.wgroup = {}        # слово -> id группы
+        self.gcent = {}         # id группы -> центр (вектор связей слов)
+        self.fired = set()
+        self.forced = set()
+        self.particles = []
+        self.nid = 0
+        self.tick = 0
+        self.center = None
+
+    # ---------- структура ----------
+
+    def _register(self, n):
+        self.neurons[n.id] = n
+        self.grid[(n.r, n.c)] = n.id
+        if n.word:
+            self.words[n.word] = n.id
+
+    def add(self, r, c, word=None, layer=None):
+        if layer is None:
+            layer = G_IN if word else G_ASSOC
+        n = Neuron(self.nid, r, c, word, layer)
+        self.nid += 1
+        self._register(n)
+        return n
+
+    def remove(self, n):
+        if n is self.center:
+            return
+        del self.neurons[n.id]
+        del self.grid[(n.r, n.c)]
+        self.noisy.discard(n.id)
+        if n.word and self.words.get(n.word) == n.id:
+            del self.words[n.word]
+            self.wgroup.pop(n.word, None)
+        for k in [k for k in self.links if n.id in k]:
+            del self.links[k]
+        self.fired.discard(n.id)
+
+    def add_free(self, r, c, word=None, layer=None, max_r=8):
+        if 0 <= r < GRID and 0 <= c < GRID and (r, c) not in self.grid:
+            return self.add(r, c, word, layer)
+        for rad in range(1, max_r + 1):
+            for dr in range(-rad, rad + 1):
+                for dc in range(-rad, rad + 1):
+                    if max(abs(dr), abs(dc)) != rad:
+                        continue
+                    rr, cc = r + dr, c + dc
+                    if 0 <= rr < GRID and 0 <= cc < GRID and (rr, cc) not in self.grid:
+                        return self.add(rr, cc, word, layer)
+        return None
+
+    def add_noise(self, count=NOISE_COUNT):
+        for _ in range(count):
+            r, c = random.randrange(GRID), random.randrange(GRID)
+            n = self.add_free(r, c, None, G_ASSOC)
+            if n is None:
+                break
+            self.noisy.add(n.id)
+            others = sorted(self.neurons.values(),
+                            key=lambda m: abs(m.r - n.r) + abs(m.c - n.c))
+            for m in others[1:3]:
+                self.connect(n, m, 0.5)
+
+    def ring_cell(self, word):
+        a = (sum((i + 7) * ord(ch) for i, ch in enumerate(word)) % 628) / 100.0
+        R = GRID * 0.30
+        return (int(GRID / 2 + R * math.sin(a)), int(GRID / 2 + R * math.cos(a)))
+
+    def connect(self, a, b, w=1.0):
+        if a.id != b.id:
+            k = key(a.id, b.id)
+            self.links[k] = max(self.links.get(k, 0.0), w)
+
+    def connect_words(self, a, b):
+        d = max(abs(a.r - b.r), abs(a.c - b.c))
+        if d <= MAX_LINK_DIST:
+            self.connect(a, b, 1.0)
+            return
+        if random.random() < BRIDGE_P and len(self.neurons) < MAX_NEURONS - 2:
+            m = self.add_free((a.r + b.r) // 2, (a.c + b.c) // 2, None, G_ASSOC)
+            if m is not None:
+                self.connect(a, m, 0.9)
+                self.connect(m, b, 0.9)
+                return
+        self.connect(a, b, 0.45)
+
+    def spawn(self, src, layer=None):
+        if len(self.neurons) >= MAX_NEURONS:
+            return None
+        if src is None or src.id not in self.neurons:
+            src = random.choice(tuple(self.neurons.values()))
+        target = layer if layer is not None else min(src.layer + 1, G_OUT)
+        best, best_score = None, -1e9
+        for _ in range(28):
+            dr, dc = random.choice(NB8)
+            r, c = src.r + dr, src.c + dc
+            if not (0 <= r < GRID and 0 <= c < GRID) or (r, c) in self.grid:
+                continue
+            occ = sum(1 for ar, ac in NB8 if (r + ar, c + ac) in self.grid)
+            score = -occ * 3 + random.random()
+            if target == G_OUT:
+                score -= 0.3 * (abs(r - GRID / 2) + abs(c - GRID / 2))
+            if score > best_score:
+                best_score, best = score, (r, c)
+        if best is None:
+            return None
+        n = self.add(best[0], best[1], None, target)
+        self.links[key(src.id, n.id)] = 0.6
+        return n
+
+    def adjacency(self):
+        adj = {}
+        for (a, b), w in self.links.items():
+            adj.setdefault(a, []).append((b, w))
+            adj.setdefault(b, []).append((a, w))
+        return adj
+
+    # ---------- обучение (без пошаговой симуляции) ----------
+
+    def _ids_for(self, words):
+        ids = []
+        for w in words:
+            nid = self.words.get(w)
+            if nid is None:
+                if len(self.neurons) >= MAX_NEURONS:
+                    continue
+                r, c = self.ring_cell(w)
+                n = self.add_free(r, c, w, G_IN)
+                if n is None:
+                    continue
+                nid = n.id
+                if random.random() < 0.3:
+                    self.spawn(n, G_ASSOC)
+            ids.append(nid)
+        return ids
+
+    def train_words(self, words):
+        ids = self._ids_for(words)
+        for i in range(len(ids)):
+            for j in range(i + 1, min(len(ids), i + 1 + TRAIN_WINDOW)):
+                a, b = ids[i], ids[j]
+                if a == b:
+                    continue
+                k = key(a, b)
+                gain = HEBB_RATE / (j - i)
+                if k in self.links:
+                    self.links[k] = min(2.0, self.links[k] + gain)
+                elif j == i + 1:
+                    self.connect_words(self.neurons[a], self.neurons[b])
+                if j == i + 1:
+                    bk = (self.neurons[a].word, self.neurons[b].word)
+                    self.bigram[bk] = self.bigram.get(bk, 0) + 1
+        return ids
+
+    def train_file(self, path):
+        lines_done, words_done = 0, 0
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                words = tokenize(line, limit=None)
+                if len(words) < 2:
+                    continue
+                self.train_words(words)
+                lines_done += 1
+                words_done += len(words)
+        self.regroup()
+        return lines_done, words_done
+
+    # ---------- уровень 2: группировка слов по всей сети ----------
+
+    def _profiles(self):
+        """Профиль слова: связи со всеми другими словами плюс биграммы."""
+        prof = {w: {} for w in self.words}
+        id2w = {nid: n.word for nid, n in self.neurons.items() if n.word}
+        for (a, b), w in self.links.items():
+            wa, wb = id2w.get(a), id2w.get(b)
+            if wa and wb:
+                prof[wa][wb] = prof[wa].get(wb, 0.0) + w
+                prof[wb][wa] = prof[wb].get(wa, 0.0) + w
+        for (a, b), c in self.bigram.items():
+            if a in prof and b in prof:
+                prof[a][b] = prof[a].get(b, 0.0) + 0.5 * c
+                prof[b][a] = prof[b].get(a, 0.0) + 0.5 * c
+        return {w: p for w, p in prof.items() if p}
+
+    def regroup(self):
+        """Каждое слово сравнивается с центрами ВСЕХ групп по косинусу.
+        Переходит в лучшую группу; если похожих нет, открывается новая."""
+        prof = self._profiles()
+        if not prof:
+            self.wgroup, self.gcent = {}, {}
+            return
+        cent = {g: c for g, c in self.gcent.items() if c}
+        if not cent:
+            seed = max(prof, key=lambda w: sum(prof[w].values()))
+            cent = {0: dict(prof[seed])}
+
+        assign = {}
+        for _ in range(REGROUP_ITERS):
+            assign = {}
+            for w, p in prof.items():
+                best_g, best_s = None, -1.0
+                for g, c in cent.items():
+                    s = cosine(p, c)
+                    if s > best_s:
+                        best_g, best_s = g, s
+                if best_s < GROUP_NEW_T and len(cent) < GROUP_MAX:
+                    best_g = max(cent) + 1
+                    cent[best_g] = dict(p)
+                assign[w] = best_g
+
+            acc, cnt = {}, {}
+            for w, g in assign.items():
+                cnt[g] = cnt.get(g, 0) + 1
+                a = acc.setdefault(g, {})
+                for k, v in prof[w].items():
+                    a[k] = a.get(k, 0.0) + v
+            cent = {g: {k: v / cnt[g] for k, v in a.items()} for g, a in acc.items()}
+
+        self.wgroup = assign
+        self.gcent = cent
+
+    def update_clusters(self):
+        """Совместимость со старыми скриптами (train_start.py)."""
+        self.regroup()
+
+    def _group_activity(self, state):
+        """Сравнение состояния сети со всеми группами: косинус с каждым центром."""
+        return {g: cosine(state, c) for g, c in self.gcent.items()}
+
+    # ---------- уровень 3: адаптация всей сети к фразе ----------
+
+    def adapt(self, seq):
+        """Фраза перестраивает сеть: связи внутри группы крепнут,
+        между группами слабеют, центры групп сдвигаются к словам фразы."""
+        if not seq:
+            return
+        id2w = {n.id: n.word for n in self.neurons.values() if n.word}
+        for k in list(self.links):
+            a, b = k
+            wa, wb = id2w.get(a), id2w.get(b)
+            if wa is None or wb is None:
+                continue
+            ga, gb = self.wgroup.get(wa), self.wgroup.get(wb)
+            if ga is None or gb is None:
+                continue
+            w = self.links[k]
+            w = min(2.0, w + ADAPT_UP) if ga == gb else w * (1 - ADAPT_DOWN)
+            if w < PRUNE:
+                del self.links[k]
+            else:
+                self.links[k] = w
+
+        for w in seq:
+            g = self.wgroup.get(w)
+            if g is None:
+                continue
+            cen = self.gcent.setdefault(g, {})
+            for other in seq:
+                if other != w:
+                    cen[other] = cen.get(other, 0.0) + ADAPT_UP
+
+    # ---------- динамика (фон) ----------
+
+    def step(self, grow=True, plastic=True):
+        self.tick += 1
+        if grow and self.neurons and random.random() < SPARK_P:
+            random.choice(tuple(self.neurons.values())).pot += THRESH * 0.8
+
+        for nid in self.noisy:
+            m = self.neurons.get(nid)
+            if m is not None and random.random() < NOISE_P:
+                m.pot += NOISE_GAIN * THRESH
+
+        adj = self.adjacency()
+        new = set()
+        for n in self.neurons.values():
+            inp = random.random() * 0.03
+            for j, w in adj.get(n.id, ()):
+                if j in self.fired:
+                    inp += w * 0.9
+            inp *= GROUP_GAIN[n.layer]
+            if n.word:
+                inp -= self.inhib.get(n.word, 0.0)
+            n.pot = n.pot * DECAY + inp
+            if n.pot >= n.thr or n.id in self.forced:
+                n.pot = 0.0
+                n.fired_at = self.tick
+                n.thr += 0.03
+                new.add(n.id)
+            else:
+                n.thr += (THRESH - n.thr) * 0.02
+        self.forced = set()
+
+        for nid in new:
+            for j, w in adj.get(nid, ()):
+                if random.random() < 0.5 * min(1.0, w):
+                    self.particles.append([nid, j, 0.0, random.uniform(0.04, 0.08), False])
+
+        if plastic:
+            prev = self.fired
+            for k in list(self.links):
+                a, b = k
+                co = ((a in new and b in new) or (a in new and b in prev)
+                      or (b in new and a in prev))
+                w = self.links[k]
+                w = min(2.0, w + HEBB_RATE) if co else w * LINK_DECAY
+                if w < PRUNE:
+                    del self.links[k]
+                else:
+                    self.links[k] = w
+
+        if grow:
+            for nid in list(new):
+                n = self.neurons.get(nid)
+                if n is not None and random.random() < GROW_P:
+                    self.spawn(n)
+            deg = {}
+            for a, b in self.links:
+                deg[a] = deg.get(a, 0) + 1
+                deg[b] = deg.get(b, 0) + 1
+            dead = []
+            for n in self.neurons.values():
+                n.iso = 0 if n.id in deg else n.iso + 1
+                if n.word or n is self.center or n.id in self.noisy:
+                    continue
+                occ = sum(1 for dr, dc in NB8 if (n.r + dr, n.c + dc) in self.grid)
+                if n.iso > ISO_LIMIT or (occ >= 6 and random.random() < 0.03):
+                    dead.append(n)
+            for n in dead:
+                self.remove(n)
+
+        self.fired = {i for i in new if i in self.neurons}
+        return set(self.fired)
+
+    # ---------- генерация: рекуррентный проход по группам ----------
+
+    def _spread(self, state, adj):
+        """Один проход: активность слов раздаётся по связям, а через скрытые
+        нейроны идёт второй хоп с весом слоя (SUPER_W)."""
+        out = {}
+        for wd, a in state.items():
+            nid = self.words.get(wd)
+            if nid is None:
+                continue
+            for j, w in adj.get(nid, ()):
+                m = self.neurons.get(j)
+                if m is None:
+                    continue
+                if m.word:
+                    out[m.word] = out.get(m.word, 0.0) + a * w
+                else:
+                    gain = SUPER_W[m.layer]
+                    for k2, w2 in adj.get(j, ()):
+                        m2 = self.neurons.get(k2)
+                        if m2 is not None and m2.word and k2 != nid:
+                            out[m2.word] = out.get(m2.word, 0.0) + a * w * w2 * gain * 0.5
+        return out
+
+    def _pick(self, cands):
+        """Температурное сэмплирование: p(w) ∝ exp(score / T)."""
+        if not cands:
+            return None
+        if self.temp < 0.05:
+            return max(cands, key=cands.get)
+        mx = max(cands.values())
+        words = list(cands)
+        weights = [math.exp((cands[w] - mx) / self.temp) for w in words]
+        return random.choices(words, weights=weights, k=1)[0]
+
+    def respond(self, input_ids):
+        """Однопроходная пошаговая генерация (запасной режим, без полушарий)."""
+        prompt = [self.neurons[i].word for i in input_ids
+                  if i in self.neurons and self.neurons[i].word]
+        if not prompt:
+            return []
+        if any(w not in self.wgroup for w in prompt):
+            self.regroup()
+        adj = self.adjacency()
+
+        state = {w: 1.0 for w in prompt}
+        for w, v in self._spread(state, adj).items():
+            state[w] = state.get(w, 0.0) + 0.5 * v
+
+        answer, used, cur = [], {}, prompt[-1]
+        for _ in range(GEN_STEPS):
+            act = self._group_activity(state)
+            nc = self.words.get(cur)
+            cands = {}
+            for wd, a in state.items():
+                if wd == cur:
+                    continue
+                s = a + BIGRAM_W * self.bigram.get((cur, wd), 0)
+                nw = self.words.get(wd)
+                if nc is not None and nw is not None:
+                    s += LINK_W * self.links.get(key(nc, nw), 0.0)
+                g = self.wgroup.get(wd)
+                if g is not None:
+                    s += GROUP_W * act.get(g, 0.0)
+                s -= REPEAT_PEN * used.get(wd, 0)
+                cands[wd] = s
+            nxt = self._pick(cands)
+            if nxt is None or cands[nxt] < MIN_SCORE:
+                break
+            answer.append(nxt)
+            used[nxt] = used.get(nxt, 0) + 1
+
+            state = {w: a * GEN_DECAY for w, a in state.items()}
+            for w, v in self._spread({nxt: 1.0}, adj).items():
+                state[w] = state.get(w, 0.0) + 0.5 * v
+            state[nxt] = state.get(nxt, 0.0) + 1.0
+            cur = nxt
+
+        if answer:
+            self.adapt(prompt + answer)
+        return answer
+
+    def _reinforce_answer(self, answer):
+        """/good и диалог: цепочка ответа усиливается."""
+        for a, b in zip(answer, answer[1:]):
+            na, nb = self.words.get(a), self.words.get(b)
+            if na is None or nb is None:
+                continue
+            k = key(na, nb)
+            if k in self.links:
+                self.links[k] = min(2.0, self.links[k] + HEBB_RATE * 2)
+            self.bigram[(a, b)] = self.bigram.get((a, b), 0) + 1
+
+    def punish(self, answer):
+        """/bad: цепочка ответа ослабляется."""
+        for a, b in zip(answer, answer[1:]):
+            na, nb = self.words.get(a), self.words.get(b)
+            if na is not None and nb is not None:
+                k = key(na, nb)
+                if k in self.links:
+                    self.links[k] *= 0.7
+            if (a, b) in self.bigram:
+                self.bigram[(a, b)] = max(0, self.bigram[(a, b)] - 1)
+
+    # ---------- консолидация ----------
+
+    def consolidate(self):
+        pruned = 0
+        for k in list(self.links):
+            w = self.links[k] * 0.95
+            if w < PRUNE:
+                del self.links[k]
+                pruned += 1
+            else:
+                self.links[k] = w
+        self.regroup()
+        return pruned, len(set(self.wgroup.values()))
+
+    def group_report(self):
+        members = {}
+        for w, g in self.wgroup.items():
+            members.setdefault(g, []).append(w)
+        out = []
+        for g in sorted(members):
+            ws = sorted(members[g], key=lambda w: -sum(
+                self.links.get(key(self.words[w], self.words[x]), 0.0)
+                for x in members[g] if x != w and x in self.words))
+            out.append(f"группа {g} ({len(ws)}): " + " ".join(ws[:6]))
+        return out
+
+    # ---------- сохранение ----------
+
+    def to_dict(self):
+        return {
+            "version": 5,
+            "center": self.center.id if self.center else None,
+            "nid": self.nid,
+            "tick": self.tick,
+            "temp": self.temp,
+            "noisy": list(self.noisy),
+            "neurons": [[n.id, n.r, n.c, n.word, n.layer, round(n.thr, 4)]
+                        for n in self.neurons.values()],
+            "links": [[a, b, round(w, 4)] for (a, b), w in self.links.items()],
+            "bigram": [[a, b, c] for (a, b), c in self.bigram.items()],
+        }
+
+    def load_dict(self, d):
+        self._clear()
+        for nid, r, c, word, layer, thr in d["neurons"]:
+            n = Neuron(nid, r, c, word, layer)
+            n.thr = thr
+            self._register(n)
+        self.nid = d.get("nid", max(self.neurons, default=-1) + 1)
+        self.tick = d.get("tick", 0)
+        self.temp = d.get("temp", TEMP_DEFAULT)
+        self.center = self.neurons.get(d.get("center"))
+        if self.center is None:
+            self.center = self.add_free(GRID // 2, GRID // 2, None, G_OUT)
+        for a, b, w in d["links"]:
+            if a in self.neurons and b in self.neurons:
+                self.links[key(a, b)] = w
+        for a, b, c in d["bigram"]:
+            self.bigram[(a, b)] = c
+        self.noisy = {i for i in d.get("noisy", []) if i in self.neurons}
+        if not self.noisy:
+            self.add_noise()
+        self.regroup()
+
+    def trim_particles(self):
+        if len(self.particles) > 1500:
+            speak_p = [p for p in self.particles if p[4]]
+            other_p = [p for p in self.particles if not p[4]][-1000:]
+            self.particles = speak_p + other_p
+
+    def move_particles(self):
+        alive = []
+        for p in self.particles:
+            p[2] += p[3]
+            if p[2] < 1.0:
+                alive.append(p)
+        self.particles = alive
+
+
+def save_brain(brain, path=SAVE_PATH):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(brain.to_dict(), f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def load_brain(path=SAVE_PATH):
+    b = Brain()
+    with open(path, encoding="utf-8") as f:
+        b.load_dict(json.load(f))
+    return b
+
+
+# ---------- отрисовка ----------
+
+THINK_RECT = pygame.Rect(NET_W + 12, 36, CHAT_W - 24, 280)
+CHAT_RECT = pygame.Rect(NET_W + 12, 346, CHAT_W - 24, 228)
+INPUT_RECT = pygame.Rect(NET_W + 12, H - 54, CHAT_W - 24, 40)
+
+
+def rounded(screen, rect, fill, border=None, r=10):
+    pygame.draw.rect(screen, fill, rect, border_radius=r)
+    if border is not None:
+        pygame.draw.rect(screen, border, rect, 1, border_radius=r)
+
+
+def header(screen, fonts, text, x, y, col):
+    pygame.draw.circle(screen, col, (x + 3, y + 9), 3)
+    screen.blit(fonts["title"].render(text, True, col), (x + 12, y))
+
+
+def make_background():
+    surf = pygame.Surface((W, H))
+    surf.fill(BG)
+    cx, cy = NET_W / 2, H / 2
+    for r in range(520, 0, -26):
+        k = 1 - r / 520
+        col = (BG[0] + int(8 * k), BG[1] + int(8 * k), BG[2] + int(10 * k))
+        pygame.draw.circle(surf, col, (int(cx), int(cy)), r)
+    pygame.draw.rect(surf, PANEL_BG, (NET_W, 0, CHAT_W, H))
+    pygame.draw.line(surf, BORDER, (NET_W, 0), (NET_W, H), 1)
+    return surf
+
+
+def node_base(brain, n):
+    if n.id in brain.noisy:
+        return (176, 178, 186)
+    if n.word and n.word in brain.wgroup:
+        return GROUP_COLORS[brain.wgroup[n.word] % len(GROUP_COLORS)]
+    return LAYER_COLORS[n.layer]
+
+
+def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info_extra=""):
+    """Сеть: связи, свечение, частицы, подписи. focus — нейрон под курсором."""
+    links_layer, glow = layers
+    tick = brain.tick
+    adj = brain.adjacency()
+    nbrs = {j for j, _ in adj.get(focus, ())} if focus is not None else set()
+
+    for x, y, ph in stars:
+        b = int(34 + 24 * math.sin(now * 1.1 + ph))
+        screen.set_at((int(x), int(y)), (b, b, b + 4))
+
+    links_layer.fill((0, 0, 0, 0))
+    for (a, b), w in brain.links.items():
+        na, nb = brain.neurons.get(a), brain.neurons.get(b)
+        if na is None or nb is None:
+            continue
+        p1, p2 = cell_xy(na.r, na.c), cell_xy(nb.r, nb.c)
+        c = ctrl_point(p1, p2, a, b)
+        hot = max(0.0, 1 - (tick - max(na.fired_at, nb.fired_at)) / HOT_LINK)
+        if focus is not None and focus in (a, b):
+            col = (C_FOCUS[0], C_FOCUS[1], C_FOCUS[2], 230)
+            width = 2
+        else:
+            alpha = int(min(255, 28 + 80 * min(w, 2.0) / 2 + 140 * hot))
+            col = (118, 130, 150, alpha) if hot < 0.3 else (214, 222, 235, alpha)
+            width = 1 + (w > 1.2) + (hot > 0.5)
+        pts = [bez(p1, c, p2, i / 10) for i in range(11)]
+        pygame.draw.lines(links_layer, col, False, pts, width)
+    screen.blit(links_layer, (0, 0))
+
+    glow.fill((0, 0, 0))
+    for n in brain.neurons.values():
+        x, y = cell_xy(n.r, n.c)
+        hot = max(0.0, 1 - (tick - n.fired_at) / HOT_NODE)
+        if n.id == focus or n.id in nbrs:
+            hot = max(hot, 0.6)                  # соседи выбранного нейрона светятся
+        base = node_base(brain, n)
+        R = (6 if n.word else 4) + 3 * hot
+        g1 = [int(v * (0.10 + 0.4 * hot)) for v in base]
+        g2 = [int(v * (0.20 + 0.5 * hot)) for v in base]
+        pygame.draw.circle(glow, g1, (int(x), int(y)), int(R * 4))
+        pygame.draw.circle(glow, g2, (int(x), int(y)), int(R * 2))
+
+    for a, b, t, _speed, speak in brain.particles:
+        na, nb = brain.neurons.get(a), brain.neurons.get(b)
+        if na is None or nb is None:
+            continue
+        lo, hi = key(a, b)
+        p_src, p_dst = cell_xy(na.r, na.c), cell_xy(nb.r, nb.c)
+        plo, phi = (p_src, p_dst) if a == lo else (p_dst, p_src)
+        c = ctrl_point(plo, phi, lo, hi)
+        pos = bez(plo, c, phi, min(1.0, t) if a == lo else 1 - min(1.0, t))
+        col = C_SPEAK if speak else C_PULSE
+        pygame.draw.circle(glow, col, (int(pos[0]), int(pos[1])), 4 if speak else 2)
+    screen.blit(glow, (0, 0), special_flags=pygame.BLEND_ADD)
+
+    for n in brain.neurons.values():
+        x, y = cell_xy(n.r, n.c)
+        hot = max(0.0, 1 - (tick - n.fired_at) / HOT_NODE)
+        base = node_base(brain, n)
+        core = tuple(min(255, int(v + (255 - v) * hot)) for v in base)
+        R = (5 if n.word else 3) + 2 * hot
+        pygame.draw.circle(screen, core, (int(x), int(y)), int(R))
+        if n.id == focus:
+            pygame.draw.circle(screen, C_FOCUS, (int(x), int(y)), int(R) + 4, 2)
+        if n.word and (hot > 0.15 or n.id == focus or n.id in nbrs
+                       or len(brain.neurons) <= LABEL_ALL):
+            surf = cache.get(n.word)
+            if surf is None:
+                surf = fonts["word"].render(n.word, True, (206, 212, 222))
+                cache[n.word] = surf
+            screen.blit(surf, (int(x) + 8, int(y) - 8))
+
+    info_rect = pygame.Rect(12, 10, 560, 26)
+    rounded(screen, info_rect, PANEL, BORDER, 8)
+    n_groups = len(set(brain.wgroup.values()))
+    info = (f"нейронов {len(brain.neurons)}   связей {len(brain.links)}"
+            f"   слов {len(brain.words)}   групп {n_groups}   T={brain.temp:.2f}"
+            f"{info_extra}")
+    screen.blit(fonts["ui"].render(info, True, MUTED), (info_rect.x + 10, info_rect.y + 4))
+
+    legend = pygame.Rect(12, 44, 220, 6 * 18 + 12)
+    rounded(screen, legend, PANEL, BORDER, 8)
+    ly = legend.y + 8
+    for g in range(4):
+        pygame.draw.circle(screen, LAYER_COLORS[g], (legend.x + 14, ly + 8), 4)
+        screen.blit(fonts["ui"].render(LAYER_NAMES[g], True, MUTED), (legend.x + 26, ly))
+        ly += 18
+    pygame.draw.circle(screen, (176, 178, 186), (legend.x + 14, ly + 8), 4)
+    screen.blit(fonts["ui"].render("шумовые", True, MUTED), (legend.x + 26, ly))
+
+
+def nearest_neuron(brain, mx, my, radius=12.0):
+    """Id нейрона ближе radius пикселей к курсору (только в зоне сети)."""
+    if mx >= NET_W or my < 0 or my > H:
+        return None
+    best, best_d = None, radius
+    for n in brain.neurons.values():
+        x, y = cell_xy(n.r, n.c)
+        d = math.hypot(x - mx, y - my)
+        if d <= best_d:
+            best, best_d = n.id, d
+    return best
+
+
+def draw_overlay(screen, fonts, brain, side, coh_hist, focus, mouse, now):
+    """Индикатор активного полушария, график согласованности, подсказка."""
+    box = pygame.Rect(12, H - 136, 250, 124)
+    rounded(screen, box, PANEL, BORDER, 8)
+    screen.blit(fonts["title"].render("ПОЛУШАРИЯ", True, MUTED), (box.x + 12, box.y + 9))
+    for i, (label, tag) in enumerate((("левое", "L"), ("правое", "R"))):
+        cx, cy = box.x + 56 + i * 140, box.y + 40
+        on = side == tag
+        if on:
+            halo = C_NET if tag == "L" else C_THOUGHT
+            pulse = 3.0 * math.sin(now * 8.0)
+            pygame.draw.circle(screen, tuple(int(v * 0.3) for v in halo),
+                               (cx, cy), int(22 + pulse))
+        pygame.draw.circle(screen, ACCENT_HI if on else ACCENT_DIM, (cx, cy), 14)
+        screen.blit(fonts["word"].render(label, True, MUTED), (cx - 16, cy + 20))
+
+    spark = pygame.Rect(box.x + 12, box.y + 92, box.w - 24, 24)
+    screen.blit(fonts["word"].render("согласованность полей", True, DIM),
+                (spark.x, spark.y - 14))
+    pygame.draw.rect(screen, TRACK, spark, border_radius=3)
+    if len(coh_hist) >= 2:
+        step = spark.w / (max(len(coh_hist), 2) - 1)   # график растягивается по данным
+        pts = []
+        for i, v in enumerate(coh_hist):
+            x = spark.right - (len(coh_hist) - 1 - i) * step
+            y = spark.bottom - 3 - max(0.0, min(1.0, v)) * (spark.h - 6)
+            pts.append((x, y))
+        pygame.draw.lines(screen, ACCENT, False, pts, 2)
+
+    if focus is not None and focus in brain.neurons:
+        n = brain.neurons[focus]
+        deg = sum(1 for a, b in brain.links if focus in (a, b))
+        lines = [n.word or "скрытый нейрон",
+                 f"слой: {LAYER_NAMES[n.layer]}",
+                 f"связей: {deg}"]
+        if n.word and n.word in brain.wgroup:
+            lines.append(f"группа: {brain.wgroup[n.word]}")
+        if n.id in brain.noisy:
+            lines.append("шумовой нейрон")
+        width = max(fonts["ui"].size(t)[0] for t in lines) + 20
+        tip = pygame.Rect(mouse[0] + 16, mouse[1] + 14, width, 16 + len(lines) * 18)
+        tip.right = min(tip.right, NET_W - 8)
+        tip.bottom = min(tip.bottom, H - 8)
+        rounded(screen, tip, PANEL_2, BORDER, 8)
+        for i, t in enumerate(lines):
+            col = TEXT if i == 0 else MUTED
+            screen.blit(fonts["ui"].render(t, True, col), (tip.x + 10, tip.y + 8 + i * 18))
+
+
+def wrap_lines(entries, font, width):
+    """Раскладывает записи в строки: (текст, цвет, заголовок?)."""
+    lines = []
+    for who, msg in entries:
+        if who != "thought":
+            col = {"you": C_YOU, "net": C_NET, "sys": C_SYS}[who]
+            label = {"you": "Вы", "net": "Сеть", "sys": "•"}[who]
+            lines.append((label, col, True))
+            body_col = DIM if who == "sys" else TEXT
+        else:
+            body_col = C_THOUGHT
+        for ln in wrap(msg, font, width):
+            lines.append((ln, body_col, False))
+        if who != "thought":
+            lines.append(("", DIM, False))
+    return lines
+
+
+def draw_panel(screen, fonts, rect, entries, scroll):
+    """Окно с прокруткой. scroll — сколько строк отмотано от низа."""
+    rounded(screen, rect, PANEL, BORDER, 10)
+    pad = 10
+    width = rect.w - 2 * pad - 10
+    lines = wrap_lines(entries, fonts["chat"], width)
+    max_rows = max(1, (rect.h - 2 * pad) // 20)
+    maxs = max(0, len(lines) - max_rows)
+    scroll = max(0, min(scroll, maxs))
+    end = len(lines) - scroll
+    start = max(0, end - max_rows)
+
+    screen.set_clip(rect.inflate(-4, -4))
+    y = rect.y + pad
+    for s, col, head in lines[start:end]:
+        if s:
+            f = fonts["title"] if head else fonts["chat"]
+            screen.blit(f.render(s, True, col), (rect.x + pad, y))
+        y += 20
+    screen.set_clip(None)
+
+    if maxs:
+        track = pygame.Rect(rect.right - 7, rect.y + pad, 3, rect.h - 2 * pad)
+        th = max(18, int(track.h * max_rows / len(lines)))
+        ty = track.y + int((track.h - th) * (1 - scroll / maxs))
+        pygame.draw.rect(screen, ACCENT_DIM, (track.x, ty, 3, th), border_radius=2)
+    if scroll > 0:
+        hint = fonts["word"].render("↓ к последнему", True, MUTED)
+        pill = pygame.Rect(0, 0, hint.get_width() + 16, 18)
+        pill.bottomright = (rect.right - 12, rect.bottom - 6)
+        rounded(screen, pill, PANEL_2, BORDER, 9)
+        screen.blit(hint, (pill.x + 8, pill.y + 2))
+    return scroll
+
+
+def draw_chat(screen, thoughts, chat, text, fonts, now, progress, sliders, scroll):
+    x0 = NET_W
+    pygame.draw.rect(screen, PANEL_BG, (x0, 0, CHAT_W, H))
+    pygame.draw.line(screen, BORDER, (x0, 0), (x0, H), 1)
+
+    header(screen, fonts, "МЫСЛИ", x0 + 18, 12, C_THOUGHT)
+    scroll["think"] = draw_panel(screen, fonts, THINK_RECT, thoughts, scroll["think"])
+
+    header(screen, fonts, "ЧАТ", x0 + 18, 326, ACCENT_HI)
+    scroll["chat"] = draw_panel(screen, fonts, CHAT_RECT, chat, scroll["chat"])
+
+    for i, s in enumerate(sliders):
+        s.draw(screen, fonts, x0 + 18, H - 204 + i * 32, CHAT_W - 36)
+
+    if progress is not None:
+        frac, label = progress
+        screen.blit(fonts["word"].render(label, True, MUTED), (x0 + 18, H - 110))
+        bar = pygame.Rect(x0 + 18, H - 90, CHAT_W - 36, 5)
+        pygame.draw.rect(screen, TRACK, bar, border_radius=3)
+        if frac > 0:
+            pygame.draw.rect(screen, C_SPEAK, (bar.x, bar.y, max(4, int(bar.w * frac)), bar.h),
+                             border_radius=3)
+
+    rounded(screen, INPUT_RECT, PANEL_2, BORDER, 10)
+    caret = "|" if int(now * 2) % 2 == 0 else " "
+    if not text:
+        screen.blit(fonts["chat"].render("напишите сообщение…", True, DIM),
+                    (INPUT_RECT.x + 12, INPUT_RECT.y + 10))
+    shown = text
+    while shown and fonts["chat"].size(shown + "|")[0] > INPUT_RECT.w - 24:
+        shown = shown[1:]
+    screen.blit(fonts["chat"].render(shown + caret, True, TEXT),
+                (INPUT_RECT.x + 12, INPUT_RECT.y + 10))
+
+
+def speech(words, entry, now, gap, live=False):
+    """Состояние озвучивания: слова по одному подсвечивают нейроны."""
+    return {"words": list(words), "start": now, "shown": 0, "prev": None,
+            "entry": entry, "gap": gap, "live": live}
+
+
+# ---------- главный цикл ----------
+
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((W, H))
+    pygame.display.set_caption("Brain Chat")
+    pygame.key.start_text_input()
+    clock = pygame.time.Clock()
+
+    fam = "dejavusans,arial,liberationsans,notosans,freesans"
+    fonts = {
+        "ui": pygame.font.SysFont(fam, 15),
+        "word": pygame.font.SysFont(fam, 12),
+        "chat": pygame.font.SysFont(fam, 16),
+        "title": pygame.font.SysFont(fam, 13, bold=True),
+    }
+
+    bg = make_background()
+    stars = [(random.uniform(0, NET_W), random.uniform(0, H), random.uniform(0, 6.28))
+             for _ in range(160)]
+    layers = (pygame.Surface((NET_W, H), pygame.SRCALPHA), pygame.Surface((NET_W, H)))
+    cache = {}
+
+    if os.path.exists(SAVE_PATH):
+        try:
+            brain = load_brain()
+            status = f"Загружена сеть: {len(brain.neurons)} нейронов, {len(brain.links)} связей."
+        except Exception as e:
+            brain = Brain()
+            status = f"Не удалось загрузить сохранение ({e}), начата новая сеть."
+    else:
+        brain = Brain()
+        status = "Новая сеть."
+    mind = Mind(brain)
+    answerer = Answerer(brain, mind)
+    sliders = [
+        Slider("частота мыслей", 50, lambda v: f"каждые {think_sec(v):.2f} с"),
+        Slider("длина ответа", 8, lambda v: f"{int(round(v))} слов"),
+        Slider("зазор между словами", 30, lambda v: f"{gap_sec(v):.2f} с"),
+    ]
+    lm, lm_status = start_lm()
+    episodes = EpisodeMemory()             # подтверждённые пары вопрос→ответ
+    pending = None                         # ожидаемый ответ LM
+    last_user_msg = ""                     # текст последнего вопроса пользователя
+    last_support = None                    # самопроверка последнего ответа LM
+    coh_hist = deque(maxlen=COH_HIST)      # история согласованности полей
+    coh_acc = 0.0
+    last_lm = None                         # (вопрос, текст) последнего ответа LM
+    dragging = None
+    thoughts = []
+    scroll = {"think": 0, "chat": 0}
+
+    chat = [["sys", status + " Команды: /save /load /reset /sleep /groups /mind "
+                           "/temp N /conf N /good /bad /teach текст /recall текст /train путь"]]
+    text = ""
+    acc = 0.0
+    now = 0.0
+    save_timer = 0.0
+    running = True
+    resp = None
+    last_answer = None
+    msg_count = 0
+    prev_q, last_q = [], []                # слова прошлого и текущего вопроса
+
+    def sys_msg(msg):
+        chat.append(["sys", msg])
+
+    sys_msg(lm_status)
+
+    while running:
+        dt = clock.tick(60) / 1000.0
+        now += dt
+
+        save_timer += dt
+        if save_timer >= AUTOSAVE_SEC:
+            save_timer = 0.0
+            try:
+                save_brain(brain)
+            except OSError as e:
+                sys_msg(f"Автосохранение не удалось: {e}")
+
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                running = False
+            elif e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_ESCAPE:
+                    running = False
+                elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    msg = text.strip()
+                    text = ""
+                    if msg == "/reset":
+                        brain = Brain()
+                        mind = Mind(brain)
+                        answerer = Answerer(brain, mind)
+                        cache.clear()
+                        resp = None
+                        last_answer = None
+                        sys_msg("Сеть сброшена (файл сохранения не тронут).")
+                    elif msg == "/save":
+                        save_brain(brain)
+                        sys_msg(f"Сохранено в {SAVE_PATH}")
+                    elif msg == "/load":
+                        if os.path.exists(SAVE_PATH):
+                            brain = load_brain()
+                            mind = Mind(brain)
+                            answerer = Answerer(brain, mind)
+                            cache.clear()
+                            resp = None
+                            last_answer = None
+                            sys_msg(f"Загружено: {len(brain.neurons)} нейронов, "
+                                    f"{len(brain.links)} связей.")
+                        else:
+                            sys_msg("Файл сохранения не найден.")
+                    elif msg == "/sleep":
+                        pruned, ngroups = brain.consolidate()
+                        for ep in episodes.items:          # эпизоды повторяются во сне
+                            brain.train_words(tokenize(ep["q"], limit=None) + tokenize(ep["a"], limit=None))
+                        sys_msg(f"Консолидация: удалено {pruned} связей, групп {ngroups}, "
+                                f"повторено эпизодов: {len(episodes.items)}.")
+                    elif msg == "/groups":
+                        for line in brain.group_report() or ["Групп пока нет."]:
+                            sys_msg(line)
+                    elif msg == "/mind":
+                        for line in mind.report():
+                            sys_msg(line)
+                        sys_msg(f"эпизодов в памяти: {len(episodes.items)}")
+                        if last_support is not None:
+                            sys_msg(f"опора последнего ответа на граф: {last_support:.2f}")
+                        if lm is not None and lm.backend.speed_text():
+                            sys_msg(f"скорость LM: {lm.backend.speed_text()}")
+                    elif msg.startswith("/recall"):
+                        query = msg[len("/recall"):].strip()
+                        found = episodes.recall(query, k=3) if query else []
+                        if not found:
+                            sys_msg("Ничего похожего в памяти нет.")
+                        for sim, ep in found:
+                            sys_msg(f"[{sim:.2f}] {ep['q']} → {ep['a']}")
+                    elif msg.startswith("/temp"):
+                        parts = msg.split()
+                        if len(parts) == 2:
+                            try:
+                                brain.temp = max(0.0, min(3.0, float(parts[1])))
+                                sys_msg(f"Температура: {brain.temp:.2f}")
+                            except ValueError:
+                                sys_msg("Формат: /temp 0.7")
+                        else:
+                            sys_msg(f"Температура: {brain.temp:.2f}")
+                    elif msg in ("/good", "/bad"):
+                        if last_answer is None:
+                            sys_msg("Нет последнего ответа.")
+                        elif msg == "/good":
+                            brain._reinforce_answer(last_answer)
+                            if last_lm is not None:
+                                LMBackend.log_feedback(last_lm[0], last_lm[1], +1)
+                                episodes.add(last_lm[0], last_lm[1])
+                            elif last_user_msg:
+                                episodes.add(last_user_msg, " ".join(last_answer))
+                            sys_msg("Ответ закреплён и сохранён в эпизодах.")
+                        else:
+                            brain.punish(last_answer)
+                            if last_lm is not None:
+                                LMBackend.log_feedback(last_lm[0], last_lm[1], -1)
+                            if last_user_msg:
+                                episodes.drop(last_user_msg)
+                            sys_msg("Ответ ослаблен, эпизод удалён из памяти.")
+                    elif msg.startswith("/teach"):
+                        body = msg[len("/teach"):].strip()
+                        if not body or not last_q:
+                            sys_msg("Формат: /teach правильный ответ (после вопроса).")
+                        else:
+                            ans_words = tokenize(body, limit=None)
+                            brain.train_words(last_q + ans_words)
+                            brain._reinforce_answer(ans_words)
+                            brain.regroup()
+                            if last_user_msg:
+                                episodes.add(last_user_msg, body)
+                            sys_msg(f"Запомнила: {len(ans_words)} слов связано с вопросом.")
+                    elif msg.startswith("/conf"):
+                        parts = msg.split()
+                        if len(parts) == 2:
+                            try:
+                                mind.conf_min = max(0.0, min(1.0, float(parts[1])))
+                            except ValueError:
+                                pass
+                        sys_msg(f"Порог уверенности: {mind.conf_min:.2f}")
+                    elif msg.startswith("/train"):
+                        parts = msg.split(maxsplit=1)
+                        if len(parts) < 2:
+                            sys_msg("Формат: /train путь_к_файлу.txt")
+                        else:
+                            t0 = time.time()
+                            try:
+                                lines_n, words_n = brain.train_file(parts[1].strip('"'))
+                                sys_msg(f"Обучено на {lines_n} строках, {words_n} словах "
+                                        f"за {time.time() - t0:.1f} с.")
+                            except OSError as ex:
+                                sys_msg(f"Не удалось открыть файл: {ex}")
+                    elif msg:
+                        if resp is not None:
+                            if not resp.get("live"):
+                                resp["entry"][1] = " ".join(resp["words"]) + "."
+                            resp = None
+                        if pending is not None:
+                            pending["entry"][1] = "(заменено новым вопросом)"
+                            pending = None          # LMWorker отменит старую генерацию
+                        chat.append(["you", msg])
+                        scroll["chat"] = 0
+                        cur = tokenize(msg, limit=None)
+                        brain.train_words(prev_q[-3:] + cur)     # контекст диалога тоже учится
+                        prev_q = last_q = cur
+                        last_user_msg = msg
+                        target = max(1, int(round(sliders[1].value)))
+                        msg_count += 1
+                        if msg_count % REGROUP_EVERY == 0:
+                            brain.regroup()
+                        recalled = episodes.recall(msg, k=2)
+                        entry = ["net", "думаю…"]
+                        chat.append(entry)
+                        gap = gap_sec(sliders[2].value)
+                        if lm is None and recalled and recalled[0][0] >= RECALL_STRONG:
+                            # граф без LM: проверенный прошлый ответ
+                            ep = recalled[0][1]
+                            st = answerer.begin(msg, target)     # мысль сети строится всегда
+                            if st["thought"] is not None:
+                                thoughts.append(["thought", st["thought"].describe()])
+                                thoughts = thoughts[-300:]
+                            answerer.learn(msg, tokenize(ep["a"], limit=None))  # подтверждённое закрепляем
+                            last_answer = tokenize(ep["a"], limit=None) or None
+                            resp = speech(ep["a"].split(), entry, now, gap)
+                        else:
+                            st = answerer.begin(msg, target)
+                            if st["thought"] is not None:
+                                thoughts.append(["thought", st["thought"].describe()])
+                                thoughts = thoughts[-300:]
+                            if lm is not None:
+                                memory = [f"«{ep['q']}» → «{ep['a']}»"
+                                          for sim, ep in recalled if sim >= RECALL_WEAK]
+                                q_req, note, remember = answerer.request(st)
+                                req = lm.submit(q_req, (), memory, note, remember)
+                                pending = {"req": req, "entry": entry, "state": st}
+                            else:
+                                final = answerer.final(st)
+                                if final:
+                                    reply_text, score, _ = final
+                                    last_answer = tokenize(reply_text, limit=None) or None
+                                    last_support = score
+                                    resp = speech(reply_text.split(), entry, now, gap)
+                                else:
+                                    entry[1] = "пока не знаю этого. Научите: /teach ответ"
+                    chat = chat[-300:]
+                elif e.key in (pygame.K_PAGEUP, pygame.K_PAGEDOWN):
+                    k = "think" if pygame.key.get_mods() & pygame.KMOD_SHIFT else "chat"
+                    scroll[k] = max(0, scroll[k] + (5 if e.key == pygame.K_PAGEUP else -5))
+                elif e.key == pygame.K_END:
+                    scroll["chat"] = 0
+                    scroll["think"] = 0
+                elif e.key == pygame.K_BACKSPACE:
+                    text = text[:-1]
+                elif e.key == pygame.K_DELETE:
+                    text = ""
+            elif e.type == pygame.MOUSEWHEEL:
+                pos = pygame.mouse.get_pos()
+                if THINK_RECT.collidepoint(pos):
+                    scroll["think"] = max(0, scroll["think"] + e.y * 3)
+                elif CHAT_RECT.collidepoint(pos):
+                    scroll["chat"] = max(0, scroll["chat"] + e.y * 3)
+            elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                for i, s in enumerate(sliders):
+                    if s.hit(e.pos):
+                        dragging = i
+                        s.set_from_x(e.pos[0])
+            elif e.type == pygame.MOUSEMOTION and dragging is not None:
+                sliders[dragging].set_from_x(e.pos[0])
+            elif e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+                dragging = None
+            elif e.type == pygame.TEXTINPUT:
+                text += e.text
+
+        mind.think_every = think_sec(sliders[0].value)
+        # ---- фоновый поток мыслей: полушария думают сами ----
+        thought = mind.tick(dt)
+        if thought:
+            thoughts.append(["thought", thought])
+            thoughts = thoughts[-300:]
+
+        if lm is not None and pending is not None:
+            partial_text = lm.partial(pending["req"])
+            if partial_text:
+                pending["entry"][1] = partial_text
+            res = lm.poll(pending["req"])
+            if res is not None:
+                st = pending["state"]
+                if answerer.feed(st, res):                      # перепроверка: переписываем
+                    q_req, note, remember = answerer.request(st)
+                    pending["req"] = lm.submit(q_req, (), (), note, remember)
+                    pending["entry"][1] = "перепроверяю…"
+                else:
+                    entry_ref = pending["entry"]
+                    pending = None
+                    final = answerer.final(st)
+                    if final:
+                        reply_text, score, from_lm = final
+                        last_support = score
+                        last_answer = tokenize(reply_text, limit=None) or None
+                        if from_lm:
+                            last_lm = (st["q"], reply_text)
+                        entry_ref[1] = reply_text
+                        resp = speech(reply_text.split(), entry_ref, now,
+                                      gap_sec(sliders[2].value), live=True)
+                    else:
+                        entry_ref[1] = "пока не знаю этого. Научите: /teach ответ"
+
+        progress = None
+        if resp is not None:
+            elapsed = now - resp["start"]
+            words = resp["words"]
+            gap = resp["gap"]
+            total = len(words) * gap
+            want = min(len(words), int(elapsed / gap) + 1)
+            while resp["shown"] < want:
+                w = words[resp["shown"]]
+                nid = brain.words.get(_norm(w))
+                if nid is not None:
+                    brain.forced.add(nid)
+                    if resp["prev"] is not None and resp["prev"] in brain.neurons:
+                        brain.particles.append([resp["prev"], nid, 0.0, 0.05, True])
+                    resp["prev"] = nid
+                resp["shown"] += 1
+            done = resp["shown"] == len(words)
+            if not resp.get("live"):
+                resp["entry"][1] = " ".join(words[:resp["shown"]]) + ("" if done else " …")
+            progress = None                          # служебный прогресс скрыт
+            if done and elapsed >= total:
+                resp = None
+
+        acc += dt
+        while acc >= SIM_DT:
+            brain.step(grow=True, plastic=True)
+            acc -= SIM_DT
+        brain.trim_particles()
+        brain.move_particles()
+
+        coh_acc += dt
+        if coh_acc >= 0.1:
+            coh_acc = 0.0
+            coh_hist.append(max(0.0, min(1.0, mind.coherence())))
+        mouse = pygame.mouse.get_pos()
+        focus = nearest_neuron(brain, mouse[0], mouse[1])
+        screen.blit(bg, (0, 0))
+        draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=focus,
+                   info_extra=f"   эпизодов {len(episodes.items)}")
+        draw_overlay(screen, fonts, brain, mind.last_side, coh_hist, focus, mouse, now)
+        draw_chat(screen, thoughts, chat, text, fonts, now, progress, sliders, scroll)
+        pygame.display.flip()
+
+    try:
+        save_brain(brain)
+    except OSError:
+        pass
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
