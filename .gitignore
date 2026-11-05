@@ -7,3 +7,5 @@
 /phase2
 *.zip
 .env
+
+.venv/
