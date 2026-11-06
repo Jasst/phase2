@@ -14,7 +14,7 @@ print("журнал: 2 строки JSONL, корректно")
 
 # 2) потоковая генерация + отмена устаревшего запроса (фейковый llama-источник)
 b = L.LMBackend.__new__(L.LMBackend)
-b.history = []; b._gen_lock = threading.Lock(); b.llm = None; b.last_stats = None; b.name = "fake"
+b.history = []; b._gen_lock = threading.Lock(); b.llm = None; b.last_stats = None; b.name = "fake"; b.backend_used = "llamacpp"
 def fake_stream(messages, should_stop):
     for i in range(40):
         if should_stop():

@@ -6,12 +6,14 @@ os.environ["SDL_VIDEODRIVER"] = "dummy"; os.environ["SDL_AUDIODRIVER"] = "dummy"
 sys.path.insert(0, ROOT); os.chdir(ROOT)
 import pygame
 import brain_chat as bc
+from _isolate import isolate; isolate()   # тесты не трогают файлы проекта
 
 class FakeLM:
     def __init__(self):
         self.calls, self._n, self._out = [], 0, {}
         self.backend = type("B", (), {"speed_text": staticmethod(lambda: "")})()
         self.name = "fake"
+        self.last_logprobs = []   # как у настоящего LMWorker (пустые логиты у фейка)
     def submit(self, q, ctx=(), memory=(), note="", remember=True):
         self._n += 1
         self.calls.append({"q": q, "note": note, "remember": remember})
@@ -40,6 +42,10 @@ def rec_chat(screen, thoughts, chat, *a, **k):
     state["chat"] = [list(x) for x in chat]
     return real_chat(screen, thoughts, chat, *a, **k)
 bc.draw_chat = rec_chat
+# Конвейер проверяем при фиксированной стратегии (вся сеть + переписывание).
+# Сам выбор стратегии бандитом проверяется в test_rl_proactive.py.
+import rl_policy
+rl_policy.Bandit.choose = lambda self, arms, rng=None: ("whole", True)
 bc.main()
 
 # первый вопрос (до /teach) — без мысли, второй — с мыслью группы сети
@@ -50,6 +56,6 @@ second = [c for c in q_calls if "Мысль сети" in c["note"]]
 assert second, "ответ не получил мысль сети"
 rewrite = [c for c in q_calls if c["q"].startswith("Вопрос:")]
 assert rewrite and rewrite[0]["remember"] is False, "переписывание не выполнено"
-msgs = [m for _, m in state["chat"]]
+msgs = [e[1] for e in state["chat"] if len(e) > 1]   # запись чата: [кто, текст, (оценка)]
 assert any("клетка мозга" in m for m in msgs), msgs
 print("pipeline OK: запросов", len(q_calls), "переписываний", len(rewrite))

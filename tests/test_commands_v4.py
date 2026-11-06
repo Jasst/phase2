@@ -7,6 +7,7 @@ os.environ["BRAIN_LM_PATH"] = "/nonexistent/model.gguf"
 sys.path.insert(0, ROOT); os.chdir(ROOT)
 import pygame
 import brain_chat as bc
+from _isolate import isolate; isolate()   # тесты не трогают файлы проекта
 from lm_backend import RUNTIME, strip_leaks, clean_reply
 
 def text(t): return pygame.event.Event(pygame.TEXTINPUT, text=t)
@@ -35,7 +36,7 @@ assert has("контекст диалога: 2500"), "/ctx не сработал
 assert has("время на ответ: 45"), "/time не сработал"
 assert RUNTIME["time_budget"] == 45 and RUNTIME["context_chars"] == 2500
 assert RUNTIME["max_tokens"] == 300 and RUNTIME["history"] == 5
-assert has("Лимит нейронов: 800"), "/neurons не сработал"
+assert has("Лимита нет"), "/neurons: лимит должен быть снят"
 assert has("Связано слов: 3"), "/assoc не сработал"
 assert has("модель: контекст"), "/mind не показывает настройки"
 assert strip_leaks("Да. Мысль сети (вся сеть): кот. Кот пушистый.") == "Да. Кот пушистый."
@@ -46,7 +47,7 @@ print("commands OK")
 import time as _t
 import lm_backend as L
 class Fake(L.LMBackend):
-    def __init__(self): self.history = []; self._gen_lock = __import__("threading").Lock(); self.last_stats = None; self.last_truncated = False; self.name = "fake"
+    def __init__(self): self.history = []; self._gen_lock = __import__("threading").Lock(); self.last_stats = None; self.last_truncated = False; self.name = "fake"; self.backend_used = "llamacpp"
     def _stream_llamacpp(self, messages, should_stop):
         for part in ["Вода ", "мокрая. ", "Совсем ", "длинный ", "хвост без точки"] * 50:
             if should_stop(): break
