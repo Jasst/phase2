@@ -175,11 +175,13 @@ class Mind:
         for w, v in self.fieldR.items():
             merged[w] = merged.get(w, 0.0) + v
         # вклад активных групп (метод _group_activity определён в Brain, не в Mind)
-        for g, act in self.b._group_activity(merged).items():
-            if act < 0.1:
-                continue
+        active = {g: act for g, act in self.b._group_activity(merged).items()
+                  if act >= 0.1}
+        if active:
+            # один проход по словам вместо обхода всего словаря на каждую группу
             for w, gg in self.b.wgroup.items():
-                if gg == g:
+                act = active.get(gg)
+                if act is not None:
                     merged[w] = merged.get(w, 0.0) + GROUP_W * act
         for w in set(self.workspace) | set(merged):
             self.workspace[w] = 0.5 * self.workspace.get(w, 0.0) + 0.5 * merged.get(w, 0.0)

@@ -8,10 +8,10 @@ from collections import deque
 
 import pygame
 
-from mind import Mind, STOPWORDS, MIN_WORD_LEN
+from mind import Mind, STOPWORDS, MIN_WORD_LEN, cosine, key
 from lm_backend import LMBackend, LMWorker, RUNTIME, set_option
 from episodes import EpisodeMemory, RECALL_STRONG, RECALL_WEAK
-from reasoning import Answerer, LEARN_MIN, REVISE_ROUNDS
+from reasoning import Answerer, REVISE_ROUNDS
 from rl_policy import Bandit, arms_for
 from ui_feedback import FeedbackButtons, NeuronMenu
 from rich_text import RLine, plain_lines, markdown_lines, x_at, index_at
@@ -24,6 +24,7 @@ OX = (NET_W - GRID * CELL) / 2
 OY = (H - GRID * CELL) / 2
 
 SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brain_state.json")
+BRAIN_FORMAT = 6        # версия формата brain_state.json
 AUTOSAVE_SEC = 60.0
 
 # ---- уровень 1: слои нейронов ----
@@ -190,10 +191,6 @@ def get_clipboard_text():
         return ""
 
 
-def key(a, b):
-    return (a, b) if a < b else (b, a)
-
-
 CAM = {"cell": CELL, "ox": OX, "oy": OY}    # камера: масштаб и сдвиг
 
 
@@ -235,18 +232,6 @@ def bez(p1, c, p2, t):
     u = 1 - t
     return (u * u * p1[0] + 2 * u * t * c[0] + t * t * p2[0],
             u * u * p1[1] + 2 * u * t * c[1] + t * t * p2[1])
-
-
-def cosine(a, b):
-    """Косинусное сходство двух разреженных векторов (dict)."""
-    if not a or not b:
-        return 0.0
-    if len(a) > len(b):
-        a, b = b, a
-    dot = sum(v * b.get(k, 0.0) for k, v in a.items())
-    na = math.sqrt(sum(v * v for v in a.values()))
-    nb = math.sqrt(sum(v * v for v in b.values()))
-    return dot / (na * nb) if na and nb else 0.0
 
 
 def tokenize(text, limit=MAX_WORDS):
@@ -1049,7 +1034,7 @@ class Brain:
 
     def to_dict(self):
         return {
-            "version": 6,
+            "version": BRAIN_FORMAT,
             "center": self.center.id if self.center else None,
             "nid": self.nid,
             "tick": self.tick,
@@ -1066,7 +1051,8 @@ class Brain:
 
     def load_dict(self, d):
         self._clear()
-        for nid, r, c, word, layer, thr in d["neurons"]:
+        for row in d.get("neurons", []):
+            nid, r, c, word, layer, thr = row
             n = Neuron(nid, r, c, word, layer)
             n.thr = thr
             self._register(n)
@@ -1076,10 +1062,10 @@ class Brain:
         self.center = self.neurons.get(d.get("center"))
         if self.center is None:
             self.center = self.add_free(GRID // 2, GRID // 2, None, G_OUT)
-        for a, b, w in d["links"]:
+        for a, b, w in d.get("links", []):
             if a in self.neurons and b in self.neurons:
                 self.links[key(a, b)] = w
-        for a, b, c in d["bigram"]:
+        for a, b, c in d.get("bigram", []):
             self.bigram[(a, b)] = c
         self.kconf = {w: float(v) for w, v in d.get("kconf", {}).items()}
         self.word_seen = {w: int(v) for w, v in d.get("word_seen", {}).items()}
@@ -1113,9 +1099,16 @@ def save_brain(brain, path=None):
 
 
 def load_brain(path=SAVE_PATH):
-    b = Brain()
+    """Читает сохранение. Бросает ValueError с понятным текстом, если файл не подходит."""
     with open(path, encoding="utf-8") as f:
-        b.load_dict(json.load(f))
+        d = json.load(f)
+    if not isinstance(d, dict) or "neurons" not in d:
+        raise ValueError("файл не похож на сохранение сети")
+    version = d.get("version", 0)
+    if version > BRAIN_FORMAT:
+        raise ValueError(f"формат v{version} новее поддерживаемого v{BRAIN_FORMAT}")
+    b = Brain()
+    b.load_dict(d)
     return b
 
 
@@ -1182,16 +1175,19 @@ def convex_hull(points):
 
 
 # NEW: рисует полупрозрачные оболочки смысловых групп
-def draw_group_hulls(screen, brain, surface):
-    """Показывает границы смысловых групп — где какая тема «живёт» в сети."""
+def draw_group_hulls(screen, brain, surface, fonts=None):
+    """Показывает границы смысловых групп и подписывает каждую самым частым словом."""
     surface.fill((0, 0, 0, 0))
     by_group = {}
+    top_word = {}
     for w, g in brain.wgroup.items():
         nid = brain.words.get(w)
         if nid is None or nid not in brain.neurons:
             continue
         n = brain.neurons[nid]
         by_group.setdefault(g, []).append((n.r, n.c))
+        if brain.word_seen.get(w, 0) > brain.word_seen.get(top_word.get(g), 0):
+            top_word[g] = w
 
     for g, cells in by_group.items():
         if len(cells) < 2:
@@ -1215,6 +1211,49 @@ def draw_group_hulls(screen, brain, surface):
         pygame.draw.polygon(surface, (*col, 22), expanded)
         pygame.draw.polygon(surface, (*col, 60), expanded, 1)
     screen.blit(surface, (0, 0))
+    if fonts is None:
+        return
+    for g, cells in by_group.items():
+        word = top_word.get(g)
+        if len(cells) < 2 or word is None:
+            continue
+        pts = [cell_xy(r, c) for r, c in cells]
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = min(p[1] for p in pts) - 14        # подпись над группой
+        col = GROUP_COLORS[g % len(GROUP_COLORS)]
+        txt = fonts["word"].render(word, True, col)
+        screen.blit(txt, txt.get_rect(center=(int(cx), int(cy))))
+
+
+TRAIL_LEN = 10           # сколько последних активных нейронов показывает след мысли
+LABEL_HOT_MAX = 45       # сколько подписей слов показывать одновременно
+TRAIL_WINDOW = 40        # не старше стольких тиков
+
+
+def draw_halo(surf, pos, base, hot, R):
+    """Мягкое гало из колец: ярче у центра, плавно гаснет к краю."""
+    steps = 6
+    px, py = int(pos[0]), int(pos[1])
+    for i in range(steps, 0, -1):
+        f = i / steps                              # 1 — внешнее кольцо, 1/steps — внутреннее
+        rad = int(R * (1.0 + 4.0 * f))
+        k = (0.04 + 0.45 * hot) * (1.0 - f) + 0.06 * hot * f
+        pygame.draw.circle(surf, tuple(min(255, int(v * k)) for v in base), (px, py), rad)
+
+
+def draw_trail(surf, brain, tick):
+    """След мысли: линия через последние активные нейроны, тускнеющая к старым."""
+    recent = [n for n in brain.neurons.values() if tick - n.fired_at <= TRAIL_WINDOW]
+    recent.sort(key=lambda n: n.fired_at)
+    recent = recent[-TRAIL_LEN:]
+    if len(recent) < 2:
+        return
+    for i in range(1, len(recent)):
+        a, b = recent[i - 1], recent[i]
+        age = 1.0 - (i - 1) / max(1, len(recent) - 1)     # 1 — новый участок
+        alpha = int(40 + 150 * age)
+        col = (C_FOCUS[0], C_FOCUS[1], C_FOCUS[2], alpha)
+        pygame.draw.line(surf, col, cell_xy(a.r, a.c), cell_xy(b.r, b.c), 2 if age > 0.6 else 1)
 
 
 def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info_extra=""):
@@ -1245,6 +1284,7 @@ def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info
             width = 1 + (w > 1.2) + (hot > 0.5)
         pts = [bez(p1, c, p2, i / 10) for i in range(11)]
         pygame.draw.lines(links_layer, col, False, pts, width)
+    draw_trail(links_layer, brain, tick)
     screen.blit(links_layer, (0, 0))
 
     glow.fill((0, 0, 0))
@@ -1255,10 +1295,7 @@ def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info
             hot = max(hot, 0.6)                  # соседи выбранного нейрона светятся
         base = node_base(brain, n)
         R = (6 if n.word else 4) + 3 * hot
-        g1 = [int(v * (0.10 + 0.4 * hot)) for v in base]
-        g2 = [int(v * (0.20 + 0.5 * hot)) for v in base]
-        pygame.draw.circle(glow, g1, (int(x), int(y)), int(R * 4))
-        pygame.draw.circle(glow, g2, (int(x), int(y)), int(R * 2))
+        draw_halo(glow, (x, y), base, hot, R)
 
     for a, b, t, _speed, speak in brain.particles:
         na, nb = brain.neurons.get(a), brain.neurons.get(b)
@@ -1275,6 +1312,10 @@ def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info
 
     # NEW: подписи с защитой от наложений. Подпись под фокусом рисуется всегда.
     drawn_label_rects = []
+    # подписи только у самых активных слов: иначе сцена превращается в кашу
+    hot_words = sorted((n for n in brain.neurons.values() if n.word),
+                       key=lambda n: tick - n.fired_at)[:LABEL_HOT_MAX]
+    hot_ids = {n.id for n in hot_words}
     for n in brain.neurons.values():
         x, y = cell_xy(n.r, n.c)
         hot = max(0.0, 1 - (tick - n.fired_at) / HOT_NODE)
@@ -1282,10 +1323,12 @@ def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info
         core = tuple(min(255, int(v + (255 - v) * hot)) for v in base)
         R = (5 if n.word else 3) + 2 * hot
         pygame.draw.circle(screen, core, (int(x), int(y)), int(R))
+        if n.word:                                   # слово отличается от скрытого нейрона кольцом
+            pygame.draw.circle(screen, base, (int(x), int(y)), int(R) + 2, 1)
         is_focus = n.id == focus
         if is_focus:
             pygame.draw.circle(screen, C_FOCUS, (int(x), int(y)), int(R) + 4, 2)
-        if n.word and (is_focus or hot > 0.15 or n.id in nbrs
+        if n.word and (is_focus or n.id in hot_ids and hot > 0.15 or n.id in nbrs
                        or len(brain.neurons) <= LABEL_ALL):
             surf = cache.get(n.word)
             if surf is None:
@@ -1296,6 +1339,8 @@ def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info
             if not is_focus and any(rect.colliderect(r) for r in drawn_label_rects):
                 continue
             drawn_label_rects.append(rect)
+            pill = rect.inflate(8, 4)
+            rounded(screen, pill, (13, 14, 17), None, 5)
             screen.blit(surf, rect)
 
     info_rect = pygame.Rect(12, 10, 560, 26)
@@ -1514,9 +1559,9 @@ def draw_panel(screen, fonts, rect, entries, scroll, name=""):
     y = rect.y + pad
     for ln in visible:
         x = rect.x + pad
-        for text, col, key in ln.segs:
+        for text, col, font_name in ln.segs:
             if text:
-                surf = fonts[key].render(text, True, col)
+                surf = fonts[font_name].render(text, True, col)
                 screen.blit(surf, (x, y))
                 x += surf.get_width()
         y += 20
@@ -1753,14 +1798,20 @@ def main():
                         sys_msg(f"Сохранено в {SAVE_PATH}")
                     elif msg == "/load":
                         if os.path.exists(SAVE_PATH):
-                            brain = load_brain()
-                            mind = Mind(brain)
-                            answerer = Answerer(brain, mind)
-                            cache.clear()
-                            resp = None
-                            last_answer = None
-                            sys_msg(f"Загружено: {len(brain.neurons)} нейронов, "
-                                    f"{len(brain.links)} связей.")
+                            try:
+                                new_brain = load_brain()
+                            except (OSError, ValueError, KeyError, TypeError) as e:
+                                # текущая сеть не трогается
+                                sys_msg(f"Не удалось загрузить сохранение: {e}")
+                            else:
+                                brain = new_brain
+                                mind = Mind(brain)
+                                answerer = Answerer(brain, mind)
+                                cache.clear()
+                                resp = None
+                                last_answer = None
+                                sys_msg(f"Загружено: {len(brain.neurons)} нейронов, "
+                                        f"{len(brain.links)} связей.")
                         else:
                             sys_msg("Файл сохранения не найден.")
                     elif msg == "/sleep":
@@ -2183,7 +2234,7 @@ def main():
         focus = nearest_neuron(brain, mouse[0], mouse[1])
         screen.blit(bg, (0, 0))
         # NEW: оболочки групп — позади связей и узлов
-        draw_group_hulls(screen, brain, group_layer)
+        draw_group_hulls(screen, brain, group_layer, fonts)
         draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=focus,
                    info_extra=f"   эпизодов {len(episodes.items)}")
         # ИЗМ: draw_overlay теперь принимает mind вместо side

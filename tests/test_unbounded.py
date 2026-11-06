@@ -11,11 +11,11 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import _isolate  # noqa: E402
+from phase3 import _isolate, brain_chat as bc
+
 _isolate.isolate()
 
-import brain_chat as bc  # noqa: E402
-from brain_chat import Brain, GRID  # noqa: E402
+from phase3.brain_chat import Brain, GRID  # noqa: E402
 
 N_WORDS = 3000          # больше, чем было лимитом (700) и клеток старой сетки (2500)
 

@@ -11,11 +11,11 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rl_policy import Bandit, arms_for, arm_key  # noqa: E402
-import reasoning  # noqa: E402
-from reasoning import Answerer, GREET_REPLY  # noqa: E402
-from mind import Mind  # noqa: E402
-from brain_chat import Brain  # noqa: E402
+from phase3.rl_policy import Bandit, arms_for, arm_key  # noqa: E402
+from phase3 import reasoning
+from phase3.reasoning import Answerer, GREET_REPLY  # noqa: E402
+from phase3.mind import Mind  # noqa: E402
+from phase3.brain_chat import Brain  # noqa: E402
 
 
 def test_bandit_learns_rewarded_arm():
