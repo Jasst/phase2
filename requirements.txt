@@ -1,7 +1,0 @@
-pygame>=2.5.0
-requests>=2.31.0
-# Опционально, только для BRAIN_LM_BACKEND=llamacpp:
-# llama-cpp-python
-# Optional, only for BRAIN_LM_BACKEND=llamacpp:
-llama-cpp-python
-
