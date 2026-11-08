@@ -20,6 +20,11 @@ def isolate():
     episodes.PATH = os.path.join(d, "episodes.json")
     lm_backend.LOG_PATH = os.path.join(d, "dialog_log.jsonl")
     rl_policy.POLICY_PATH = os.path.join(d, "policy.json")
+    # Сети (nets/): хранилище, логи и песочница тоже во временной папке.
+    import nets.manager as nets_manager
+    nets_manager.STORE_DIR = os.path.join(d, "nets_store")
+    nets_manager.LOG_DIR = os.path.join(d, "nets_logs")
+    nets_manager.SANDBOX_DIR = os.path.join(d, "nets_sandbox")
     # Сохранение на выходе — в пустую папку, без записи в проект.
     bc.save_brain = lambda *a, **k: None
     return d

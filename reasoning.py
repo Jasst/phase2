@@ -63,15 +63,26 @@ class Thought:
     score: float
 
     def describe(self):
-        where = "вся сеть" if self.group is None else f"группа {self.group}"
-        return (f"мысль ({where}, оценка {self.score:.2f}): "
+        return (f"мысль ({_where(self.group)}, оценка {self.score:.2f}): "
                 + " ".join(self.words))
 
 
+CHAIN = "chain"       # метка мысли цепочки сетей (пакет nets/)
+
+
+def _where(group):
+    if group is None:
+        return "вся сеть"
+    if group == CHAIN:
+        return "цепочка сетей"
+    return f"группа {group}"
+
+
 class Answerer:
-    def __init__(self, brain, mind):
+    def __init__(self, brain, mind, nets=None):
         self.brain = brain
         self.mind = mind
+        self.nets = nets                    # NetsManager или None (без цепочки)
 
     def _ids(self, words):
         return [self.brain.words[w] for w in words if w in self.brain.words]
@@ -133,7 +144,33 @@ class Answerer:
             t = Thought(words, gid, stab, support, score)
             if mode not in best or t.score > best[mode].score:
                 best[mode] = t
+        chain_t = self._chain_thought(question, seeds, target)
+        if chain_t is not None and ("whole" not in best or chain_t.score > best["whole"].score):
+            best["whole"] = chain_t          # цепочка сетей — лучшая «вся сеть» мысль
         return best, seeds
+
+    def _chain_thought(self, question, seeds, target):
+        """Мысль из цепочки сетей (nets/): выход последней сети после раундов."""
+        if self.nets is None:
+            return None
+        res = self.nets.think(question)
+        if not res or not res["thought"]:
+            return None
+        from mind import clean_words
+        raw = [w for w in res["thought"] if w in self.brain.words]
+        words = clean_words(raw)[:max(1, target)]
+        if not words:
+            return None
+        support = self.mind.support(seeds, words)
+        # стабильность с поправкой: чем больше мусора отфильтровано, тем ниже бонус.
+        # Если цепочка выдала 6 слов, из которых 2 — стоп-слова и повторы, честнее
+        # не награждать её как «стабильную» на полную.
+        ratio = len(words) / max(1, len(raw))
+        stab_base = 1.0 if res["reason"] == "стабилизация" else 0.5
+        stab = stab_base * (0.4 + 0.6 * ratio)
+        length = min(1.0, len(words) / max(1, target))
+        score = W_SUPPORT * support + W_STAB * stab + W_LEN * length
+        return Thought(words, CHAIN, stab, support, score)
 
     # ---------- 2–3. LM пишет и проверяется ----------
 
@@ -167,8 +204,7 @@ class Answerer:
         if st["stage"] == 0:
             note = ""
             if th is not None and th.words:
-                where = "вся сеть" if th.group is None else f"группа {th.group}"
-                note = (f"Мысль сети ({where}): связанные по смыслу слова — "
+                note = (f"Мысль сети ({_where(th.group)}): связанные по смыслу слова — "
                         f"{' '.join(th.words)}. Опирайся на них, если они согласуются "
                         "с вопросом. Если нет — ответь по существу и не выдумывай.")
             q = (st["q"] + "\n\n"

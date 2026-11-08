@@ -605,6 +605,11 @@ class LMWorker:
                 return result
         return None
 
+    def is_current(self, request_id):
+        """True, если запрос ещё не перебит новым (ответом в чат и т.п.)."""
+        with self._lock:
+            return request_id == self._last_id
+
     def _cancelled(self, request_id):
         with self._lock:
             return request_id != self._last_id

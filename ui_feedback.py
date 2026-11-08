@@ -63,9 +63,11 @@ class FeedbackButtons:
 class NeuronMenu:
     """Меню нейрона по правой кнопке мыши. Действие возвращается из hit()."""
 
-    ITEMS = (("верно", "good"),
+    ITEMS = (("активировать", "activate"),
+             ("верно", "good"),
              ("неверно", "bad"),
              ("переформулировать", "rename"),
+             ("обучить через LLM", "llm_teach"),
              ("удалить нейрон", "delete"))
 
     def __init__(self):
@@ -90,9 +92,9 @@ class NeuronMenu:
         self.box = None
 
     def _items(self):
-        # Переименовать можно только нейрон со словом.
+        # Переименовать и обучить через LLM можно только нейрон со словом.
         return [(label, act) for label, act in self.ITEMS
-                if not (act == "rename" and not self.word)]
+                if not (act in ("rename", "llm_teach") and not self.word)]
 
     def draw(self, screen, font, bounds):
         if not self.active:

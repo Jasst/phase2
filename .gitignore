@@ -9,3 +9,11 @@
 .env
 
 .venv/
+
+# nets: генерируемые файлы
+nets/_store/*.json
+nets/_store/feedback.jsonl
+nets/_logs/
+nets/_sandbox/*.json
+nets/__pycache__/
+nets/tests/__pycache__/
