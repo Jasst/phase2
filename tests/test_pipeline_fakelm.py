@@ -5,7 +5,8 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 os.environ["SDL_VIDEODRIVER"] = "dummy"; os.environ["SDL_AUDIODRIVER"] = "dummy"
 sys.path.insert(0, ROOT); os.chdir(ROOT)
 import pygame
-from phase3._isolate import isolate; isolate()   # тесты не трогают файлы проекта
+import brain_chat as bc
+from _isolate import isolate; isolate()   # тесты не трогают файлы проекта
 
 class FakeLM:
     def __init__(self):
@@ -43,8 +44,7 @@ def rec_chat(screen, thoughts, chat, *a, **k):
 bc.draw_chat = rec_chat
 # Конвейер проверяем при фиксированной стратегии (вся сеть + переписывание).
 # Сам выбор стратегии бандитом проверяется в test_rl_proactive.py.
-from phase3 import rl_policy, brain_chat as bc
-
+import rl_policy
 rl_policy.Bandit.choose = lambda self, arms, rng=None: ("whole", True)
 bc.main()
 

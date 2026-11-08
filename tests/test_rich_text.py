@@ -9,11 +9,12 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from phase3 import _isolate, rich_text as rt, brain_chat as bc
-
+import _isolate  # noqa: E402
 _isolate.isolate()
 
 import pygame  # noqa: E402
+import rich_text as rt  # noqa: E402
+import brain_chat as bc  # noqa: E402
 
 
 def _fonts():

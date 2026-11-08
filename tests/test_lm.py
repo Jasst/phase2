@@ -1,6 +1,7 @@
+import os
 import os, sys, time, threading, json, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from phase3 import lm_backend as L
+import lm_backend as L
 
 # 1) очистка think и журнал
 assert L.clean_reply("<think>рассуждаю</think>Ответ") == "Ответ"

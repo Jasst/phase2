@@ -1,10 +1,10 @@
+import os
 import os, sys, json, threading, time
 os.environ["BRAIN_LM_BACKEND"]="lmstudio"
 os.environ["BRAIN_LM_URL"]="http://127.0.0.1:18234/v1/chat/completions"
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from phase3 import lm_backend as L
-
+import lm_backend as L
 
 class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass

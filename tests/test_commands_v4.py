@@ -6,8 +6,9 @@ os.environ["SDL_VIDEODRIVER"] = "dummy"; os.environ["SDL_AUDIODRIVER"] = "dummy"
 os.environ["BRAIN_LM_PATH"] = "/nonexistent/model.gguf"
 sys.path.insert(0, ROOT); os.chdir(ROOT)
 import pygame
-from phase3._isolate import isolate; isolate()   # тесты не трогают файлы проекта
-from phase3.lm_backend import RUNTIME, strip_leaks, clean_reply
+import brain_chat as bc
+from _isolate import isolate; isolate()   # тесты не трогают файлы проекта
+from lm_backend import RUNTIME, strip_leaks, clean_reply
 
 def text(t): return pygame.event.Event(pygame.TEXTINPUT, text=t)
 def enter(): return pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, mod=0, unicode="\r", scancode=0)
@@ -44,9 +45,7 @@ print("commands OK")
 
 # Лимит времени: генерация обрывается по времени и ответ заканчивается точкой.
 import time as _t
-from phase3 import lm_backend as L
-
-
+import lm_backend as L
 class Fake(L.LMBackend):
     def __init__(self): self.history = []; self._gen_lock = __import__("threading").Lock(); self.last_stats = None; self.last_truncated = False; self.name = "fake"; self.backend_used = "llamacpp"
     def _stream_llamacpp(self, messages, should_stop):

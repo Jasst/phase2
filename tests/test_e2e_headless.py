@@ -6,8 +6,8 @@ os.environ["SDL_VIDEODRIVER"] = "dummy"; os.environ["SDL_AUDIODRIVER"] = "dummy"
 os.environ["BRAIN_LM_PATH"] = "/nonexistent/model.gguf"
 sys.path.insert(0, ROOT); os.chdir(ROOT)
 import pygame
-from phase3 import brain_chat as bc
-from phase3._isolate import isolate; isolate()   # тесты не трогают файлы проекта
+import brain_chat as bc
+from _isolate import isolate; isolate()   # тесты не трогают файлы проекта
 
 def text(t): return pygame.event.Event(pygame.TEXTINPUT, text=t)
 def enter(): return pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, mod=0, unicode="\r", scancode=0)
