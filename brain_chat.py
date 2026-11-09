@@ -188,8 +188,7 @@ def get_clipboard_text():
     return clipboard.paste()
 
 
-CAM = {"cell": CELL, "ox": OX, "oy": OY,
-       "zoom": 1.0, "pan_x": 0.0, "pan_y": 0.0}   # zoom — множитель масштаба
+CAM = {"cell": CELL, "ox": OX, "oy": OY}    # камера: масштаб и сдвиг
 
 
 def cell_xy(r, c):
@@ -208,10 +207,14 @@ def update_view(brain, dt, rate=6.0):
     cs = [n.c for n in brain.neurons.values()]
     r0, r1, c0, c1 = min(rs), max(rs), min(cs), max(cs)
     span = max(r1 - r0 + 1, c1 - c0 + 1, GRID)
-    cell_t = min(NET_W, H) / (span + 2) * CAM.get("zoom", 1.0)
+    cell_t = min(NET_W, H) / (span + 2)
     cx, cy = (c0 + c1 + 1) / 2, (r0 + r1 + 1) / 2
-    ox_t = NET_W / 2 - cx * cell_t + CAM.get("pan_x", 0.0)
-    oy_t = H / 2 - cy * cell_t + CAM.get("pan_y", 0.0)
+    VIEW_USER["base"], VIEW_USER["auto"] = cell_t, (cx, cy)
+    if VIEW_USER["on"]:
+        cell_t *= VIEW_USER["zoom"]
+        cx, cy = VIEW_USER["wcx"], VIEW_USER["wcy"]
+    ox_t = NET_W / 2 - cx * cell_t
+    oy_t = H / 2 - cy * cell_t
     k = min(1.0, rate * max(dt, 0.0))
     CAM["cell"] += (cell_t - CAM["cell"]) * k
     CAM["ox"] += (ox_t - CAM["ox"]) * k
@@ -1468,7 +1471,7 @@ def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info
     screen.blit(fonts["ui"].render("шумовые", True, MUTED), (legend.x + 26, ly))
 
 
-HINT = "колесо — масштаб · 0 — сброс · СКМ — сдвиг · ПКМ — действия"
+HINT = "колесо — масштаб · тянуть — сдвиг · клик — выбрать · ПКМ — меню"
 
 
 def draw_hint(screen, fonts):
@@ -1777,6 +1780,62 @@ def _set_score(entry, score):
         entry.append(score)
 
 
+# ---------- v20: управление сетью мышью ----------
+
+VIEW_USER = {"on": False, "zoom": 1.0, "wcx": 0.0, "wcy": 0.0, "base": CELL, "auto": (0.0, 0.0)}
+NET_PRESS = {"pos": None, "moved": False, "nid": None}
+NET_SEL = {"nid": None}
+ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 0.25, 10.0, 1.15
+
+
+def _ensure_user_view():
+    """Перейти от автоподгонки к пользовательскому виду, сохранив текущий центр."""
+    if not VIEW_USER["on"]:
+        VIEW_USER.update(on=True, zoom=1.0, wcx=VIEW_USER["auto"][0], wcy=VIEW_USER["auto"][1])
+
+
+def reset_view():
+    VIEW_USER["on"] = False
+
+
+def zoom_at(pos, steps):
+    """Масштаб колесом, относительно курсора: мировая точка под курсором остаётся на месте."""
+    if not steps:
+        return
+    _ensure_user_view()
+    mx, my = pos
+    base = VIEW_USER["base"]
+    z0 = VIEW_USER["zoom"]
+    z1 = max(ZOOM_MIN, min(ZOOM_MAX, z0 * ZOOM_STEP ** steps))
+    if z1 == z0:
+        return
+    wx = VIEW_USER["wcx"] + (mx - NET_W / 2) / (base * z0)
+    wy = VIEW_USER["wcy"] + (my - H / 2) / (base * z0)
+    VIEW_USER["zoom"] = z1
+    VIEW_USER["wcx"] = wx - (mx - NET_W / 2) / (base * z1)
+    VIEW_USER["wcy"] = wy - (my - H / 2) / (base * z1)
+
+
+def pan_by(dx, dy):
+    """Сдвиг сети мышью: dx, dy — смещение курсора в пикселях."""
+    _ensure_user_view()
+    cell = VIEW_USER["base"] * VIEW_USER["zoom"]
+    VIEW_USER["wcx"] -= dx / cell
+    VIEW_USER["wcy"] -= dy / cell
+
+
+def select_neuron(brain, nid):
+    """Выбор нейрона кликом: описание в чате, соседи подсвечиваются (см. focus)."""
+    NET_SEL["nid"] = nid
+    if nid is None or nid not in brain.neurons:
+        NET_SEL["nid"] = None
+        return None
+    word = brain.neurons[nid].word
+    deg = sum(1 for a, b in brain.links if a == nid or b == nid)
+    label = f"«{word}»" if word else f"нейрон {nid}"
+    return f"Выбран {label}: связей {deg}. ПКМ — действия, двойной клик по пустому — вид сброшен."
+
+
 # ---------- v18: поле ввода, выделение и буфер ----------
 
 FIELD_PAD = 12
@@ -1881,11 +1940,7 @@ def handle_edit_key(e, field):
             return f"Вырезано: {len(body)} симв."
         if e.key == pygame.K_v:
             _focus_field()
-            text = (get_clipboard_text()
-                    .replace("\r\n", "\n")
-                    .replace("\r", "\n")
-                    .replace("\x00", ""))
-            field.insert(text)
+            field.insert(get_clipboard_text().replace("\r\n", "\n").replace("\r", "\n"))
             return ""
         return None
     if e.key == pygame.K_LEFT:
@@ -1917,9 +1972,7 @@ def handle_edit_key(e, field):
 def _draw_field(screen, font, rect, field, now):
     """Поле ввода: окно с прокруткой, выделение, курсор."""
     FIELD_VIEW.update(rect=rect, font=font)
-    shown = (field.text.replace("\r\n", "¶")
-             .replace("\n", "¶")
-             .replace("\r", "¶"))
+    shown = field.text.replace("\n", "¶")
     avail = rect.w - 2 * FIELD_PAD
     base_x, y = rect.x + FIELD_PAD, rect.y + 10
     if not field.text:
@@ -2027,7 +2080,6 @@ def main():
     cortex_acc = 0.0
     last_lm = None
     dragging = None
-    pan_drag = None
     thoughts = []
     scroll = {"think": 0, "chat": 0}
 
@@ -2355,20 +2407,11 @@ def main():
                                     brain.note_support(score)
                                     # Автообучения нет: граф меняется только по награде (/good, /teach).
                                     last_arm, last_st = st.get("arm"), st
-                                    # ФИКС: вывести ответ графа в чат (было: оставалось «думаю…»)
-                                    entry[1] = reply_text
-                                    _set_score(entry, score)
-                                    resp = speech(reply_text.split(), entry, now, gap)
                                 else:
                                     entry[1] = answerer.unknown_reply(st)
                     chat = chat[-300:]
                 elif e.key == pygame.K_F3:
                     show_legend = not show_legend
-                elif e.key == pygame.K_0:                  # 0 — сбросить масштаб и сдвиг
-                    CAM["zoom"] = 1.0
-                    CAM["pan_x"] = 0.0
-                    CAM["pan_y"] = 0.0
-                    update_view(brain, 1.0)
                 elif e.key in (pygame.K_PAGEUP, pygame.K_PAGEDOWN):
                     k = "think" if pygame.key.get_mods() & pygame.KMOD_SHIFT else "chat"
                     scroll[k] = max(0, scroll[k] + (5 if e.key == pygame.K_PAGEUP else -5))
@@ -2387,24 +2430,15 @@ def main():
                 else:
                     sys_msg("Перетащите текстовый файл (.txt), чтобы обучить сеть.")
             elif e.type == pygame.DROPTEXT:
-                text_dropped = (e.text
-                                .replace("\r\n", "\n")
-                                .replace("\r", "\n")
-                                .replace("\x00", ""))
-                field.insert(text_dropped)
+                field.insert(e.text)
             elif e.type == pygame.MOUSEWHEEL:
                 pos = pygame.mouse.get_pos()
-                if THINK_RECT.collidepoint(pos):
+                if pos[0] < NET_W:
+                    zoom_at(pos, e.y)
+                elif THINK_RECT.collidepoint(pos):
                     scroll["think"] = max(0, scroll["think"] + e.y * 3)
                 elif CHAT_RECT.collidepoint(pos):
                     scroll["chat"] = max(0, scroll["chat"] + e.y * 3)
-                elif pos[0] < NET_W:                       # колесо над сетью = зум
-                    step = 1.15 if e.y > 0 else 1 / 1.15
-                    CAM["zoom"] = max(0.3, min(5.0, CAM["zoom"] * step))
-                    update_view(brain, 1.0)                # мгновенно
-            elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 2:
-                if e.pos[0] < NET_W:                       # СКМ над сетью — начать сдвиг
-                    pan_drag = e.pos
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 3:
                 if panel_at(e.pos):
                     pname = panel_at(e.pos)
@@ -2418,6 +2452,13 @@ def main():
                     neuron_menu.open(brain.neurons[nid_r], e.pos)
                 else:
                     neuron_menu.close()
+            elif (e.type == pygame.MOUSEBUTTONDOWN and e.button == 1
+                  and e.pos[0] < NET_W and not neuron_menu.active):
+                nid_p = nearest_neuron(brain, e.pos[0], e.pos[1])
+                NET_PRESS.update(pos=e.pos, moved=False, nid=nid_p)
+                if nid_p is None and _is_double(e.pos):
+                    reset_view()
+                    sys_msg("Вид сброшен: автоматический масштаб и центр.")
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 # Меню нейрона и кнопки оценки имеют приоритет над остальными элементами.
                 if neuron_menu.active:
@@ -2489,13 +2530,12 @@ def main():
                                 SEL.update(_word_sel(pname, p))
                         else:
                             SEL.update(panel=None, a=None, b=None, drag=False)
-            elif e.type == pygame.MOUSEMOTION and pan_drag is not None:
-                dx = e.pos[0] - pan_drag[0]
-                dy = e.pos[1] - pan_drag[1]
-                pan_drag = e.pos
-                CAM["pan_x"] = CAM.get("pan_x", 0.0) + dx
-                CAM["pan_y"] = CAM.get("pan_y", 0.0) + dy
-                update_view(brain, 1.0)                    # мгновенно
+            elif e.type == pygame.MOUSEMOTION and NET_PRESS["pos"] is not None:
+                if not NET_PRESS["moved"]:
+                    x0, y0 = NET_PRESS["pos"]
+                    NET_PRESS["moved"] = math.hypot(e.pos[0] - x0, e.pos[1] - y0) > 4
+                if NET_PRESS["moved"]:
+                    pan_by(e.rel[0], e.rel[1])
             elif e.type == pygame.MOUSEMOTION and FIELD_DRAG["on"]:
                 _drag_field(field, e.pos)
             elif e.type == pygame.MOUSEMOTION and dragging is not None:
@@ -2504,12 +2544,20 @@ def main():
                 p = point_at(SEL["panel"], e.pos)
                 if p is not None:
                     SEL["b"] = p
+            elif e.type == pygame.MOUSEBUTTONUP and e.button == 1 and NET_PRESS["pos"] is not None:
+                if not NET_PRESS["moved"]:
+                    msg_sel = select_neuron(brain, NET_PRESS["nid"])
+                    if msg_sel:
+                        sys_msg(msg_sel)
+                    elif NET_PRESS["nid"] is None:
+                        NET_SEL["nid"] = None
+                NET_PRESS.update(pos=None, moved=False, nid=None)
+                dragging = None
+                FIELD_DRAG["on"] = False
             elif e.type == pygame.MOUSEBUTTONUP and e.button == 1:
                 dragging = None
                 SEL["drag"] = False
                 FIELD_DRAG["on"] = False
-            elif e.type == pygame.MOUSEBUTTONUP and e.button == 2:
-                pan_drag = None
             elif e.type == pygame.TEXTINPUT:
                 field.insert(e.text)
 
@@ -2615,7 +2663,7 @@ def main():
             coh_hist.append(max(0.0, min(1.0, mind.coherence())))
         mouse = pygame.mouse.get_pos()
         update_view(brain, dt)
-        focus = nearest_neuron(brain, mouse[0], mouse[1])
+        focus = nearest_neuron(brain, mouse[0], mouse[1]) or NET_SEL["nid"]
         screen.blit(bg, (0, 0))
         # NEW: оболочки групп — позади связей и узлов
         hull_tick += 1

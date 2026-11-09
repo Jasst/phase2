@@ -22,6 +22,10 @@ COHERENCE_EMIT = 0.25    # порог согласованности полей 
 DELIB_CYCLES = 24        # шагов мышления на один вопрос
 MAX_ANSWER = 8
 CANDIDATES = 5           # сколько вариантов ответа сравнивается
+CANDIDATES_WEAK = 9     # при слабой опоре на граф в последних ответах — больше вариантов
+CHAIN_BONUS = 0.25      # бонус цепочке по тексту при выборе ответа
+CHAIN_STEP_MIN = 0.05   # цепочка по тексту держится дольше: порядок важнее краткости
+STEP_MIN = 0.35         # цепочка мысли обрывается, когда шаг слабее этой доли лучшего шага
 CONF_MIN = 0.05          # ниже этого порога ответ помечается как неуверенный
 GROUP_W = 1.2
 LEFT_SCALE = 0.6         # левое полушарие холоднее (множитель от /temp)
@@ -33,14 +37,10 @@ MIN_WORD_LEN = 3         # короче — служебный мусор
 THOUGHT_MIN_WORDS = 3    # мысль в чат, только если после очистки осталось столько слов
 REPEAT_MAX = 2           # одно слово в ответе не чаще двух раз
 STOPWORDS = frozenset(
-    "черновик черновика черновику рассуждение рассуждений "
-    "формат формату формата служебный служебных "
-    "подсказка подсказки проверь проверить перепроверь "
-    "вопрос вопроса вопросу ответь ответа ответу "
-    "правильный правильных одним словом "
     "и в во на с со к по за из у о об от до не ни что как а но или это то же бы ли так "
     "вот был была было были есть быть он она оно они мы вы я ты его её ее их там тут уже "
     "еще ещё при для без над под про все всё себя этот эта эти который которые такое какой какие".split())
+
 
 def clean_words(words):
     """Убирает служебные слова, короткий мусор, соседние повторы и излишний повтор."""
@@ -375,6 +375,97 @@ class Mind:
         coverage = sum(1 for w in reply_known if w in nearby) / len(reply_known)
         return 0.55 * cos + 0.45 * coverage
 
+    def _n_candidates(self):
+        """Адаптивный поиск: при слабой опоре в последних ответах пробуем больше вариантов."""
+        hist = self.b.support_hist
+        if len(hist) >= 5 and sum(hist) / len(hist) < 0.3:
+            return CANDIDATES_WEAK
+        return CANDIDATES
+
+    def order_path(self, seeds, words, ctx, target):
+        """Логичный порядок мысли: цепочка по связям графа от вопроса.
+
+        Каждое следующее слово — самое сильное продолжение предыдущего: связь в графе,
+        биграмма и близость к контексту вопроса. Цепочка обрывается, когда продолжение
+        слабеет (длина адаптивна), потолок — target. Слова, которые не продолжают
+        мысль, в неё не попадают.
+        """
+        pool = list(dict.fromkeys(words))
+        if not pool:
+            return []
+        prev = seeds[-1] if seeds else None
+        path, best_seen = [], 0.0
+        while pool and len(path) < max(1, target):
+            scores = {}
+            for w in pool:
+                sc = ctx.get(w, 0.0)
+                if prev is not None:
+                    ni, nw = self.b.words.get(prev), self.b.words.get(w)
+                    if ni is not None and nw is not None:
+                        sc += self.b.links.get(key(ni, nw), 0.0)
+                    sc += 0.5 * math.log1p(self.b.bigram.get((prev, w), 0))
+                scores[w] = sc
+            best = max(pool, key=lambda w: (scores[w], w))
+            s_best = scores[best]
+            if s_best <= 0:
+                break
+            best_seen = max(best_seen, s_best)
+            if path and s_best < STEP_MIN * best_seen:
+                break
+            path.append(best)
+            pool.remove(best)
+            prev = best
+        return path
+
+    def chain_from(self, seeds, ctx, target):
+        """Генеративная цепочка: от последнего слова вопроса по реальным парам «слово →
+        следующее» (биграммы из текста), с поправками на связи графа и близость к вопросу.
+
+        Это логичнее случайной выборки: порядок слов подтверждён текстом. Цепочка
+        обрывается, когда продолжение слабеет; потолок — target.
+        """
+        if not seeds:
+            return []
+        succ = {}
+        for (a, w), c in self.b.bigram.items():
+            succ.setdefault(a, []).append((w, c))
+        adj = self.b.adjacency()
+        seed_set = set(seeds)
+        # старт — затравка с самым богатым продолжением (а не просто последнее слово)
+        start = max(seeds, key=lambda w: (len(succ.get(w, ())), w))
+        prev, used, path, best_seen = start, {start}, [], 0.0   # по затравкам можно идти, повторы — нет
+        while len(path) < max(1, target):
+            cand = {}
+            for w, c in succ.get(prev, ()):
+                cand[w] = max(cand.get(w, 0.0), math.log1p(c))
+            ni = self.b.words.get(prev)
+            if ni is not None:
+                for j, lw in adj.get(ni, ()):
+                    m = self.b.neurons.get(j)
+                    if m is not None and m.word:
+                        cand[m.word] = max(cand.get(m.word, 0.0), 0.3 * lw)
+            scores = {}
+            for w, base in cand.items():
+                # служебные слова («на», «и») здесь нужны: они держат связь фразы;
+                # повторы не допускаются
+                if w in used:
+                    continue
+                # порядок из текста главный (x2), контекст вопроса — лёгкая поправка
+                scores[w] = 2.0 * base + 0.2 * ctx.get(w, 0.0)
+            if not scores:
+                break
+            best = max(scores, key=lambda w: (scores[w], w))
+            s_best = scores[best]
+            if s_best <= 0:
+                break
+            best_seen = max(best_seen, s_best)
+            if path and s_best < CHAIN_STEP_MIN * best_seen:
+                break
+            path.append(best)
+            used.add(best)
+            prev = best
+        return [w for w in path if w not in seed_set]
+
     def answer(self, seed_ids, target=8):
         """Возвращает (слова, оценка ассоциативного сходства).
 
@@ -391,7 +482,7 @@ class Mind:
         cands = []
         # Каждый вариант должен начинаться с одного и того же состояния.
         # Иначе предыдущая попытка незаметно меняет следующую.
-        for _ in range(CANDIDATES):
+        for _ in range(self._n_candidates()):
             snapshot = (
                 collections.deque(self.stream, maxlen=STREAM_LEN),
                 dict(self.fieldL), dict(self.fieldR), dict(self.recent),
@@ -410,7 +501,12 @@ class Mind:
                  self.workspace, self.steps, self.turn, self.since_emit,
                  self.b.forced, self.last_side) = snapshot
             if cand:
+                cand = self.order_path(seeds, cand, ctx, target)     # логичный порядок мысли
                 cands.append((cosine({w: 1.0 for w in cand}, ctx), cand))
+        chain = self.chain_from(seeds, ctx, target)
+        if chain:
+            # цепочка по тексту логичнее случайной выборки: даём ей преимущество
+            cands.append((cosine({w: 1.0 for w in chain}, ctx) + CHAIN_BONUS, chain))
         if not cands:
             self.b.adapt(seeds)  # незнакомый вопрос всё равно учит сеть
             return [], 0.0

@@ -15,19 +15,12 @@ TIMEOUT = 2.0
 
 
 def _commands():
+    """(команда записи, команда чтения) для текущей системы или (None, None)."""
     which = shutil.which
     if sys.platform == "darwin" and which("pbcopy") and which("pbpaste"):
         return ["pbcopy"], ["pbpaste"]
-    if sys.platform.startswith("win") and which("powershell"):
-        # base64 — обходит любую кодировку консоли Windows
-        write = ["powershell", "-NoProfile", "-Command",
-                 "$b=[Convert]::FromBase64String($env:CLIP_B64);"
-                 "Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString($b))"]
-        read = ["powershell", "-NoProfile", "-Command",
-                "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
-                "$s=Get-Clipboard -Raw; "
-                "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s))"]
-        return write, read
+    if sys.platform.startswith("win") and which("clip") and which("powershell"):
+        return ["clip"], ["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"]
     if os.environ.get("WAYLAND_DISPLAY") and which("wl-copy") and which("wl-paste"):
         return ["wl-copy"], ["wl-paste", "-n"]
     if which("xclip"):
@@ -39,36 +32,27 @@ def _commands():
 
 
 def copy(text):
+    """Кладёт текст в буфер. Возвращает 'system' или 'internal'."""
     _INTERNAL["text"] = text
     write, _ = _commands()
-    if not write:
-        return "internal"
-    try:
-        if sys.platform.startswith("win") and shutil.which("powershell"):
-            import base64, os as _os
-            env = dict(_os.environ)
-            env["CLIP_B64"] = base64.b64encode(text.encode("utf-8")).decode("ascii")
-            subprocess.run(write, timeout=TIMEOUT, check=True,
-                           capture_output=True, env=env)
-        else:
+    if write:
+        try:
             subprocess.run(write, input=text.encode("utf-8"), timeout=TIMEOUT,
                            check=True, capture_output=True)
-        return "system"
-    except (OSError, subprocess.SubprocessError):
-        return "internal"
+            return "system"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return "internal"
 
 
 def paste():
+    """Текст из буфера. Если системный недоступен — внутренний."""
     _, read = _commands()
-    if not read:
-        return _INTERNAL["text"]
-    try:
-        out = subprocess.run(read, timeout=TIMEOUT, capture_output=True)
-        if out.returncode != 0:
-            return _INTERNAL["text"]
-        if sys.platform.startswith("win") and shutil.which("powershell"):
-            import base64
-            return base64.b64decode(out.stdout.strip()).decode("utf-8", "ignore")
-        return out.stdout.decode("utf-8", "ignore").replace("\x00", "")
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return _INTERNAL["text"]
+    if read:
+        try:
+            out = subprocess.run(read, timeout=TIMEOUT, capture_output=True)
+            if out.returncode == 0:
+                return out.stdout.decode("utf-8", "ignore").replace("\x00", "")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return _INTERNAL["text"]

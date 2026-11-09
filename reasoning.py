@@ -156,18 +156,11 @@ class Answerer:
         res = self.nets.think(question)
         if not res or not res["thought"]:
             return None
-        from mind import clean_words
-        raw = [w for w in res["thought"] if w in self.brain.words]
-        words = clean_words(raw)[:max(1, target)]
+        words = [w for w in res["thought"] if w in self.brain.words][:max(1, target)]
         if not words:
             return None
         support = self.mind.support(seeds, words)
-        # стабильность с поправкой: чем больше мусора отфильтровано, тем ниже бонус.
-        # Если цепочка выдала 6 слов, из которых 2 — стоп-слова и повторы, честнее
-        # не награждать её как «стабильную» на полную.
-        ratio = len(words) / max(1, len(raw))
-        stab_base = 1.0 if res["reason"] == "стабилизация" else 0.5
-        stab = stab_base * (0.4 + 0.6 * ratio)
+        stab = 1.0 if res["reason"] == "стабилизация" else 0.5
         length = min(1.0, len(words) / max(1, target))
         score = W_SUPPORT * support + W_STAB * stab + W_LEN * length
         return Thought(words, CHAIN, stab, support, score)
