@@ -1,19 +1,9 @@
-/.idea
-*.xml
-/.idea
-/__pycache__
-/OLD
-/phase1
-/phase2
-*.zip
-.env
-
+__pycache__/
+.pytest_cache/
 .venv/
-
-# nets: генерируемые файлы
-nets/_store/*.json
-nets/_store/feedback.jsonl
-nets/_logs/
-nets/_sandbox/*.json
-nets/__pycache__/
-nets/tests/__pycache__/
+state/
+*.npz
+*.tmp
+*.tmp.npz
+data/
+.env

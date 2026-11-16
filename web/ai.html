@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0d0e11">
+  <meta name="color-scheme" content="dark">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="AI">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+  <title>AI-ассистент</title>
+
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/ai.css">
+  <link rel="stylesheet" href="/static/ui.css">
+  <link rel="stylesheet" href="/static/ui-polish.css">
+  <link rel="stylesheet" href="/static/ui-refined.css">
+  <link rel="stylesheet" href="/static/vendor/github-dark.min.css">
+  <script src="/static/vendor/purify.min.js"></script>
+  <script src="/static/vendor/marked.min.js"></script>
+  <script src="/static/vendor/highlight.min.js"></script>
+</head>
+<body class="ai-body">
+<div class="app" id="app">
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sb-top">
+      <div class="brand">
+        <span class="brand-mark">✦</span>
+        <span class="brand-name">Ассистент</span>
+        <span class="status" id="status" title="Проверка связи"></span>
+      </div>
+      <button class="btn-new" id="newChatBtn" type="button">
+        <span class="plus">＋</span> Новый чат <kbd>Ctrl K</kbd>
+      </button>
+      <div class="search">
+        <input id="searchInput" type="search" placeholder="Поиск по чатам (/)" autocomplete="off">
+      </div>
+    </div>
+
+    <div class="sb-pull-anchor">
+      <div class="pull-indicator" id="sbPullIndicator" aria-hidden="true"><span class="pi-spin">↻</span> <span class="pi-text">Потяните вниз, чтобы обновить список</span></div>
+    </div>
+    <nav class="sb-list" id="sessionList" aria-label="Чаты"></nav>
+
+    <div class="sb-bottom">
+      <button class="sb-link" id="installBtn" type="button" hidden>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
+        Установить приложение
+      </button>
+      <button class="sb-link" id="logoutBtn" type="button" title="Выйти из аккаунта">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
+        <span id="userEmail">Выйти</span>
+      </button>
+      <button class="sb-link" id="openSettings" type="button">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Настройки
+      </button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn only-mobile" id="menuBtn" type="button" aria-label="Список чатов">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+      <div class="title-wrap">
+        <h1 class="chat-title" id="chatTitle">Новый чат</h1>
+        <span class="chat-sub" id="chatSub"></span>
+      </div>
+      <div class="top-actions">
+        <!-- Кнопка-триггер вместо нативного <select>: системный dropdown не
+             стилизуется и выглядит чужеродно. Список рисует ai-app.js в стиле
+             приложения (.model-dd); скрытый select ниже — только для значения. -->
+        <button class="model-select" id="modelSelectBtn" type="button"
+                aria-haspopup="listbox" aria-expanded="false" title="Выбрать модель" hidden>
+          <span class="model-name" id="modelName"></span>
+          <!-- подпись «в памяти: …»: показывается, когда выбрана одна модель,
+               а в VRAM сейчас держится другая (грузится в фоне / переключили
+               вручную). Управляется JS (updateModelLabel), по умолчанию скрыта -->
+          <span class="model-status" id="modelStatus" hidden></span>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <select id="modelSelect" aria-hidden="true" style="display:none"></select>
+        <button class="icon-btn" id="modelSettingsBtn" type="button" title="Настройки модели" aria-label="Настройки модели">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+        </button>
+        <button class="icon-btn" id="renameBtn" type="button" title="Переименовать" disabled>
+          <img class="ico" src="/static/icons/Edit.png" alt="">
+        </button>
+        <button class="icon-btn" id="exportBtn" type="button" title="Скачать чат (Markdown)" disabled>
+          <img class="ico" src="/static/icons/Download.png" alt="">
+        </button>
+        <button class="icon-btn" id="clearBtn" type="button" title="Очистить историю" disabled>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 21h10"/><path d="M5.5 14.5 12 8l6 6-5.5 5.5H9.5L5.5 14.5Z"/><path d="M12 8l-3-3 5-2 4 4-2 3"/></svg>
+        </button>
+        <button class="icon-btn danger" id="deleteBtn" type="button" title="Удалить чат" disabled>
+          <img class="ico" src="/static/icons/Remove.png" alt="">
+        </button>
+      </div>
+    </header>
+
+    <div class="msgs-wrap">
+    <section class="messages" id="messages" role="log" aria-live="polite">
+      <div class="pull-indicator" id="pullIndicator" aria-hidden="true"><span class="pi-spin">↻</span> <span class="pi-text">Потяните вниз, чтобы обновить чаты</span></div>
+      <div class="msgs-inner" id="inner"></div>
+    </section>
+      <button class="scroll-bottom" id="scrollBottomBtn" type="button" hidden aria-label="К концу переписки">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
+      </button>
+    </div>
+
+    <div class="composer-wrap">
+      <div class="composer">
+        <div class="attach-chip" id="attachChip" hidden>
+          <img id="attachThumb" alt="">
+          <span id="attachName"></span>
+          <button type="button" id="attachRemove" aria-label="Убрать изображение">×</button>
+        </div>
+        <textarea id="input" rows="1" placeholder="Напишите сообщение…"></textarea>
+        <div class="composer-bar">
+          <div class="tools">
+            <button class="tool" id="attachBtn" type="button" title="Прикрепить изображение">
+              <img class="ico" src="/static/icons/Attach.png" alt="" style="width:15px;height:15px"><svg class="ti" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg><span class="tl">Фото</span>
+            </button>
+            <button class="tool" id="toggleWeb" type="button" aria-pressed="false" title="Искать в интернете"><span class="ti-emoji">🌐</span><svg class="ti" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg><span class="tl">Поиск</span></button>
+            <button class="tool" id="toggleReason" type="button" aria-pressed="false" title="Показывать ход рассуждений"><span class="ti-emoji">🧠</span><svg class="ti" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="9" y1="18" x2="15" y2="18"/><line x1="10" y1="22" x2="14" y2="22"/><path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1 .23 2.23 1.5 3.5A4.61 4.61 0 0 1 8.91 14"/></svg><span class="tl">Рассуждения</span></button>
+          </div>
+          <span class="counter" id="counter"></span>
+          <button class="mic" id="micBtn" type="button" title="Голосовой ввод: нажмите и говорите" aria-label="Голосовой ввод" aria-pressed="false" hidden><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg></button>
+          <button class="send" id="sendBtn" type="button" title="Отправить" aria-label="Отправить">➤</button>
+        </div>
+      </div>
+      <p class="hint" id="hint"><span id="hintText">Enter — отправить · Shift+Enter — новая строка · / — поиск по чатам</span> <button type="button" class="link-btn" id="hintBtn" hidden>Открыть</button></p>
+    </div>
+    <input type="file" id="fileInput" hidden accept="image/*,.json,.txt,.md,.csv,.tsv,.log,.py,.js,.ts,.jsx,.tsx,.css,.html,.htm,.xml,.yaml,.yml,.toml,.ini,.cfg,.sql,.sh,.java,.kt,.go,.rs,.c,.h,.cpp,.hpp,.cs,.rb,.php,.swift,.srt,.vtt">
+  </main>
+</div>
+
+<dialog id="settingsDialog" class="dialog">
+  <form method="dialog" class="dialog-body">
+    <header>
+      <h2>Настройки</h2>
+      <button class="icon-btn" value="close" aria-label="Закрыть">×</button>
+    </header>
+
+    <section>
+      <h3>Отправка</h3>
+      <label class="row"><span>Отправлять по Enter</span><input type="checkbox" data-key="enterSends"></label>
+      <label class="row"><span>Прокручивать к новым сообщениям</span><input type="checkbox" data-key="autoScroll"></label>
+    </section>
+
+    <section>
+      <h3>Ответы по умолчанию</h3>
+      <label class="row"><span>Поиск в интернете</span><input type="checkbox" data-key="webDefault"></label>
+      <label class="row"><span>Показывать рассуждения</span><input type="checkbox" data-key="reasoningDefault"></label>
+    </section>
+
+    <section>
+      <h3>Внешний вид</h3>
+      <label class="row"><span>Размер текста</span>
+        <select data-key="fontSize">
+          <option value="s">Маленький</option>
+          <option value="m">Средний</option>
+          <option value="l">Крупный</option>
+        </select>
+      </label>
+      <label class="row"><span>Компактный режим</span><input type="checkbox" data-key="compact"></label>
+    </section>
+
+    <section>
+      <h3>Фоновые находки</h3>
+      <label class="row"><span>Получать уведомления ассистента</span><input type="checkbox" data-key="notify"></label>
+      <label class="row"><span>Проверять каждые</span>
+        <select data-key="notifyInterval">
+          <option value="15">15 секунд</option>
+          <option value="30">30 секунд</option>
+          <option value="60">60 секунд</option>
+        </select>
+      </label>
+    </section>
+
+    <section>
+      <h3>Память</h3>
+      <div class="row"><span>Что ассистент помнит о тебе: просмотр, связи и правка</span><a class="btn-ghost" href="/ai/memory/page" target="_blank" rel="noopener">Открыть</a></div>
+    </section>
+    <section>
+      <h3>Внешний ИИ (MCP)</h3>
+      <div class="row"><span>Код подключения</span><button type="button" class="btn-ghost" id="mcpCodeBtn">Выпустить новый код</button></div>
+      <div class="row"><span id="mcpCodeOut" class="mono"></span></div>
+      <p class="hint" style="text-align:left;margin:4px 0 0">Код действует, пока не получен новый: получение нового кода отключает все прежние подключения.</p>
+    </section>
+
+    <section>
+      <h3>Данные</h3>
+      <div class="row"><span>Экспорт всех чатов в JSON</span><button type="button" class="btn-ghost" id="exportAll">Скачать</button></div>
+      <div class="row"><span>Удалить все чаты в браузере</span><button type="button" class="btn-danger" id="wipeAll">Удалить</button></div>
+    </section>
+
+    <footer><button class="btn-primary" value="close">Готово</button></footer>
+  </form>
+</dialog>
+
+<!-- Подтверждение выхода: случайное нажатие не выкидывает из аккаунта -->
+<dialog id="logoutDialog" class="dialog">
+  <form method="dialog" class="dialog-body">
+    <header>
+      <h2>Выйти из аккаунта?</h2>
+    </header>
+    <section>
+      <p class="lead" id="logoutText" style="margin:0;color:var(--text-secondary);font-size:14px;line-height:1.5">
+        Чаты сохранятся: они привязаны к аккаунту и откроются при следующем входе.
+      </p>
+    </section>
+    <footer style="gap:8px">
+      <button class="btn-ghost" value="cancel" autofocus>Отмена</button>
+      <button class="btn-danger" value="confirm" id="logoutConfirm">Выйти</button>
+    </footer>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script>
+  // Регистрация service worker: нужна, чтобы браузер разрешил установку
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch((e) => console.warn('SW:', e));
+  }
+
+  // Кнопка «Установить»: Chrome/Edge/Android покажут системный диалог,
+  // iOS не поддерживает его, поэтому там показываем подсказку
+  (function () {
+    const btn = document.getElementById('installBtn');
+    const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+    if (standalone) return;                       // уже установлено
+
+    const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+    let deferred = null;
+
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferred = e;
+      btn.hidden = false;
+    });
+    if (isIOS) btn.hidden = false;
+
+    btn.addEventListener('click', async () => {
+      if (deferred) {
+        deferred.prompt();
+        await deferred.userChoice;
+        deferred = null;
+        btn.hidden = true;
+      } else if (isIOS) {
+        UI.alert('Нажмите «Поделиться» внизу Safari и выберите «На экран «Домой»».', { title: 'Установка приложения' });
+      }
+    });
+    window.addEventListener('appinstalled', () => { btn.hidden = true; });
+  })();
+</script>
+<script src="/static/js/ui.js"></script>
+<script src="/static/js/ai-store.js" defer></script>
+<script src="/static/js/ai-app.js" defer></script>
+<script src="/static/js/model-settings.js" defer></script>
+<script src="/static/js/topbar-menu.js" defer></script>
+</body>
+</html>
