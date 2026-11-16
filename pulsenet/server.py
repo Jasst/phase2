@@ -103,8 +103,6 @@ class Handler(BaseHTTPRequestHandler):
 
         handler = ROUTES.get((method, path))
         if handler is None:
-            if path.startswith("/ai/memory"):
-                return _not_supported(self, None, None)
             return self.send_json({"error": "not_found"}, 404)
         body = self.read_json() if method in ("POST", "PUT") else None
         try:
