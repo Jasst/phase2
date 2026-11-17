@@ -198,6 +198,10 @@
  <label class="row"><span>Кто отвечает по умолчанию</span>
  <select id="setBrainMode"><option value="llm">LLM</option><option value="net">Моя модель</option></select></label>
  <label class="row"><span>Учить из ответов LLM</span><input type="checkbox" id="setAutoLearn"></label>
+ <div class="row">
+   <span>Обучить на примере ответа LLM:</span>
+   <button type="button" class="btn-primary" id="trainWithLLMBtn">Обучить с LLM</button>
+ </div>
  <h3 class="sub">Параметры сети</h3>
  <label class="row"><span>Температура ответа сети</span><span class="tune"><input type="range" id="tuneTemperature" min="0" max="1.5" step="0.05"><output id="outTemperature"></output></span></label>
  <label class="row"><span>Порог «не уверена»</span><span class="tune"><input type="range" id="tuneMinConfidence" min="0" max="0.3" step="0.005"><output id="outMinConfidence"></output></span></label>

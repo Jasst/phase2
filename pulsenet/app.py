@@ -21,6 +21,7 @@ import numpy as np
 from . import store
 from .config import Config
 from .llm import PARAM_DEFAULTS, BackendError, make_backend
+from .teacher import HTTPTeacher
 from .net import BrainNet
 from .vocab import tokenize
 
@@ -303,6 +304,40 @@ class App:
                 "known": reply.known, "focus": self.focus_words(),
                 "path": [{"word": names.get(w, w), "ensemble": int(k), "mass": m}
                          for w, k, m in reply.path]}
+
+    def train_with_llm(self, question, teacher_url, model, iterations):
+        """
+        Обучить модель на примере ответа LLM (учителя).
+        
+        Для каждого из `iterations` итераций:
+          1. Спрашиваем учителя ответ на вопрос.
+          2. Учим сеть этому ответу с весом 1.0.
+        Возвращает список уроков: [{"iteration": N, "teacher_answer": ..., "loss": ...}, ...]
+        """
+        if not teacher_url:
+            return {"ok": False, "error": "не указан URL учителя (LLM)"}
+        try:
+            teacher = HTTPTeacher(teacher_url, model)
+        except Exception as exc:
+            return {"ok": False, "error": f"ошибка создания учителя: {exc}"}
+        lessons = []
+        with self.lock:
+            for i in range(iterations):
+                try:
+                    teacher_answer = teacher.answer(question)
+                except Exception as exc:
+                    lessons.append({"iteration": i + 1, "error": str(exc)})
+                    continue
+                if not teacher_answer:
+                    lessons.append({"iteration": i + 1, "teacher_answer": None, "error": "пустой ответ учителя"})
+                    continue
+                loss = self.net.teach(question, teacher_answer, weight=1.0)
+                lessons.append({
+                    "iteration": i + 1,
+                    "teacher_answer": teacher_answer,
+                    "loss": round(float(loss), 4) if loss is not None else None,
+                })
+        return {"ok": True, "lessons": lessons}
 
     def graph(self, max_edges=600):
         with self.lock:

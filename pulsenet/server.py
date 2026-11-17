@@ -322,6 +322,23 @@ def _net_eval(h, _b, _q):
     h.send_json(h.app.run_eval())
 
 
+def _net_train_with_llm(h, b, _q):
+    """Обучить модель на примере ответа LLM (учителя)."""
+    question = str(b.get("question", "")).strip()
+    if not question:
+        return h.send_json({"error": "пустой вопрос"}, 400)
+    teacher_url = b.get("teacher_url", "")
+    model = b.get("model", "")
+    iterations = int(b.get("iterations", 1))
+    if not teacher_url:
+        return h.send_json({"error": "не указан URL учителя (LLM)"}, 400)
+    try:
+        result = h.app.train_with_llm(question, teacher_url, model, iterations)
+    except Exception as exc:
+        return h.send_json({"error": str(exc)}, 500)
+    h.send_json(result, 200 if result.get("ok") else 400)
+
+
 def _net_episodes(h, _b, q):
     try:
         limit = max(1, min(500, int((q.get("limit") or ["50"])[0])))
@@ -369,6 +386,7 @@ ROUTES = {
     ("POST", "/net/mode"): _net_mode,
     ("POST", "/net/feedback"): _net_feedback,
     ("POST", "/net/eval"): _net_eval,
+    ("POST", "/net/train-with-llm"): _net_train_with_llm,
     ("GET", "/net/tuning"): _net_tuning_get,
     ("POST", "/net/tuning"): _net_tuning_set,
     ("GET", "/net/episodes"): _net_episodes,
