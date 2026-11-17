@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
-"""BrainNet — сеть импульсов: нейроны, ансамбли, цепи и онлайн-дистилляция.
+"""BrainNet — сеть импульсов.
 
-learn()   — один урок: вопрос → ответ учителя. Обновляет эмбеддинги, ансамбли,
-            направленные связи и выходную голову (дистилляция).
-respond() — ответ: импульс стартует с ансамблей вопроса и идёт по направленным
-            связям; на каждом шаге слово выбирается из выходной головы.
-teach()   — урок и повторение старого опыта (replay) против забывания.
+Мысль (thought) — распределение массы по ансамблям. Она переживает ходы:
+вопрос не стартует с нуля, а смешивается с предыдущей мыслью (фокус). Перед ответом
+импульс несколько шагов устаканивается внутри сети (settle). Во время ответа
+сеть сравнивает собственное предсказание следующего состояния (шаг цепи) с тем,
+что реально произошло (самопредсказание), и отдаёт уверенность.
+
+learn()   — онлайн-урок: эмбеддинги, ансамбли, связи, дистилляция в выходную голову.
+respond() — ответ сети с учётом мысли; тексты не учат сеть (обучение — отдельным уроком).
+teach()   — урок и повтор старого опыта против забывания.
 """
 import numpy as np
 
@@ -16,11 +20,15 @@ from .vocab import EOS_ID, Vocab, detokenize, split_sentences, tokenize
 
 
 class Reply:
-    __slots__ = ("text", "path")
+    __slots__ = ("text", "path", "confidence", "self_error", "focus", "known")
 
-    def __init__(self, text, path):
+    def __init__(self, text, path, confidence=0.0, self_error=None, focus=None, known=True):
         self.text = text
-        self.path = path        # [(слово, номер ансамбля, масса импульса), ...]
+        self.path = path            # [(слово, ансамбль, масса импульса), ...]
+        self.confidence = confidence
+        self.self_error = self_error
+        self.focus = focus or []    # топ ансамблей мысли: [(ансамбль, масса)]
+        self.known = known          # знает ли сеть хоть одно слово вопроса
 
 
 class BrainNet:
@@ -28,20 +36,26 @@ class BrainNet:
         self.cfg = cfg or Config()
         self.rng = np.random.default_rng(self.cfg.seed)
         self.vocab = Vocab()
-        self.cortex = Cortex(self.cfg, self.rng)
         self.chain = Chain(self.cfg.max_clusters)
-        self.buffer = []        # опыт: [(вопрос, ответ, вес)] для повторения
-        self.updates = 0        # все внутренние обновления (включая повтор опыта)
-        self.lessons = 0        # реальные уроки: teach() и предобучение, без повтора
+        self.cortex = Cortex(self.cfg, self.rng, chain=self.chain)
+        self.thought = None         # текущая мысль (распределение по ансамблям), переживает ходы
+        self.self_errors = []       # история ошибок самопредсказания
+        self.buffer = []            # опыт: [(вопрос, ответ, вес)] для повторения
+        self.updates = 0            # все внутренние обновления (включая повтор опыта)
+        self.lessons = 0            # реальные уроки: teach() и предобучение, без повтора
         self.last_loss = None
 
     # ---------- вспомогательное ----------
 
-    def _qvec(self, ids):
-        """Вектор вопроса: нормированное среднее входных векторов его слов."""
-        v = self.cortex.E[ids].mean(axis=0)
-        n = float(np.linalg.norm(v))
-        return (v / n if n > 1e-9 else v).astype(np.float32)
+    def _pad(self, v):
+        cap = self.cortex.cap
+        if v is None:
+            return np.zeros(cap)
+        if v.shape[0] == cap:
+            return v
+        out = np.zeros(cap)
+        out[:min(cap, v.shape[0])] = v[:cap]
+        return out
 
     def _dist(self, ids):
         """Распределение массы по ансамблям для набора нейронов (якорь вопроса)."""
@@ -54,19 +68,17 @@ class BrainNet:
         tot = v.sum()
         return v / tot if tot > 0 else None
 
-    def _context(self, s, qvec, last):
-        """Контекст шага: импульс (ансамбли) + вопрос + предыдущее слово."""
-        cfg, cx = self.cfg, self.cortex
-        w_last = 1.0 - cfg.alpha - cfg.beta
-        return (cfg.alpha * (cx.M.T @ s) + cfg.beta * qvec
-                + w_last * cx.E[last]).astype(np.float32)
+    @staticmethod
+    def _norm(v):
+        t = v.sum()
+        return v / t if t > 1e-12 else v
 
     def _advance(self, s, k_e, anchor, visited):
         """Один шаг импульса: из ансамбля k_e (с подмесью вопроса) по цепи."""
         cfg = self.cfg
         visited *= cfg.visited_decay
         if k_e >= 0:
-            cur = np.zeros(cfg.max_clusters)
+            cur = np.zeros(self.cortex.cap)
             cur[k_e] = 1.0
             mixed = (1 - cfg.anchor_mix) * cur + cfg.anchor_mix * anchor
         else:
@@ -77,10 +89,36 @@ class BrainNet:
         visited += (nxt > 0)
         return nxt
 
+    def _focus(self, anchor):
+        """Новая мысль = фокус на вопросе, смешанный с прошлой мыслью."""
+        g = self.cfg.focus_gain
+        if self.thought is None:
+            return anchor.copy()
+        prev = self._pad(self.thought)
+        return self._norm((1 - g) * prev + g * anchor)
+
+    def _settle(self, s, anchor):
+        """Внутренние шаги перед ответом: мысль устаканивается, без вывода слов."""
+        visited = np.zeros(self.cortex.cap)
+        for _ in range(self.cfg.settle_steps):
+            nxt = self.chain.hop(s, visited, self.cfg.chain_topk)
+            if nxt is None:
+                break
+            visited = visited * self.cfg.visited_decay + (nxt > 0)
+            s = self._norm(0.8 * nxt + 0.2 * anchor)
+        return s
+
+    def top_focus(self, k=5):
+        if self.thought is None:
+            return []
+        t = self._pad(self.thought)
+        idx = np.argsort(-t)[:k]
+        return [(int(i), round(float(t[i]), 3)) for i in idx if t[i] > 1e-4]
+
     # ---------- обучение ----------
 
     def learn(self, question, answer, weight=1.0):
-        """Один онлайн-урок. weight < 0 — отрицательная обратная связь (/bad).
+        """Один онлайн-урок. weight < 0 — отрицательная обратная связь.
         Возвращает средний loss дистилляции или None, если урок пуст."""
         cfg, cx = self.cfg, self.cortex
         q_tok, a_tok = tokenize(question), tokenize(answer)
@@ -94,7 +132,6 @@ class BrainNet:
         cx.attach_seq(q)
         cx.attach_seq(a)
 
-        # 1. нейроны, встречающиеся рядом, сближаются и сливаются в ансамбли
         cx.cooccur(q, weight, V)
         cx.cooccur(a, weight, V)
         cx.update_profiles(q, weight)
@@ -104,9 +141,8 @@ class BrainNet:
         cx.refresh()
         q_cl = [cx.cluster_of(i) for i in q]
         a_cl = [cx.cluster_of(i) for i in a]
-        K = cfg.max_clusters
+        K = cx.cap
 
-        # 2. направленные связи: вопрос → начало ответа, затем по порядку внутри ответа
         for k in set(q_cl):
             for m in set(a_cl[:8]):
                 self.chain.add(k, m, cfg.chain_link * weight)
@@ -116,16 +152,13 @@ class BrainNet:
                     self.chain.add(k, a_cl[i + d], weight / d)
         self.chain.decay(cfg.chain_forget)
 
-        # 3. дистилляция с принуждением учителя: импульс идёт так же, как при
-        #    генерации, но по настоящим словам учителя
         anchor = self._dist(q)
-        qvec = self._qvec(q)
         s, visited, last = anchor.copy(), np.zeros(K), q[-1]
         total = 0.0
         for tgt in a:
-            ctx = self._context(s, qvec, last)
+            ctx = (cfg.alpha * (cx.M.T @ s) + (1 - cfg.alpha) * cx.E[last]).astype(np.float32)
             loss, grad = cx.distill(ctx, tgt, V, cfg.lr_out * weight, cfg.smooth)
-            cx.E[last] -= (cfg.lr_emb * weight * (1 - cfg.alpha - cfg.beta)) * grad
+            cx.E[last] -= (cfg.lr_emb * weight * (1 - cfg.alpha)) * grad
             total += loss
             s = self._advance(s, cx.cluster_of(tgt), anchor, visited)
             last = tgt
@@ -149,8 +182,7 @@ class BrainNet:
         return loss
 
     def pretrain(self, text, weight=0.5, epochs=None):
-        """Предобучение на тексте: предыдущее предложение — вопрос, следующее — ответ.
-        Несколько проходов нужны выходной голове, чтобы она успела сойтись."""
+        """Предобучение на тексте: предыдущее предложение — вопрос, следующее — ответ."""
         sents = split_sentences(text)
         done = 0
         for _ in range(epochs or self.cfg.pretrain_epochs):
@@ -163,33 +195,36 @@ class BrainNet:
     # ---------- ответ ----------
 
     def respond(self, question, max_tokens=None, temp=None):
-        """Генерация: импульс идёт по направленным цепям, слово выбирается на каждом шаге."""
+        """Ответ сети с учётом мысли. Обновляет мысль и журнал самопредсказания."""
         cfg, cx = self.cfg, self.cortex
         max_tokens = max_tokens or cfg.max_answer
         temp = cfg.temperature if temp is None else temp
         q = self.vocab.encode(tokenize(question), grow=False)
         if not q:
-            return Reply("", [])
+            return Reply("", [], 0.0, None, self.top_focus(), known=False)
         cx.refresh()
         anchor = self._dist(q)
-        if anchor is None:
-            return Reply("", [])
-        K, V = cfg.max_clusters, len(self.vocab)
-        qvec = self._qvec(q)
-        s, visited, last = anchor.copy(), np.zeros(K), q[-1]
+
+        focus = self._focus(anchor)
+        settled = self._settle(focus, anchor)
+        prediction = self.chain.hop(settled, np.zeros(cx.cap), cfg.chain_topk)   # что сеть ждёт дальше
+        # говорим из фокуса (сохраняет первое слово вопроса), уверенность берём из устаканенной мысли
+        s = focus
+
+        K, V = cx.cap, len(self.vocab)
+        visited, last = np.zeros(K), q[-1]
         out, path, recent = [], [], []
+        act = np.zeros(K)
         for t in range(max_tokens):
-            ctx = self._context(s, qvec, last)
+            ctx = (cfg.alpha * (cx.M.T @ s) + (1 - cfg.alpha) * cx.E[last]).astype(np.float32)
             logits = (cx.O[:V] @ ctx).astype(np.float64)
             freq = np.log1p(np.asarray(self.vocab.counts[:V], dtype=np.float64))
             logits -= cfg.freq_penalty * freq
-            # импульс → слово: выбираются слова из тех ансамблей, через которые сейчас идёт импульс
-            lab = cx.label[:V]
-            mass = np.where(lab >= 0, s[np.maximum(lab, 0)], 0.0)
+            mass = np.where(cx.label[:V] >= 0, s[np.maximum(cx.label[:V], 0)], 0.0)
             logits += cfg.ensemble_gain * np.log(mass + 1e-3)
             for r in set(recent[-cfg.no_repeat:]):
                 logits[r] = -np.inf if r != EOS_ID else logits[r]
-            if t == 0:                       # ответ не начинается с EOS или знака препинания
+            if t == 0:
                 logits[EOS_ID] = -np.inf
                 for i in range(1, V):
                     if not self.vocab.words[i][:1].isalnum():
@@ -205,20 +240,43 @@ class BrainNet:
                 break
             out.append(tok)
             recent.append(tok)
-            s = self._advance(s, cx.cluster_of(tok), anchor, visited)
+            k_e = cx.cluster_of(tok)
+            if k_e >= 0:
+                act[k_e] += 1.0
+            s = self._advance(s, k_e, anchor, visited)
             path.append((self.vocab.words[tok], int(np.argmax(s)), round(float(s.max()), 3)))
             last = tok
-        return Reply(detokenize([self.vocab.words[i] for i in out]), path)
+
+        # самопредсказание: предсказанный шаг цепи против реально пройденных ансамблей
+        self_error = None
+        if prediction is not None and act.sum() > 0:
+            a_n = act / np.linalg.norm(act)
+            p_n = prediction / (np.linalg.norm(prediction) + 1e-12)
+            self_error = round(float(1.0 - a_n @ p_n), 4)
+            self.self_errors.append(self_error)
+            del self.self_errors[:-200]
+        # мысль после ответа: её переписывает то, что сеть сказала
+        if act.sum() > 0:
+            told = self._norm(act)
+            self.thought = self._norm((1 - cfg.thought_decay) * settled + cfg.thought_decay * told)
+        else:
+            self.thought = settled
+        confidence = round(float(settled.max()), 4)
+        text = detokenize([self.vocab.words[i] for i in out]) if confidence >= cfg.min_confidence else ""
+        return Reply(text, path, confidence, self_error, self.top_focus(), known=True)
 
     # ---------- диагностика ----------
 
     def stats(self):
         return {"слов": len(self.vocab) - 1, "ансамблей": len(self.cortex.members),
                 "связей": self.chain.edges(), "уроков": self.lessons,
-                "в_памяти_опыта": len(self.buffer)}
+                "в_памяти_опыта": len(self.buffer), "ёмкость": self.cortex.cap}
 
     def clusters(self):
-        """Ансамбли: [(номер, [слова...])], от больших к малым."""
         groups = [(k, [self.vocab.words[i] for i in ws])
                   for k, ws in self.cortex.members.items() if ws]
         return sorted(groups, key=lambda kv: (-len(kv[1]), kv[0]))
+
+    def self_error_avg(self, last=20):
+        xs = self.self_errors[-last:]
+        return round(float(np.mean(xs)), 4) if xs else None

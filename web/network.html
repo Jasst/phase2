@@ -21,6 +21,7 @@
   <button id="btnLoad" type="button" title="Заменить сеть состоянием с диска">Загрузить с диска</button>
   <button id="btnReset" type="button" class="danger" title="Очистить сеть и начать обучение заново (текущая сеть сохранится в резервную копию)">Сбросить сеть</button>
   <button id="btnRestore" type="button" title="Вернуть сеть из последней резервной копии, созданной при сбросе">Восстановить копию</button>
+  <button id="btnEval" type="button" class="primary" title="Проверить, помнит ли сеть подтверждённые ответы">Проверить припоминание</button>
   <span id="toast" class="toast" role="status"></span>
 </section>
 
@@ -67,6 +68,13 @@
       <h2>Развитие по урокам</h2>
       <svg id="chart" role="img" aria-label="График развития сети"></svg>
       <div id="chartLegend" class="legend small"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Журнал уроков</h2>
+      <p class="muted small">Что сеть выучила и откуда: из чата, от вас или из ответов LLM.</p>
+      <ol id="episodes" class="path"></ol>
+      <div id="evalResult" class="result small"></div>
     </section>
   </aside>
 </main>

@@ -1,21 +1,14 @@
 # -*- coding: utf-8 -*-
 """Нейроны и ансамбли.
 
-Нейрон — слово. У него три вектора:
-  E — входной рецептор;
-  C — контекст совместной встречи (как в word2vec, обучается SGNS);
-  O — строка выходной головы, которая предсказывает следующее слово.
-
-Ансамбль (кластер) — группа нейронов со сходным окружением (распределительная
-гипотеза: слова с одними и теми же соседями играют одну роль). Каждый нейрон
-ведёт профиль соседей — счётчики слов слева и справа. Онлайн-правило: после
-урока для каждого нового слова ищем кандидатов с общими соседями и сливаем его
-с самым похожим (косинус профилей >= merge_sim), если размер ансамбля не
-превышает max_cluster_size. Слова одной фразы с разным окружением остаются
-разными звеньями цепи, а синонимы и темы объединяются.
-
-Центроид M[k] — средний входной вектор членов ансамбля k, нужен для контекста.
+Нейрон — слово: входной вектор E, контекстный C (SGNS), строка выходной головы O.
+Ансамбль — группа нейронов с похожим окружением (профили соседей). Нейроны
+сливаются, когда косинус их профилей >= merge_sim; за урок не больше
+max_merges_per_lesson слияний, размер ограничен max_cluster_size.
+Ёмкость ансамблей растёт по мере необходимости (grow): рост без жёсткого потолка.
 """
+from collections import defaultdict  # noqa: F401  (оставлено для совместимости импорта)
+
 import numpy as np
 
 
@@ -25,18 +18,19 @@ def _unit(v):
 
 
 class Cortex:
-    def __init__(self, cfg, rng):
+    def __init__(self, cfg, rng, chain=None):
         self.cfg = cfg
         self.rng = rng
-        self.cap = cfg.max_clusters
+        self.chain = chain
+        self.cap = cfg.max_clusters                # текущая ёмкость ансамблей (слотов)
         self.E = self._init_rows(256)
         self.C = np.zeros((256, cfg.dim), np.float32)
         self.O = np.zeros((256, cfg.dim), np.float32)
-        self.label = np.full(256, -1, np.int64)     # нейрон → номер ансамбля (-1 — ещё нет)
-        self.members = {}                           # ансамбль → [нейроны]
-        self.free = list(range(self.cap))           # свободные номера ансамблей
-        self.prof = {}                              # нейрон → {сосед: счётчик}
-        self.by_nb = {}                             # сосед → нейроны, которые его знают
+        self.label = np.full(256, -1, np.int64)    # нейрон → номер ансамбля (-1 — ещё нет)
+        self.members = {}                          # ансамбль → [нейроны]
+        self.free = list(range(self.cap))          # свободные номера ансамблей
+        self.prof = {}                             # нейрон → {сосед: счётчик}
+        self.by_nb = {}                            # сосед → нейроны, которые его знают
         self.M = np.zeros((self.cap, cfg.dim), np.float32)
 
     def _init_rows(self, n):
@@ -54,31 +48,39 @@ class Cortex:
         self.O = np.vstack([self.O, np.zeros((add, d), np.float32)])
         self.label = np.concatenate([self.label, np.full(add, -1, np.int64)])
 
+    def grow(self, new_cap):
+        """Расширить число ансамблей (и связанные матрицы)."""
+        if new_cap <= self.cap:
+            return
+        d = self.cfg.dim
+        self.M = np.vstack([self.M, np.zeros((new_cap - self.cap, d), np.float32)])
+        self.free.extend(range(self.cap, new_cap))
+        self.cap = new_cap
+        if self.chain is not None:
+            self.chain.grow(new_cap)
+
     # ---------- ансамбли ----------
 
     def cluster_of(self, word_id):
         return int(self.label[word_id])
 
     def attach_seq(self, ids):
-        """Гарантирует, что каждый нейрон входит в ансамбль. Если номера кончились,
-        нейрон берёт ансамбль предыдущего слова в тексте (или 0)."""
-        out, prev = [], -1
+        """Гарантирует, что каждый нейрон входит в ансамбль. Номеров не хватило —
+        ёмкость растёт вдвое (рост без ограничения)."""
+        out = []
         for i in ids:
             k = int(self.label[i])
             if k < 0:
-                if self.free:
-                    k = self.free.pop(0)
-                    self.members[k] = []
-                else:
-                    k = prev if prev >= 0 else 0
-                self.members.setdefault(k, []).append(i)
+                if not self.free:
+                    self.grow(self.cap * 2)
+                k = self.free.pop(0)
+                self.members[k] = []
+                self.members[k].append(i)
                 self.label[i] = k
             out.append(k)
-            prev = k
         return out
 
     def _merge(self, keep, drop):
-        """Сливает ансамбль drop в keep. Возвращает (keep, drop) для переноса цепи."""
         for w in self.members.pop(drop, []):
             self.label[w] = keep
             self.members[keep].append(w)
@@ -94,7 +96,7 @@ class Cortex:
     # ---------- совместная встреча ----------
 
     def cooccur(self, ids, weight, vocab_size):
-        """Слова рядом сближаются (SGNS). weight < 0 — расталкивание (негативная обратная связь)."""
+        """Слова рядом сближаются (SGNS). weight < 0 — расталкивание."""
         cfg = self.cfg
         if len(ids) < 2 or weight == 0:
             return
@@ -113,7 +115,6 @@ class Cortex:
                         self._pair(a, n, 0.0, lr)
 
     def update_profiles(self, ids, weight):
-        """Профили соседей: слова слева и справа в тексте."""
         for i, a in enumerate(ids):
             for j in (i - 1, i + 1):
                 if j < 0 or j >= len(ids) or ids[j] == a:
@@ -179,9 +180,8 @@ class Cortex:
 
     def distill(self, ctx, target, vocab_size, lr, smooth):
         """Шаг дистилляции: кросс-энтропия к сглаженной мягкой цели учителя.
-        Для softmax с мягкой целью q градиент по логитам равен p - q.
-        Возвращает (loss, градиент по контексту)."""
-        O = self.O[:vocab_size]            # вид на память: правки попадают в self.O
+        Для softmax с мягкой целью q градиент по логитам равен p - q."""
+        O = self.O[:vocab_size]
         z = O @ ctx
         z = z - z.max()
         p = np.exp(z)

@@ -1,0 +1,15 @@
+.brain-panel { max-width: 760px; margin: 0 auto 8px; padding: 8px 10px; border: 1px solid #272a31; border-radius: 12px; background: #16181d; color: #e9ecf1; font-size: 13px; }
+.bp-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.bp-seg { display: inline-flex; border: 1px solid #2b2f38; border-radius: 9px; overflow: hidden; }
+.bp-seg button { border: 0; background: transparent; color: #8b93a1; padding: 5px 12px; cursor: pointer; font: inherit; }
+.bp-seg button.on, .bp-seg button[aria-pressed="true"] { background: #2a2f38; color: #e9ecf1; }
+.bp-check { color: #8b93a1; display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.bp-status { margin-left: auto; color: #8b93a1; font-size: 12px; }
+.bp-last { margin: 8px 0; color: #c9ced8; line-height: 1.45; }
+.bp-src { color: #8b93a1; font-size: 12px; }
+.bp-ans { margin-top: 3px; color: #e9ecf1; white-space: pre-wrap; }
+.bp-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.bp-actions button { font: inherit; color: #e9ecf1; background: #1d2028; border: 1px solid #2b2f38; border-radius: 9px; padding: 5px 12px; cursor: pointer; }
+.bp-actions button:hover:not(:disabled) { border-color: #9aa3b2; }
+.bp-actions button:disabled { opacity: .45; cursor: default; }
+.bp-actions button.danger { color: #f0a09d; }

@@ -114,3 +114,42 @@ def test_development_is_gradual_per_lesson():
     n.teach("огонь горит", "огонь греет дом", replay=False)
     after = len(n.cortex.members)
     assert before - after <= n.cfg.max_merges_per_lesson
+
+
+def test_thought_persists_between_turns():
+    n = make()
+    for _ in range(5):
+        n.teach("что такое огонь", "огонь горячее пламя", 1.0, replay=False)
+    assert n.thought is None
+    first = n.respond("что такое огонь", temp=0)
+    assert n.thought is not None, "после ответа мысль должна сохраниться"
+    kept = n.thought.copy()
+    n.respond("что такое огонь", temp=0)
+    assert n.thought is not None and n.thought.shape == kept.shape
+    assert first.confidence > 0
+
+
+def test_capacity_grows_without_fixed_limit():
+    n = BrainNet(Config(seed=2, max_clusters=4))
+    n.pretrain("Огонь горит и греет дом. Вода течёт и холодная. Солнце светит днём. "
+               "Ветер дует в поле. Птица поёт в саду. Рыба плывёт в реке.", epochs=1)
+    assert n.cortex.cap > 4
+    assert n.chain.T.shape == (n.cortex.cap, n.cortex.cap)
+    assert len(n.cortex.members) <= n.cortex.cap
+
+
+def test_self_prediction_error_and_confidence_are_reported():
+    n = make()
+    for _ in range(4):
+        n.teach("alpha beta", "gamma delta", 1.0, replay=False)
+    r = n.respond("alpha beta", temp=0)
+    assert 0.0 <= r.confidence <= 1.0
+    assert r.self_error is None or 0.0 <= r.self_error <= 2.0
+    assert n.self_error_avg() is None or isinstance(n.self_error_avg(), float)
+
+
+def test_unknown_question_is_reported_as_unknown_not_guessed():
+    n = make()
+    n.teach("alpha beta", "gamma delta", 1.0, replay=False)
+    r = n.respond("совсем чужие слова", temp=0)
+    assert r.known is False and r.text == ""

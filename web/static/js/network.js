@@ -43,6 +43,9 @@
       ['Уроки', fmt(state.lessons)],
       ['Опыт для повтора', fmt(s['в_памяти_опыта'])],
       ['Размер на диске', state.on_disk ? Math.round(state.size_bytes / 1024) + ' КБ' : 'нет'],
+      ['Мысль (фокус)', (state.focus || []).map((f) => f.words.join(' ') || ('ансамбль ' + f.ensemble)).slice(0, 2).join(' · ') || '—'],
+      ['Ошибка самопредсказания', state.self_error === null || state.self_error === undefined ? '—' : state.self_error],
+      ['Припоминание', state.eval_last === null || state.eval_last === undefined ? '—' : Math.round(state.eval_last * 100) + '%'],
     ];
     $('#stats').innerHTML = cards.map(([k, v]) =>
       `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
@@ -237,10 +240,19 @@
 
   // ---------- обновление всей страницы ----------
 
+  function renderEpisodes(list) {
+    const ol = $('#episodes');
+    if (!list || !list.length) { ol.innerHTML = '<li class="muted">уроков пока нет</li>'; return; }
+    const src = { manual: 'вручную', good: 'хороший', fix: 'исправлено', 'fix-wrong': 'неверный', bad: 'неверный', llm: 'из LLM', net: 'сеть' };
+    ol.innerHTML = list.map((e) => `<li>${escapeHtml(e.question)} → ${escapeHtml(e.answer)}
+      <span class="e">(${src[e.source] || e.source}${e.weight < 0 ? ', ослаблено' : ''})</span></li>`).join('');
+  }
+
   async function refresh() {
     const [state, g] = await Promise.all([api('/net/state'), api('/net/graph')]);
     graph = g;
     renderStats(state);
+    renderEpisodes(state.recent);
     drawGraph();
     drawChart(state.history);
     return state;
@@ -294,6 +306,19 @@
       toast(r.backup ? 'Сеть сброшена. Копия: ' + r.backup.split(/[\\/]/).pop() : 'Сеть сброшена');
     });
   });
+  $('#btnEval').addEventListener('click', () => run(async () => {
+    const r = await api('/net/eval', {});
+    if (r.score === null) {
+      $('#evalResult').textContent = 'Проверочных вопросов пока нет: отмечайте хорошие ответы в чате.';
+    } else {
+      const lines = r.details.map((d) => `${escapeHtml(d.question)}: ${Math.round(d.score * 100)}%`);
+      const note = r.score < 0.3
+        ? '<br><span class="muted">Сеть пока слабо помнит эти ответы. Повторите «Хороший ответ» или дайте урок ещё раз: закрепление требует повторов.</span>'
+        : '';
+      $('#evalResult').innerHTML = `<b>Припоминание: ${Math.round(r.score * 100)}%</b> по ${r.count} вопросам<br>` + lines.join('<br>') + note;
+    }
+    await refresh();
+  }, 'Проверка выполнена'));
   $('#btnRestore').addEventListener('click', () => {
     if (!confirm('Восстановить сеть из последней резервной копии? Текущая рабочая сеть будет заменена.')) return;
     run(async () => { await api('/net/restore', {}); selected = null; pos.clear(); await refresh(); }, 'Сеть восстановлена из копии');

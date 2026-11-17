@@ -2918,7 +2918,12 @@ function buildCodeBlock(text, lang) {
     }
   }
 
-  // Настройки интерфейса убраны: см. страницу «Сеть» в боковом меню.
+  els.openSettings.addEventListener('click', () => {
+    els.dialog.showModal();
+  });
+
+  els.exportAll.addEventListener('click', exportAllChats);
+  els.wipeAll.addEventListener('click', wipeAllChats);
 
   document.addEventListener('keydown', (e) => {
     // Esc закрывает открытое модальное окно настроек (браузер это делает сам

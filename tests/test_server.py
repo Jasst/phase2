@@ -238,3 +238,80 @@ def test_dotenv_does_not_override_existing_env(tmp_path, monkeypatch):
     assert os.environ["LLM_BACKEND"] == "llamacpp"
     assert os.environ["MODELS_DIR"] == "E:\\models"
     assert os.environ["NEW_KEY"] == "1"
+
+
+def test_feedback_fix_teaches_correct_answer(tmp_path):
+    from pulsenet.app import App
+    env = {"LLM_BACKEND": "lmstudio", "LMSTUDIO_URL": "http://127.0.0.1:9/v1"}
+    app = App(env, data_dir=str(tmp_path / "data"))
+    for _ in range(6):
+        app.teach("какой цвет неба", "неба зелёное", 1.0, source="llm")
+    assert app.feedback("какой цвет неба", "неба зелёное", "fix", correct="небо голубое")["ok"]
+    for _ in range(3):   # неверный ответ снова всплывает: каждый раз его исправляем
+        app.feedback("какой цвет неба", "неба зелёное", "fix", correct="небо голубое")
+    assert "голубое" in app.respond("какой цвет неба", temp=0)["text"].lower()
+    kinds = [e["source"] for e in app.episodes]
+    assert "fix" in kinds and "fix-wrong" in kinds
+
+
+def test_good_answer_adds_eval_item_and_eval_runs(tmp_path):
+    from pulsenet.app import App
+    env = {"LLM_BACKEND": "lmstudio", "LMSTUDIO_URL": "http://127.0.0.1:9/v1"}
+    app = App(env, data_dir=str(tmp_path / "data"))
+    assert app.run_eval()["score"] is None          # пустой проверочный набор
+    for _ in range(3):
+        app.feedback("что такое огонь", "огонь горячее пламя", "good")
+    assert any(e["question"] == "что такое огонь" for e in app.eval_set)
+    res = app.run_eval()
+    assert res["count"] == 1 and res["score"] is not None and 0.0 <= res["score"] <= 1.0
+
+
+def test_mode_net_answers_without_llm_and_emits_turn(running):
+    app, port = running
+    st, _, raw = _req(port, "POST", "/net/mode", {"mode": "net"})
+    assert st == 200 and json.loads(raw)["mode"] == "net"
+    app.teach("что такое огонь", "огонь горячее пламя", 1.0, source="manual")
+    before = app.net.lessons
+    st, _, raw = _req(port, "POST", "/ai/chat", {"message": "что такое огонь", "chat_id": "n1"})
+    text = raw.decode("utf-8")
+    assert '"turn"' in text and '"source": "net"' in text
+    assert app.net.lessons == before, "ответ сети сам по себе не должен становиться уроком"
+    _req(port, "POST", "/net/mode", {"mode": "llm"})
+
+
+def test_episodes_and_state_expose_journal(running):
+    app, port = running
+    app.teach("alpha beta", "gamma delta", 1.0, source="manual")
+    st, _, raw = _req(port, "GET", "/net/episodes?limit=5")
+    eps = json.loads(raw)["episodes"]
+    assert eps and eps[0]["source"] == "manual"
+    st, _, raw = _req(port, "GET", "/net/state")
+    state = json.loads(raw)
+    assert state["mode"] in ("llm", "net") and "recent" in state and "self_error" in state
+
+
+def test_tuning_validates_bounds_and_applies(tmp_path):
+    from pulsenet.app import App
+    env = {"LLM_BACKEND": "lmstudio", "LMSTUDIO_URL": "http://127.0.0.1:9/v1"}
+    app = App(env, data_dir=str(tmp_path / "data"))
+    ok = app.set_tuning({"temperature": 0.9, "settle_steps": 3, "fix_weight": 2.5})
+    assert ok["ok"] and app.net.cfg.temperature == 0.9 and app.net.cfg.settle_steps == 3
+    assert app.fix_weight() == 2.5
+    bad = app.set_tuning({"temperature": 9.0, "unknown_key": 1})
+    assert bad["ok"] is False and app.net.cfg.temperature == 0.9
+    assert "unknown_key" not in bad["applied"]
+    # параметры сохраняются вместе с сетью
+    app.save_net()
+    from pulsenet import store
+    assert store.load(app.state_dir).cfg.temperature == 0.9
+
+
+def test_tuning_routes_roundtrip(running):
+    app, port = running
+    st, _, raw = _req(port, "GET", "/net/tuning")
+    data = json.loads(raw)
+    assert st == 200 and {"temperature", "settle_steps", "fix_weight"} <= set(data)
+    st, _, raw = _req(port, "POST", "/net/tuning", {"settle_steps": 99})
+    assert st == 400 and json.loads(raw)["errors"]
+    st, _, raw = _req(port, "POST", "/net/tuning", {"replay_n": 1})
+    assert st == 200 and app.net.cfg.replay_n == 1

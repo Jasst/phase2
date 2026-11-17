@@ -276,7 +276,7 @@ def _net_respond(h, b, _q):
 
 def _net_teach(h, b, _q):
     result = h.app.teach(str(b.get("question", "")), str(b.get("answer", "")),
-                         float(b.get("weight", 1.0)))
+                         float(b.get("weight", 1.0)), source="manual")
     h.send_json(result, 200 if result.get("ok") else 400)
 
 
@@ -297,6 +297,37 @@ def _net_reset(h, _b, _q):
 def _net_restore(h, _b, _q):
     result = h.app.restore_backup()
     h.send_json(result, 200 if result.get("ok") else 400)
+
+
+def _net_mode(h, b, _q):
+    result = h.app.set_mode(b.get("mode"), b.get("auto_learn"))
+    h.send_json(result, 200 if result.get("ok") else 400)
+
+
+def _net_feedback(h, b, _q):
+    result = h.app.feedback(b.get("question"), b.get("answer"), b.get("verdict"), b.get("correct"))
+    h.send_json(result, 200 if result.get("ok") else 400)
+
+
+def _net_tuning_get(h, _b, _q):
+    h.send_json(h.app.get_tuning())
+
+
+def _net_tuning_set(h, b, _q):
+    result = h.app.set_tuning(b)
+    h.send_json(result, 200 if result["ok"] else 400)
+
+
+def _net_eval(h, _b, _q):
+    h.send_json(h.app.run_eval())
+
+
+def _net_episodes(h, _b, q):
+    try:
+        limit = max(1, min(500, int((q.get("limit") or ["50"])[0])))
+    except ValueError:
+        limit = 50
+    h.send_json({"episodes": h.app.episodes[-limit:][::-1], "total": len(h.app.episodes)})
 
 
 ROUTES = {
@@ -335,6 +366,12 @@ ROUTES = {
     ("POST", "/net/load"): _net_load,
     ("POST", "/net/reset"): _net_reset,
     ("POST", "/net/restore"): _net_restore,
+    ("POST", "/net/mode"): _net_mode,
+    ("POST", "/net/feedback"): _net_feedback,
+    ("POST", "/net/eval"): _net_eval,
+    ("GET", "/net/tuning"): _net_tuning_get,
+    ("POST", "/net/tuning"): _net_tuning_set,
+    ("GET", "/net/episodes"): _net_episodes,
 }
 
 

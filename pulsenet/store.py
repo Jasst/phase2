@@ -1,6 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Сохранение состояния: папка с arrays.npz (веса, ансамбли, цепь) и meta.json
-(словарь, конфиг, опыт, профили соседей). Запись атомарная."""
+"""Сохранение состояния сети: папка с двумя файлами.
+
+arrays.npz — веса и структура:
+  E, C, O   — векторы нейронов (входной, контекстный, выходная голова);
+  label     — номер ансамбля каждого нейрона;
+  T         — матрица направленных связей между ансамблями (cap × cap);
+  thought   — текущая мысль (распределение по ансамблям), если есть.
+meta.json — словарь, частоты, профили соседей, конфиг, буфер опыта, счётчики,
+            ёмкость ансамблей и история самопредсказания.
+Запись атомарная. Старые версии (2–4) читаются.
+"""
 import dataclasses
 import json
 import os
@@ -11,7 +20,7 @@ from .config import Config
 from .net import BrainNet
 from .vocab import Vocab
 
-VERSION = 4
+VERSION = 5
 
 
 def save(net, directory):
@@ -20,13 +29,16 @@ def save(net, directory):
     V = len(net.vocab)
     arrays = {"E": cx.E[:V], "C": cx.C[:V], "O": cx.O[:V],
               "label": cx.label[:V], "T": net.chain.T}
+    if net.thought is not None:
+        arrays["thought"] = np.asarray(net.thought, dtype=np.float32)
     npz = os.path.join(directory, "arrays.npz")
     tmp = npz + ".tmp.npz"
     np.savez_compressed(tmp, **arrays)
     os.replace(tmp, npz)
     meta = {"version": VERSION, "config": dataclasses.asdict(net.cfg),
             "words": net.vocab.words, "counts": net.vocab.counts, "buffer": net.buffer,
-            "updates": net.updates, "lessons": net.lessons,
+            "updates": net.updates, "lessons": net.lessons, "cap": cx.cap,
+            "self_errors": net.self_errors[-200:],
             "prof": [[w, [[n, c] for n, c in p.items()]] for w, p in cx.prof.items()]}
     js = os.path.join(directory, "meta.json")
     tmp = js + ".tmp"
@@ -38,20 +50,26 @@ def save(net, directory):
 def load(directory):
     with open(os.path.join(directory, "meta.json"), encoding="utf-8") as f:
         meta = json.load(f)
-    if meta.get("version") != VERSION:
+    if meta.get("version") not in (2, 3, 4, VERSION):
         raise ValueError(f"неизвестная версия состояния: {meta.get('version')}")
-    net = BrainNet(Config(**meta["config"]))
+    data = np.load(os.path.join(directory, "arrays.npz"))
+    cap = int(meta.get("cap", data["T"].shape[0]))
+    cfg = dict(meta["config"])
+    cfg["max_clusters"] = max(cap, int(cfg.get("max_clusters", cap)))
+    net = BrainNet(Config(**cfg))
     net.vocab = Vocab(meta["words"], meta.get("counts"))
     V = len(net.vocab)
     cx = net.cortex
     cx.ensure_words(V)
-    data = np.load(os.path.join(directory, "arrays.npz"))
+    if cap > cx.cap:
+        cx.grow(cap)
     cx.E[:V] = data["E"]
     cx.C[:V] = data["C"]
     cx.O[:V] = data["O"]
     cx.label[:V] = data["label"]
-    net.chain.T[:, :] = data["T"]
-    # восстановить состав ансамблей и список свободных номеров по меткам нейронов
+    net.chain.T = np.array(data["T"], dtype=np.float32)
+    if "thought" in data.files:
+        net.thought = np.array(data["thought"], dtype=np.float64)
     cx.members = {}
     for i in range(V):
         k = int(cx.label[i])
@@ -65,4 +83,5 @@ def load(directory):
     net.buffer = [tuple(x) for x in meta["buffer"]]
     net.updates = meta["updates"]
     net.lessons = meta.get("lessons", meta["updates"])
+    net.self_errors = list(meta.get("self_errors", []))
     return net
