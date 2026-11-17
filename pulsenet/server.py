@@ -300,8 +300,18 @@ def _net_restore(h, _b, _q):
 
 
 def _net_mode(h, b, _q):
-    result = h.app.set_mode(b.get("mode"), b.get("auto_learn"))
+    result = h.app.set_mode(b.get("mode"), b.get("auto_learn"), b.get("auto_think"))
     h.send_json(result, 200 if result.get("ok") else 400)
+
+
+def _net_thoughts(h, _b, _q):
+    """Поток мыслей: последние мысли внутреннего нарратива."""
+    h.send_json(h.app.thoughts_state())
+
+
+def _net_think(h, b, _q):
+    """Ручной шаг нарратива: сеть сама рождает мысль и учится на ней."""
+    h.send_json(h.app.think_step(b.get("n", 1)))
 
 
 def _net_feedback(h, b, _q):
@@ -385,6 +395,8 @@ ROUTES = {
     ("POST", "/net/reset"): _net_reset,
     ("POST", "/net/restore"): _net_restore,
     ("POST", "/net/mode"): _net_mode,
+    ("GET", "/net/thoughts"): _net_thoughts,
+    ("POST", "/net/thoughts/step"): _net_think,
     ("POST", "/net/feedback"): _net_feedback,
     ("POST", "/net/eval"): _net_eval,
     ("POST", "/net/train-with-llm"): _net_train_with_llm,

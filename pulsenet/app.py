@@ -23,6 +23,7 @@ from .config import Config
 from .llm import PARAM_DEFAULTS, BackendError, make_backend
 from .teacher import HTTPTeacher
 from .net import BrainNet
+from .thoughts import ThoughtStream
 from .vocab import tokenize
 
 CONTEXT_TURNS = 6
@@ -41,6 +42,12 @@ def _read_json(path, default):
         except (OSError, ValueError):
             return default
     return default
+
+
+def _condense(text, k=8):
+    """Сжатая мысль о тексте: ключевые слова без служебных."""
+    ws = [w for w in tokenize(text) if w.isalnum() and len(w) >= 3 and w not in STOP_WORDS]
+    return " ".join(ws[:k])
 
 
 def _write_json(path, obj):
@@ -63,8 +70,10 @@ class App:
                                    {"model": "", "params": {}})
         self.settings.setdefault("mode", "llm")
         self.settings.setdefault("auto_learn", True)
+        self.settings.setdefault("auto_think", True)
         self.ui = _read_json(os.path.join(data_dir, "ui_state.json"), {"updated": 0})
         self.history = _read_json(os.path.join(data_dir, "history.json"), {})
+        self.thoughts = ThoughtStream(os.path.join(data_dir, "thoughts.json"))
         self.dev = _read_json(os.path.join(data_dir, "dev_history.json"), [])
         self.episodes = _read_json(os.path.join(data_dir, "episodes.json"), [])
         self.eval_set = _read_json(os.path.join(data_dir, "eval.json"), [])
@@ -212,15 +221,19 @@ class App:
             _write_json(os.path.join(self.data_dir, "dev_history.json"), self.dev)
         return {"score": score, "count": len(details), "details": details}
 
-    def set_mode(self, mode=None, auto_learn=None):
+    def set_mode(self, mode=None, auto_learn=None, auto_think=None):
         if mode is not None:
             if mode not in ("llm", "net"):
                 return {"ok": False, "error": "mode: llm или net"}
             self.settings["mode"] = mode
         if auto_learn is not None:
             self.settings["auto_learn"] = bool(auto_learn)
+        if auto_think is not None:
+            self.settings["auto_think"] = bool(auto_think)
         self._save_settings()
-        return {"ok": True, "mode": self.settings["mode"], "auto_learn": self.settings["auto_learn"]}
+        return {"ok": True, "mode": self.settings["mode"],
+                "auto_learn": self.settings["auto_learn"],
+                "auto_think": self.settings["auto_think"]}
 
 
     # ---------- параметры сети (страница настроек) ----------
@@ -284,6 +297,8 @@ class App:
                     "size_bytes": os.path.getsize(meta) if os.path.isfile(meta) else 0,
                     "dim": self.net.cfg.dim, "history": self.dev[-400:],
                     "mode": self.settings["mode"], "auto_learn": self.settings["auto_learn"],
+                    "auto_think": self.settings.get("auto_think", True),
+                    "thoughts": len(self.thoughts.items),
                     "focus": self.focus_words(), "self_error": self.net.self_error_avg(),
                     "episodes": len(self.episodes), "recent": self.episodes[-8:][::-1],
                     "eval_items": len(self.eval_set),
@@ -298,7 +313,8 @@ class App:
 
     def respond(self, question, temp=None):
         with self.lock:
-            reply = self.net.respond(question, temp=temp)
+            # последние мысли (нарратив) подмешиваются в якорь вопроса
+            reply = self.net.respond(question, temp=temp, context=self.thoughts.context_text())
         names = {"<eos>": "конец"}
         return {"text": reply.text, "confidence": reply.confidence, "self_error": reply.self_error,
                 "known": reply.known, "focus": self.focus_words(),
@@ -347,6 +363,66 @@ class App:
         return {"ok": True, "question": question, "teacher_answer": teacher_answer,
                 "iterations": iterations, "lessons": lessons,
                 "avg_loss": round(sum(losses) / len(losses), 4) if losses else None}
+
+    # ---------- поток мыслей: внутренний нарратив ----------
+
+    def _after_turn(self, summary, emit):
+        """Мысль о ходе и автономное обдумывание: нарратив продолжается сам."""
+        with self.lock:
+            changed = False
+            item = self.thoughts.push(summary, "turn")
+            if item:
+                emit({"thought": item})
+            if self.settings.get("auto_think", True):
+                emit({"gen_phase": {"phase": "Сеть думает сама"}})
+                text = self.net.think()
+                if text:
+                    self._learn_thought(text, emit)
+                    changed = True
+            if changed:
+                self.save_net()
+
+    def _learn_thought(self, text, emit=None):
+        """Внести спонтанную мысль в нарратив и выучить шаг: контекст → мысль.
+
+        Шаг нарратива учится не как «урок» (счётчик уроков не растёт — уроки
+        только от действий пользователя и ответов LLM), а как внутренний шаг:
+        связи строятся, шаг попадает в буфер опыта для повтора.
+        """
+        ctx = self.thoughts.context_text(2)     # контекст до внесения новой мысли
+        item = self.thoughts.push(text, "inner")
+        if not item:
+            return None
+        if emit is not None:
+            emit({"thought": item})
+        if ctx:
+            w = self.net.cfg.thought_weight
+            loss = self.net.learn(ctx, text, w)
+            if loss is not None:
+                self.net.buffer.append((ctx, text, w))
+                del self.net.buffer[:-self.net.cfg.replay_size]
+        return item
+
+    def think_step(self, n=1):
+        """Ручной шаг нарратива: сеть рождает мысль (или несколько) и учится на ней."""
+        with self.lock:
+            made = []
+            for _ in range(max(1, min(5, int(n or 1)))):
+                text = self.net.think()
+                if not text:
+                    break
+                if self._learn_thought(text) is None:
+                    break
+                made.append(text)
+            if made:
+                self.save_net()
+        return {"ok": True, "thoughts": made, "narrative": self.thoughts.recent(8)}
+
+    def thoughts_state(self):
+        with self.lock:
+            return {"items": self.thoughts.recent(30), "count": len(self.thoughts.items),
+                    "auto_think": self.settings.get("auto_think", True),
+                    "focus": self.focus_words()}
 
     def graph(self, max_edges=600):
         with self.lock:
@@ -507,6 +583,10 @@ class App:
 
         if answer and not self.stop_flag:
             self._remember(chat_id or "default", message, answer, source)
+        if not self.stop_flag:
+            # мысль о ходе + автономное обдумывание (внутренний нарратив)
+            summary = _condense(message, 8) + (" " + _condense(answer, 10) if answer else "")
+            self._after_turn(summary, emit)
         emit({"turn": {"question": message, "answer": answer, "source": source,
                        "confidence": reply["confidence"], "self_error": reply["self_error"],
                        "uncertain": not answer}})

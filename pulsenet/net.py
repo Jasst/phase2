@@ -138,6 +138,10 @@ class BrainNet:
         cx.update_profiles(a, weight)
         for keep, drop in cx.merge_step(q + a, weight):
             self.chain.merge(keep, drop)
+            if self.thought is not None and drop < self.thought.shape[0]:
+                # мысль переезжает вместе с ансамблем: масса drop уходит в keep
+                self.thought[keep] += self.thought[drop]
+                self.thought[drop] = 0.0
         cx.refresh()
         q_cl = [cx.cluster_of(i) for i in q]
         a_cl = [cx.cluster_of(i) for i in a]
@@ -194,8 +198,12 @@ class BrainNet:
 
     # ---------- ответ ----------
 
-    def respond(self, question, max_tokens=None, temp=None):
-        """Ответ сети с учётом мысли. Обновляет мысль и журнал самопредсказания."""
+    def respond(self, question, max_tokens=None, temp=None, context=None):
+        """Ответ сети с учётом мысли. Обновляет мысль и журнал самопредсказания.
+
+        context — текст последних мыслей (внутренний нарратив): он подмешивается
+        в якорь вопроса, так что накопленный нарратив участвует в ответе.
+        """
         cfg, cx = self.cfg, self.cortex
         max_tokens = max_tokens or cfg.max_answer
         temp = cfg.temperature if temp is None else temp
@@ -204,6 +212,10 @@ class BrainNet:
             return Reply("", [], 0.0, None, self.top_focus(), known=False)
         cx.refresh()
         anchor = self._dist(q)
+        if context and cfg.thought_mix > 0:
+            c = self._dist(self.vocab.encode(tokenize(context), grow=False))
+            if c is not None:
+                anchor = self._norm(anchor + cfg.thought_mix * c)
 
         focus = self._focus(anchor)
         settled = self._settle(focus, anchor)
@@ -264,6 +276,91 @@ class BrainNet:
         confidence = round(float(settled.max()), 4)
         text = detokenize([self.vocab.words[i] for i in out]) if confidence >= cfg.min_confidence else ""
         return Reply(text, path, confidence, self_error, self.top_focus(), known=True)
+
+    # ---------- спонтанная мысль (внутренний нарратив) ----------
+
+    def _start_thought(self):
+        """Отправная точка нарратива, если мысли ещё нет: последний опыт, иначе частоты словаря."""
+        if self.buffer:
+            q, a, _w = self.buffer[-1]
+            d = self._dist(self.vocab.encode(tokenize(q + " " + a), grow=False))
+            if d is not None:
+                return d
+        V = len(self.vocab)
+        d = np.zeros(self.cortex.cap)
+        for i in range(1, V):
+            k = self.cortex.cluster_of(i)
+            if k >= 0:
+                d[k] += float(self.vocab.counts[i])
+        tot = d.sum()
+        return d / tot if tot > 0 else None
+
+    def think(self, max_words=8):
+        """Спонтанная мысль: сеть сама продолжает свой нарратив.
+
+        Импульс блуждает по цепи от текущей мысли (без вопроса), на каждом шаге
+        из активных ансамблей выбирается слово. Если мысли ещё нет — отправной
+        точкой становится последний опыт из буфера. Тупик цепи не останавливает
+        нарратив: слова выбираются из самой мысли. Полученная короткая фраза
+        переписывает мысль (thought_decay) — нарратив продолжается.
+        Возвращает текст мысли или None, если думать пока не о чем.
+        """
+        cfg, cx = self.cfg, self.cortex
+        V = len(self.vocab)
+        if V < 3:
+            return None
+        if self.thought is None:
+            self.thought = self._start_thought()
+            if self.thought is None:
+                return None
+        anchor = self._norm(self._pad(self.thought))
+        s, visited, out_ids = anchor.copy(), np.zeros(cx.cap), []
+        for t in range(max(1, int(max_words))):
+            nxt = self.chain.hop(s, visited, cfg.chain_topk)
+            if nxt is None:
+                nxt = anchor.copy()        # тупик: думаем от самой мысли
+            visited = visited * cfg.visited_decay + (nxt > 0)
+            pick = self._norm(0.6 * nxt + 0.4 * self._pad(s))
+            mass = np.where(cx.label[:V] >= 0, pick[np.maximum(cx.label[:V], 0)], 0.0)
+            ctx = (cfg.alpha * (cx.M.T @ s)).astype(np.float32)
+            logits = (cx.O[:V] @ ctx).astype(np.float64)
+            logits += cfg.ensemble_gain * np.log(mass + 1e-3)
+            freq = np.log1p(np.asarray(self.vocab.counts[:V], dtype=np.float64))
+            logits -= cfg.freq_penalty * freq
+            for r in set(out_ids[-cfg.no_repeat:]):
+                logits[r] = -np.inf
+            if t == 0:
+                logits[EOS_ID] = -np.inf
+                for i in range(1, V):
+                    if not self.vocab.words[i][:1].isalnum():
+                        logits[i] = -np.inf
+            if not np.isfinite(logits).any():
+                break
+            if cfg.temperature <= 0:
+                tok = int(np.argmax(logits))
+            else:
+                z = (logits - logits.max()) / cfg.temperature
+                p = np.exp(z)
+                p /= p.sum()
+                tok = int(self.rng.choice(V, p=p))
+            if tok == EOS_ID:
+                break
+            out_ids.append(tok)
+            s = self._advance(s, cx.cluster_of(tok), anchor, visited)
+        if not out_ids:
+            return None
+        text = detokenize([self.vocab.words[i] for i in out_ids])
+        # мысль переписывается тем, о чём сеть «подумала» — нарратив движется сам
+        act = np.zeros(cx.cap)
+        for tok in out_ids:
+            k = cx.cluster_of(tok)
+            if k >= 0:
+                act[k] += 1.0
+        if act.sum() > 0:
+            told = self._norm(act)
+            self.thought = self._norm((1 - cfg.thought_decay) * self._pad(self.thought) + cfg.thought_decay * told)
+        self.updates += 1
+        return text
 
     # ---------- диагностика ----------
 
