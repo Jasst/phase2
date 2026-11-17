@@ -25,7 +25,8 @@ def save(net, directory):
     np.savez_compressed(tmp, **arrays)
     os.replace(tmp, npz)
     meta = {"version": VERSION, "config": dataclasses.asdict(net.cfg),
-            "words": net.vocab.words, "counts": net.vocab.counts, "buffer": net.buffer, "updates": net.updates,
+            "words": net.vocab.words, "counts": net.vocab.counts, "buffer": net.buffer,
+            "updates": net.updates, "lessons": net.lessons,
             "prof": [[w, [[n, c] for n, c in p.items()]] for w, p in cx.prof.items()]}
     js = os.path.join(directory, "meta.json")
     tmp = js + ".tmp"
@@ -63,4 +64,5 @@ def load(directory):
             cx.by_nb.setdefault(n, set()).add(w)
     net.buffer = [tuple(x) for x in meta["buffer"]]
     net.updates = meta["updates"]
+    net.lessons = meta.get("lessons", meta["updates"])
     return net

@@ -104,3 +104,13 @@ def test_unreachable_teacher_returns_none_without_raising():
     t = HTTPTeacher("http://127.0.0.1:9/v1/chat/completions", "m", timeout=1)
     assert t.answer("привет") is None
     assert t.error
+
+
+def test_development_is_gradual_per_lesson():
+    n = make()
+    n.pretrain("Огонь горит и греет дом. Вода течёт и холодная. Солнце светит днём. Ветер дует в поле. "
+               "Птица поёт в саду. Рыба плывёт в реке. Дерево растёт в лесу.", epochs=1)
+    before = len(n.cortex.members)
+    n.teach("огонь горит", "огонь греет дом", replay=False)
+    after = len(n.cortex.members)
+    assert before - after <= n.cfg.max_merges_per_lesson

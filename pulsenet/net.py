@@ -31,7 +31,8 @@ class BrainNet:
         self.cortex = Cortex(self.cfg, self.rng)
         self.chain = Chain(self.cfg.max_clusters)
         self.buffer = []        # опыт: [(вопрос, ответ, вес)] для повторения
-        self.updates = 0
+        self.updates = 0        # все внутренние обновления (включая повтор опыта)
+        self.lessons = 0        # реальные уроки: teach() и предобучение, без повтора
         self.last_loss = None
 
     # ---------- вспомогательное ----------
@@ -138,6 +139,7 @@ class BrainNet:
         loss = self.learn(question, answer, weight)
         if loss is None:
             return None
+        self.lessons += 1
         self.buffer.append((question, answer, weight))
         del self.buffer[:-self.cfg.replay_size]
         if replay and len(self.buffer) > 1:
@@ -155,6 +157,7 @@ class BrainNet:
             for prev, cur in zip(sents, sents[1:]):
                 if self.learn(prev, cur, weight) is not None:
                     done += 1
+        self.lessons += done
         return done
 
     # ---------- ответ ----------
@@ -211,7 +214,7 @@ class BrainNet:
 
     def stats(self):
         return {"слов": len(self.vocab) - 1, "ансамблей": len(self.cortex.members),
-                "связей": self.chain.edges(), "уроков": self.updates,
+                "связей": self.chain.edges(), "уроков": self.lessons,
                 "в_памяти_опыта": len(self.buffer)}
 
     def clusters(self):

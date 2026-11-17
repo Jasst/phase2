@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Сеть импульсов</title>
+  <link rel="stylesheet" href="/static/network.css">
+</head>
+<body>
+<header class="top">
+  <a class="back" href="/">← Чат</a>
+  <h1>Сеть импульсов</h1>
+  <span id="saveState" class="pill">загрузка…</span>
+</header>
+
+<section class="stats" id="stats"></section>
+
+<section class="actions">
+  <button id="btnSave" type="button" title="Записать текущее состояние сети на диск">Сохранить сеть</button>
+  <button id="btnLoad" type="button" title="Заменить сеть состоянием с диска">Загрузить с диска</button>
+  <button id="btnReset" type="button" class="danger" title="Очистить сеть и начать обучение заново (текущая сеть сохранится в резервную копию)">Сбросить сеть</button>
+  <button id="btnRestore" type="button" title="Вернуть сеть из последней резервной копии, созданной при сбросе">Восстановить копию</button>
+  <span id="toast" class="toast" role="status"></span>
+</section>
+
+<main class="grid">
+  <section class="panel graph-panel">
+    <div class="panel-head">
+      <h2>Ансамбли и цепи</h2>
+      <span id="graphInfo" class="muted"></span>
+    </div>
+    <svg id="graph" role="img" aria-label="Граф ансамблей"></svg>
+    <div id="nodeInfo" class="node-info muted">Нажмите на ансамбль, чтобы увидеть его нейроны.</div>
+    <p class="legend muted">
+      Круг — ансамбль (группа слов с похожим окружением). Стрелка — направленная связь:
+      импульс идёт от одного ансамбля к другому. Чем толще стрелка, тем сильнее связь.
+    </p>
+  </section>
+
+  <aside class="side">
+    <section class="panel">
+      <h2>Урок: онлайн-обучение</h2>
+      <p class="muted small">Вопрос и правильный ответ. Сеть сразу меняет связи и сохраняет себя.</p>
+      <form id="teachForm">
+        <label>Вопрос<input id="teachQ" autocomplete="off" required></label>
+        <label>Ответ<input id="teachA" autocomplete="off" required></label>
+        <div class="row">
+          <button type="submit" class="primary">Учиться</button>
+          <button type="button" id="btnBad" class="danger" title="Ослабить эту связь">Ослабить связь</button>
+        </div>
+      </form>
+      <div id="teachResult" class="result muted"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Импульс: как сеть отвечает</h2>
+      <form id="respondForm">
+        <label>Вопрос<input id="respondQ" autocomplete="off" required></label>
+        <button type="submit" class="primary">Пустить импульс</button>
+      </form>
+      <div id="respondText" class="result"></div>
+      <ol id="path" class="path"></ol>
+    </section>
+
+    <section class="panel">
+      <h2>Развитие по урокам</h2>
+      <svg id="chart" role="img" aria-label="График развития сети"></svg>
+      <div id="chartLegend" class="legend small"></div>
+    </section>
+  </aside>
+</main>
+
+<script src="/static/js/network.js"></script>
+</body>
+</html>

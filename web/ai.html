@@ -47,19 +47,11 @@
     <nav class="sb-list" id="sessionList" aria-label="Чаты"></nav>
 
     <div class="sb-bottom">
-      <button class="sb-link" id="installBtn" type="button" hidden>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
-        Установить приложение
-      </button>
-      <button class="sb-link" id="logoutBtn" type="button" title="Выйти из аккаунта">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
-        <span id="userEmail">Выйти</span>
-      </button>
-      <button class="sb-link" id="openSettings" type="button">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        Настройки
-      </button>
-    </div>
+      <a class="sb-link" id="networkLink" href="/network" title="Как сеть учится и развивается">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7 6h10M6.5 7.5l4 9M17.5 7.5l-4 9"/></svg>
+        Сеть импульсов
+      </a>
+                      </div>
   </aside>
   <div class="scrim" id="scrim"></div>
 
@@ -141,87 +133,8 @@
   </main>
 </div>
 
-<dialog id="settingsDialog" class="dialog">
-  <form method="dialog" class="dialog-body">
-    <header>
-      <h2>Настройки</h2>
-      <button class="icon-btn" value="close" aria-label="Закрыть">×</button>
-    </header>
-
-    <section>
-      <h3>Отправка</h3>
-      <label class="row"><span>Отправлять по Enter</span><input type="checkbox" data-key="enterSends"></label>
-      <label class="row"><span>Прокручивать к новым сообщениям</span><input type="checkbox" data-key="autoScroll"></label>
-    </section>
-
-    <section>
-      <h3>Ответы по умолчанию</h3>
-      <label class="row"><span>Поиск в интернете</span><input type="checkbox" data-key="webDefault"></label>
-      <label class="row"><span>Показывать рассуждения</span><input type="checkbox" data-key="reasoningDefault"></label>
-    </section>
-
-    <section>
-      <h3>Внешний вид</h3>
-      <label class="row"><span>Размер текста</span>
-        <select data-key="fontSize">
-          <option value="s">Маленький</option>
-          <option value="m">Средний</option>
-          <option value="l">Крупный</option>
-        </select>
-      </label>
-      <label class="row"><span>Компактный режим</span><input type="checkbox" data-key="compact"></label>
-    </section>
-
-    <section>
-      <h3>Фоновые находки</h3>
-      <label class="row"><span>Получать уведомления ассистента</span><input type="checkbox" data-key="notify"></label>
-      <label class="row"><span>Проверять каждые</span>
-        <select data-key="notifyInterval">
-          <option value="15">15 секунд</option>
-          <option value="30">30 секунд</option>
-          <option value="60">60 секунд</option>
-        </select>
-      </label>
-    </section>
-
-    <section>
-      <h3>Память</h3>
-      <div class="row"><span>Что ассистент помнит о тебе: просмотр, связи и правка</span><a class="btn-ghost" href="/memory" target="_blank" rel="noopener">Открыть</a></div>
-    </section>
-    <section>
-      <h3>Внешний ИИ (MCP)</h3>
-      <div class="row"><span>Код подключения</span><button type="button" class="btn-ghost" id="mcpCodeBtn">Выпустить новый код</button></div>
-      <div class="row"><span id="mcpCodeOut" class="mono"></span></div>
-      <p class="hint" style="text-align:left;margin:4px 0 0">Код действует, пока не получен новый: получение нового кода отключает все прежние подключения.</p>
-    </section>
-
-    <section>
-      <h3>Данные</h3>
-      <div class="row"><span>Экспорт всех чатов в JSON</span><button type="button" class="btn-ghost" id="exportAll">Скачать</button></div>
-      <div class="row"><span>Удалить все чаты в браузере</span><button type="button" class="btn-danger" id="wipeAll">Удалить</button></div>
-    </section>
-
-    <footer><button class="btn-primary" value="close">Готово</button></footer>
-  </form>
-</dialog>
 
 <!-- Подтверждение выхода: случайное нажатие не выкидывает из аккаунта -->
-<dialog id="logoutDialog" class="dialog">
-  <form method="dialog" class="dialog-body">
-    <header>
-      <h2>Выйти из аккаунта?</h2>
-    </header>
-    <section>
-      <p class="lead" id="logoutText" style="margin:0;color:var(--text-secondary);font-size:14px;line-height:1.5">
-        Чаты сохранятся: они привязаны к аккаунту и откроются при следующем входе.
-      </p>
-    </section>
-    <footer style="gap:8px">
-      <button class="btn-ghost" value="cancel" autofocus>Отмена</button>
-      <button class="btn-danger" value="confirm" id="logoutConfirm">Выйти</button>
-    </footer>
-  </form>
-</dialog>
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <script>
@@ -230,35 +143,7 @@
     navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch((e) => console.warn('SW:', e));
   }
 
-  // Кнопка «Установить»: Chrome/Edge/Android покажут системный диалог,
-  // iOS не поддерживает его, поэтому там показываем подсказку
-  (function () {
-    const btn = document.getElementById('installBtn');
-    const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
-    if (standalone) return;                       // уже установлено
 
-    const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
-    let deferred = null;
-
-    window.addEventListener('beforeinstallprompt', (e) => {
-      e.preventDefault();
-      deferred = e;
-      btn.hidden = false;
-    });
-    if (isIOS) btn.hidden = false;
-
-    btn.addEventListener('click', async () => {
-      if (deferred) {
-        deferred.prompt();
-        await deferred.userChoice;
-        deferred = null;
-        btn.hidden = true;
-      } else if (isIOS) {
-        UI.alert('Нажмите «Поделиться» внизу Safari и выберите «На экран «Домой»».', { title: 'Установка приложения' });
-      }
-    });
-    window.addEventListener('appinstalled', () => { btn.hidden = true; });
-  })();
 </script>
 <script src="/static/js/ui.js"></script>
 <script src="/static/js/ai-store.js" defer></script>

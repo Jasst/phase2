@@ -2262,7 +2262,7 @@ refreshUI();
   // ------------------------------------------------------------------ настройки
 
   function bindSettings() {
-    $$('[data-key]', els.dialog).forEach((inp) => {
+    $$('[data-key]', els.dialog || document).forEach((inp) => {
       const k = inp.dataset.key;
       if (inp.type === 'checkbox') inp.checked = !!settings[k];
       else inp.value = String(settings[k]);
@@ -2428,7 +2428,7 @@ refreshUI();
     const t = e.target;
     const tag = t && t.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
-    if (els.dialog.open) return;
+    if (els.dialog && els.dialog.open) return;
     e.preventDefault();
     openNav();                       // на мобильных панель скрыта — сначала открываем
     els.search.focus();
@@ -2918,51 +2918,17 @@ function buildCodeBlock(text, lang) {
     }
   }
 
-  els.openSettings.addEventListener('click', () => {
-    els.dialog.showModal();
-    loadMcpCode();
-  });
-
-  // Выход только после подтверждения: случайное нажатие не разлогинивает
-  const logoutDialog = $('#logoutDialog');
-  $('#logoutBtn').addEventListener('click', () => {
-    $('#logoutText').textContent = gen
-      ? 'Ответ ещё пишется. Он продолжится на сервере и появится при следующем входе. Чаты сохранятся.'
-      : 'Чаты сохранятся: они привязаны к аккаунту и откроются при следующем входе.';
-    logoutDialog.showModal();
-  });
-  $('#logoutConfirm').addEventListener('click', async (e) => {
-    e.preventDefault();
-    try { await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin' }); } catch { /* сеть */ }
-    location.href = '/login';
-  });
-
-  // Выпуск нового кода: старый код и все MCP-сессии отключаются — просим подтверждение.
-  $('#mcpCodeBtn').addEventListener('click', async () => {
-    if (!(await UI.confirm('Выпустить новый код? Старый код перестанет работать, все подключённые внешние ИИ отключатся.', { title: 'Новый код подключения', okText: 'Выпустить', danger: true }))) return;
-    try {
-      const r = await fetch('/ai/mcp_code', { method: 'POST', credentials: 'same-origin' });
-      if (r.status === 401) { location.href = '/login'; return; }
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const j = await r.json();
-      $('#mcpCodeOut').textContent = j.code;
-      toast('Новый код выдан. Прежние подключения отключены.');
-    } catch (e) {
-      toast('Не удалось получить код: ' + e.message);
-    }
-  });
-  els.exportAll.addEventListener('click', exportAllChats);
-  els.wipeAll.addEventListener('click', wipeAllChats);
+  // Настройки интерфейса убраны: см. страницу «Сеть» в боковом меню.
 
   document.addEventListener('keydown', (e) => {
     // Esc закрывает открытое модальное окно настроек (браузер это делает сам
     // только при фокусе внутри <dialog>; клик по фону-оверлею тоже закрывает)
     if (e.key === 'Escape') {
-      if (els.dialog.open) { els.dialog.close(); return; }
+      if (els.dialog && els.dialog.open) { els.dialog.close(); return; }
       closeNav();
     }
     // Ctrl/Cmd+K — новый чат, но не пока открыт диалог настроек
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k' && !els.dialog.open) {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k' && !(els.dialog && els.dialog.open)) {
       e.preventDefault(); newChat();
     }
   });

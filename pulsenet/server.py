@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """HTTP-сервер (stdlib): отдаёт веб-интерфейс из web/ и API, которое он вызывает.
 
-Страницы: /  — чат (ai.html), /memory — граф памяти (memory_viewer.html).
+Страницы: /  — чат (ai.html), /network — сеть импульсов (network.html).
 Чат: POST /ai/chat — поток Server-Sent Events (token, reasoning_token, trace,
 gen_phase, error, затем [DONE]).
 """
@@ -87,8 +87,13 @@ class Handler(BaseHTTPRequestHandler):
         path, query = url.path, parse_qs(url.query)
         if method == "GET" and path == "/":
             return self.send_file(os.path.join(self.web_dir, "ai.html"))
-        if method == "GET" and path == "/memory":
-            return self.send_file(os.path.join(self.web_dir, "memory_viewer.html"))
+        if method == "GET" and path == "/network":
+            return self.send_file(os.path.join(self.web_dir, "network.html"))
+        if method == "GET" and path in ("/memory", "/ai/memory/page"):
+            self.send_response(302)
+            self.send_header("Location", "/network")
+            self.end_headers()
+            return
         if method == "GET" and path == "/login":
             self.send_response(302)
             self.send_header("Location", "/")
@@ -103,6 +108,8 @@ class Handler(BaseHTTPRequestHandler):
 
         handler = ROUTES.get((method, path))
         if handler is None:
+            if path.startswith("/ai/memory"):
+                return _not_supported(self, None, None)
             return self.send_json({"error": "not_found"}, 404)
         body = self.read_json() if method in ("POST", "PUT") else None
         try:
@@ -234,19 +241,62 @@ def _ui_delta(h, _b, _q):
 
 
 def _ui_events(h, _b, _q):
-    h.send_json({"error": "not_found"}, 404)
+    # 204 — EventSource не переподключается; потоковой синхронизации здесь нет
+    h.send_response(204)
+    h.send_header("Content-Length", "0")
+    h.end_headers()
 
 
 def _mcp_code(h, _b, _q):
     h.send_json({"code": None})
 
 
-def _memory(h, _b, _q):
-    h.send_json(h.app.memory_snapshot())
+def _net_state(h, _b, _q):
+    h.send_json(h.app.net_state())
 
 
-def _memory_status(h, _b, _q):
-    h.send_json({"readonly": False})
+def _net_graph(h, _b, _q):
+    h.send_json(h.app.graph())
+
+
+def _net_neurons(h, _b, q):
+    try:
+        k = int((q.get("ensemble") or ["-1"])[0])
+    except ValueError:
+        return h.send_json({"error": "ensemble должен быть числом"}, 400)
+    h.send_json(h.app.neurons(k))
+
+
+def _net_respond(h, b, _q):
+    question = str(b.get("question", "")).strip()
+    if not question:
+        return h.send_json({"error": "пустой вопрос"}, 400)
+    h.send_json(h.app.respond(question))
+
+
+def _net_teach(h, b, _q):
+    result = h.app.teach(str(b.get("question", "")), str(b.get("answer", "")),
+                         float(b.get("weight", 1.0)))
+    h.send_json(result, 200 if result.get("ok") else 400)
+
+
+def _net_save(h, _b, _q):
+    h.app.save_net()
+    h.send_json(h.app.net_state())
+
+
+def _net_load(h, _b, _q):
+    result = h.app.load_net()
+    h.send_json(result, 200 if result.get("ok") else 400)
+
+
+def _net_reset(h, _b, _q):
+    h.send_json(h.app.reset_net())
+
+
+def _net_restore(h, _b, _q):
+    result = h.app.restore_backup()
+    h.send_json(result, 200 if result.get("ok") else 400)
 
 
 ROUTES = {
@@ -276,8 +326,15 @@ ROUTES = {
     ("GET", "/ai/ui-state/events"): _ui_events,
     ("GET", "/ai/mcp_code"): _mcp_code,
     ("POST", "/ai/mcp_code"): _mcp_code,
-    ("GET", "/ai/memory"): _memory,
-    ("GET", "/ai/memory/status"): _memory_status,
+    ("GET", "/net/state"): _net_state,
+    ("GET", "/net/graph"): _net_graph,
+    ("GET", "/net/neurons"): _net_neurons,
+    ("POST", "/net/respond"): _net_respond,
+    ("POST", "/net/teach"): _net_teach,
+    ("POST", "/net/save"): _net_save,
+    ("POST", "/net/load"): _net_load,
+    ("POST", "/net/reset"): _net_reset,
+    ("POST", "/net/restore"): _net_restore,
 }
 
 

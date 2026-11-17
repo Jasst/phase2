@@ -140,6 +140,8 @@ class Cortex:
         if weight <= 0:
             return merges
         for a in dict.fromkeys(ids):
+            if len(merges) >= self.cfg.max_merges_per_lesson:
+                break
             pa = self.prof.get(a)
             if not pa:
                 continue

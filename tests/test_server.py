@@ -72,8 +72,12 @@ def test_pages_and_static_assets_are_served(running):
     _, port = running
     st, ct, raw = _req(port, "GET", "/")
     assert st == 200 and "text/html" in ct and "AI-ассистент".encode() in raw
-    st, _, raw = _req(port, "GET", "/memory")
-    assert st == 200 and b"memory" in raw.lower()
+    st, _, raw = _req(port, "GET", "/network")
+    assert st == 200 and "Сеть импульсов".encode() in raw
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("GET", "/memory")
+    r = conn.getresponse(); r.read(); conn.close()
+    assert r.status == 302 and r.getheader("Location") == "/network"
     st, ct, _ = _req(port, "GET", "/static/js/ai-app.js")
     assert st == 200 and "javascript" in ct
     st, _, _ = _req(port, "GET", "/static/vendor/marked.min.js")
@@ -122,17 +126,60 @@ def test_impulse_trace_appears_after_learning(running):
     assert '"trace"' in raw.decode("utf-8") and '"pulsenet"' in raw.decode("utf-8")
 
 
-def test_memory_snapshot_reflects_learned_chain(running):
+def test_network_teach_respond_graph_and_neurons(running):
     app, port = running
+    st, _, raw = _req(port, "POST", "/net/teach", {"question": "что такое огонь", "answer": "огонь это горячее пламя"})
+    res = json.loads(raw)
+    assert st == 200 and res["ok"] and res["loss"] > 0
+    assert res["stats"]["слов"] > 0
     for _ in range(3):
-        app.net.teach("что такое огонь", "огонь это горячее пламя", 1.0, replay=False)
-    st, _, raw = _req(port, "GET", "/ai/memory")
-    snap = json.loads(raw)
-    assert st == 200 and snap["nodes"], "граф памяти должен содержать ансамбли"
-    assert all(n["type"] == "ensemble" for n in snap["nodes"])
-    assert all(e["relation"] for e in snap["edges"])
-    st, _, _ = _req(port, "GET", "/ai/memory/identity?layer=x")
-    assert st == 501
+        _req(port, "POST", "/net/teach", {"question": "что такое огонь", "answer": "огонь это горячее пламя"})
+    st, _, raw = _req(port, "POST", "/net/respond", {"question": "что такое огонь"})
+    reply = json.loads(raw)
+    assert st == 200 and reply["path"], "после уроков импульс должен пройти по ансамблям"
+    assert all({"word", "ensemble", "mass"} <= set(step) for step in reply["path"])
+    st, _, raw = _req(port, "GET", "/net/graph")
+    graph = json.loads(raw)
+    assert graph["nodes"] and graph["total_ensembles"] == len(graph["nodes"])
+    assert all(e["weight"] > 0 for e in graph["edges"])
+    k = graph["nodes"][0]["id"]
+    st, _, raw = _req(port, "GET", f"/net/neurons?ensemble={k}")
+    neurons = json.loads(raw)
+    assert neurons["neurons"] and all("word" in n for n in neurons["neurons"])
+
+
+def test_teach_is_online_and_persists_across_restart(tmp_path):
+    from pulsenet.app import App
+    env = {"LLM_BACKEND": "lmstudio", "LMSTUDIO_URL": "http://127.0.0.1:9/v1"}
+    app = App(env, data_dir=str(tmp_path / "data"))
+    before = app.net_state()["lessons"]
+    app.teach("что такое огонь", "огонь это горячее пламя")
+    app.teach("что такое вода", "вода это прозрачная жидкость")
+    after = app.net_state()
+    assert after["lessons"] == before + 2
+    assert after["on_disk"] and after["size_bytes"] > 0
+    assert len(after["history"]) == 2
+    # перезапуск приложения: сеть подгружается с диска
+    app2 = App(env, data_dir=str(tmp_path / "data"))
+    assert app2.net_state()["stats"] == after["stats"]
+    # сравниваем детерминированный ответ (temp=0): сэмплирование зависит от состояния RNG
+    assert app2.respond("что такое огонь", temp=0)["text"] == app.respond("что такое огонь", temp=0)["text"]
+
+
+def test_reset_keeps_backup_of_previous_network(tmp_path):
+    from pulsenet import store
+    from pulsenet.app import App
+    env = {"LLM_BACKEND": "lmstudio", "LMSTUDIO_URL": "http://127.0.0.1:9/v1"}
+    app = App(env, data_dir=str(tmp_path / "data"))
+    app.teach("alpha beta", "gamma delta")
+    saved = app.net_state()["stats"]
+    state = app.reset_net()
+    assert app.net_state()["stats"]["слов"] == 0 and state["backup"]
+    assert app.load_net()["ok"] is False  # сохранённой сети на диске больше нет
+    restored = store.load(state["backup"])
+    assert restored.stats() == saved
+    back = app.restore_backup()
+    assert back["ok"] and app.net_state()["stats"] == saved
 
 
 def test_ui_state_roundtrip(running):
