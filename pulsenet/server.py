@@ -323,17 +323,18 @@ def _net_eval(h, _b, _q):
 
 
 def _net_train_with_llm(h, b, _q):
-    """Обучить модель на примере ответа LLM (учителя)."""
+    """Обучить сеть на примере ответа LLM (учителя): учитель отвечает на вопрос,
+    сеть учится на этом примере `iterations` раз."""
     question = str(b.get("question", "")).strip()
     if not question:
         return h.send_json({"error": "пустой вопрос"}, 400)
-    teacher_url = b.get("teacher_url", "")
     model = b.get("model", "")
-    iterations = int(b.get("iterations", 1))
-    if not teacher_url:
-        return h.send_json({"error": "не указан URL учителя (LLM)"}, 400)
     try:
-        result = h.app.train_with_llm(question, teacher_url, model, iterations)
+        iterations = max(1, min(20, int(b.get("iterations", 1))))
+    except (TypeError, ValueError):
+        iterations = 1
+    try:
+        result = h.app.train_with_llm(question, str(b.get("teacher_url", "")), model, iterations)
     except Exception as exc:
         return h.send_json({"error": str(exc)}, 500)
     h.send_json(result, 200 if result.get("ok") else 400)

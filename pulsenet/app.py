@@ -305,39 +305,48 @@ class App:
                 "path": [{"word": names.get(w, w), "ensemble": int(k), "mass": m}
                          for w, k, m in reply.path]}
 
-    def train_with_llm(self, question, teacher_url, model, iterations):
+    def train_with_llm(self, question, teacher_url="", model="", iterations=1):
         """
-        Обучить модель на примере ответа LLM (учителя).
-        
-        Для каждого из `iterations` итераций:
-          1. Спрашиваем учителя ответ на вопрос.
-          2. Учим сеть этому ответу с весом 1.0.
-        Возвращает список уроков: [{"iteration": N, "teacher_answer": ..., "loss": ...}, ...]
+        Обучить сеть на примере ответа LLM (учителя).
+
+        Учитель один раз отвечает на вопрос — это и есть пример. Затем сеть
+        учится на нём `iterations` раз подряд, чтобы пример закрепился.
+        URL учителя и модель по умолчанию берутся из текущего бэкенда,
+        поэтому интерфейсу достаточно передать вопрос и число повторов.
         """
+        question = str(question or "").strip()
+        if not question:
+            return {"ok": False, "error": "пустой вопрос"}
+        try:
+            iterations = max(1, min(20, int(iterations or 1)))
+        except (TypeError, ValueError):
+            iterations = 1
+        if not teacher_url:
+            base = getattr(self.backend, "base_url", "")
+            teacher_url = base + "/chat/completions" if base else ""
         if not teacher_url:
             return {"ok": False, "error": "не указан URL учителя (LLM)"}
         try:
-            teacher = HTTPTeacher(teacher_url, model)
+            teacher = HTTPTeacher(teacher_url, model or self.default_model())
         except Exception as exc:
             return {"ok": False, "error": f"ошибка создания учителя: {exc}"}
+        try:
+            teacher_answer = teacher.answer(question)
+        except Exception as exc:
+            return {"ok": False, "error": f"учитель недоступен: {exc}"}
+        if not teacher_answer:
+            return {"ok": False, "error": f"пустой ответ учителя: {teacher.error or 'неизвестная ошибка'}"}
         lessons = []
         with self.lock:
             for i in range(iterations):
-                try:
-                    teacher_answer = teacher.answer(question)
-                except Exception as exc:
-                    lessons.append({"iteration": i + 1, "error": str(exc)})
-                    continue
-                if not teacher_answer:
-                    lessons.append({"iteration": i + 1, "teacher_answer": None, "error": "пустой ответ учителя"})
-                    continue
                 loss = self.net.teach(question, teacher_answer, weight=1.0)
-                lessons.append({
-                    "iteration": i + 1,
-                    "teacher_answer": teacher_answer,
-                    "loss": round(float(loss), 4) if loss is not None else None,
-                })
-        return {"ok": True, "lessons": lessons}
+                lessons.append({"iteration": i + 1,
+                                "loss": round(float(loss), 4) if loss is not None else None})
+            self.save_net()
+        losses = [l["loss"] for l in lessons if l["loss"] is not None]
+        return {"ok": True, "question": question, "teacher_answer": teacher_answer,
+                "iterations": iterations, "lessons": lessons,
+                "avg_loss": round(sum(losses) / len(losses), 4) if losses else None}
 
     def graph(self, max_edges=600):
         with self.lock:

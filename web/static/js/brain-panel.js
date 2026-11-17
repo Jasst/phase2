@@ -1,7 +1,8 @@
 /* Панель «Сеть» над полем ввода чата.
  * Переключатель: отвечает LLM или сама сеть. Кнопки для последнего ответа:
  * «Хороший ответ» — закрепить; «Обучить» — дать урок с этим вопросом и ответом;
- * «Переучить» — ввести правильный ответ, неверный ослабится.
+ * «Переучить» — ввести правильный ответ, неверный ослабится;
+ * «Обучить с LLM» — LLM отвечает заново, сеть учится на этом примере несколько раз.
  * Данные последнего хода приходят из события turn в потоке /ai/chat. */
 (function () {
   'use strict';
@@ -46,7 +47,9 @@
     const bGood = el('button', { type: 'button', id: 'bpGood', title: 'Закрепить этот ответ в сети' }, 'Хороший ответ');
     const bTeach = el('button', { type: 'button', id: 'bpTeach', title: 'Дать сети урок: этот вопрос и этот ответ' }, 'Обучить');
     const bFix = el('button', { type: 'button', id: 'bpFix', class: 'danger', title: 'Ответ неверный: введите правильный' }, 'Переучить');
-    actions.append(bGood, bTeach, bFix);
+    const bTrainLLM = el('button', { type: 'button', id: 'bpTrainLLM', class: 'primary',
+      title: 'LLM заново ответит на этот вопрос, сеть выучит её ответ несколько раз подряд' }, 'Обучить с LLM');
+    actions.append(bGood, bTeach, bFix, bTrainLLM);
     box.append(head, last, actions);
     anchor.parentNode.insertBefore(box, anchor);
 
@@ -56,6 +59,7 @@
     bGood.addEventListener('click', () => verdict('good'));
     bTeach.addEventListener('click', teachCurrent);
     bFix.addEventListener('click', fixCurrent);
+    bTrainLLM.addEventListener('click', () => trainLLMFlow());
     paintButtons();
   }
 
@@ -77,8 +81,10 @@
     llm.classList.toggle('on', state.mode === 'llm');
     net.classList.toggle('on', state.mode === 'net');
     document.getElementById('bpAutoLearn').checked = state.autoLearn;
-    const ok = !!(state.last && state.last.question && state.last.answer) && !state.busy;
+    const okQ = !!(state.last && state.last.question) && !state.busy;
+    const ok = okQ && !!state.last.answer;
     ['bpGood', 'bpTeach', 'bpFix'].forEach((id) => { document.getElementById(id).disabled = !ok; });
+    document.getElementById('bpTrainLLM').disabled = !okQ;
     const lastBox = document.getElementById('bpLast');
     if (state.last && state.last.question) {
       const src = { llm: 'ответ LLM', net: 'ответ сети', manual: 'урок' }[state.last.source] || state.last.source || '';
@@ -124,9 +130,11 @@
     const auto = document.getElementById('setAutoLearn');
     const openBtn = document.getElementById('openSettings');
     const apply = document.getElementById('netTuneApply');
+    const trainLLM = document.getElementById('trainWithLLMBtn');
     if (!mode || !auto || !apply) return;
     mode.addEventListener('change', () => setMode(mode.value));
     auto.addEventListener('change', () => setAuto(auto.checked));
+    if (trainLLM) trainLLM.addEventListener('click', () => trainLLMFlow('netTuneStatus'));
     for (const [inputId, outId, , digits] of TUNE) {
       const input = document.getElementById(inputId);
       input.addEventListener('input', () => {
@@ -205,6 +213,41 @@
       await api('/net/feedback', { question: state.last.question, answer: state.last.answer, verdict: 'fix', correct });
       say('Сеть переучилась: правильный ответ закреплён');
     } catch (e) { say('Ошибка: ' + e.message, true); }
+    finally { state.busy = false; paintButtons(); }
+  }
+
+  // ---------- «Обучить с LLM»: пример от учителя, несколько повторов ----------
+
+  function statusOut(id) {
+    const s = document.getElementById(id);
+    if (!s) return null;
+    return { set(text, isError) { s.textContent = text; s.style.color = isError ? '#f0a09d' : ''; } };
+  }
+
+  async function trainLLMFlow(statusId) {
+    const out = statusOut(statusId || 'bpStatus') || { set: (t, e) => say(t, e) };
+    let question = state.last && state.last.question;
+    if (!question) {
+      question = await window.UI.prompt('На какой вопрос обучить сеть на примере ответа LLM?', {
+        title: 'Обучить с LLM', okText: 'Дальше', value: '', placeholder: 'Вопрос', required: true,
+      });
+      if (!question) return;
+    }
+    const iters = await window.UI.prompt(
+      'LLM ответит на этот вопрос, и сеть выучит её ответ. Сколько раз обучить на этом примере? (1–20)',
+      { title: 'Обучить с LLM', okText: 'Обучить', value: '3', placeholder: '3', required: true },
+    );
+    if (!iters) return;
+    const n = Math.min(20, Math.max(1, Math.round(Number(String(iters).replace(',', '.')) || 0)));
+    if (!n) { out.set('Введите число повторов от 1 до 20', true); return; }
+    state.busy = true; paintButtons();
+    out.set(`Спрашиваю LLM и обучаюсь на примере (${n} раз)…`);
+    try {
+      const r = await api('/net/train-with-llm', { question, iterations: n });
+      if (!r.ok) throw new Error(r.error || 'LLM не ответила');
+      const tail = r.avg_loss !== null && r.avg_loss !== undefined ? ` средняя ошибка ${r.avg_loss}` : '';
+      out.set(`Сеть обучилась на примере ${r.iterations} раз подряд.${tail} Ответ учителя: «${r.teacher_answer}»`);
+    } catch (e) { out.set('Ошибка: ' + e.message, true); }
     finally { state.busy = false; paintButtons(); }
   }
 

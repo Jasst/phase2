@@ -13,3 +13,4 @@
 .bp-actions button:hover:not(:disabled) { border-color: #9aa3b2; }
 .bp-actions button:disabled { opacity: .45; cursor: default; }
 .bp-actions button.danger { color: #f0a09d; }
+.bp-actions button.primary { border: none; background: linear-gradient(135deg, #5b626f 0%, #8d96a7 100%); color: #fff; font-weight: 600; }
