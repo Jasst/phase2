@@ -10,6 +10,9 @@
   let graph = null;          // последний ответ /net/graph
   const pos = new Map();     // id ансамбля -> {x, y}: позиции сохраняются между обновлениями
   let selected = null;
+  let lastTurn = null;       // последний ответ импульса: с ним работают кнопки оценки
+  let busy = false;
+  let thoughts = [];
 
   // ---------- сеть запросов ----------
 
@@ -32,6 +35,108 @@
     toast._t = setTimeout(() => { t.textContent = ''; }, 4000);
   }
 
+  function neuronStatus(text, kind) {
+    const el = $('#neuronResult');
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = 'result small' + (kind === 'ok' ? ' ok' : kind === 'err' ? ' err' : ' muted');
+  }
+
+  function gradeStatus(text, isError) {
+    const el = $('#gradeStatus');
+    if (!el) return;
+    el.textContent = text || '';
+    el.style.color = isError ? '#f0a09d' : '';
+  }
+
+  function setBusy(on) {
+    busy = !!on;
+    for (const id of ['btnAutocorrect', 'btnDistill', 'btnReplay']) {
+      const b = document.getElementById(id);
+      if (b) b.disabled = busy;
+    }
+    renderGrade();
+  }
+
+  function sourceName(source) {
+    return { llm: 'ответ LLM', net: 'ответ сети', manual: 'урок' }[source] || source || '';
+  }
+
+  function renderGrade() {
+    const hasQuestion = !!(lastTurn && lastTurn.question);
+    const hasAnswer = hasQuestion && !!(lastTurn && lastTurn.answer);
+    const box = $('#lastTurn');
+    if (box) {
+      if (!hasQuestion) {
+        box.className = 'last-turn muted';
+        box.textContent = 'Сначала задайте вопрос и пустите импульс.';
+      } else {
+        box.className = 'last-turn';
+        box.innerHTML = '';
+        box.append(h('div', { class: 'q' }, 'Вопрос: ' + lastTurn.question));
+        box.append(h('div', { class: 'a' },
+          lastTurn.answer || 'сеть не ответила — нажмите «Переучить» и введите правильный ответ'));
+        const meta = [sourceName(lastTurn.source)];
+        if (lastTurn.confidence !== null && lastTurn.confidence !== undefined) {
+          meta.push('уверенность ' + Math.round(Number(lastTurn.confidence) * 100) + '%');
+        }
+        if (lastTurn.self_error !== null && lastTurn.self_error !== undefined) {
+          meta.push('ошибка самопредсказания ' + lastTurn.self_error);
+        }
+        box.append(h('div', { class: 'meta' }, meta.filter(Boolean).join(' · ')));
+      }
+    }
+    const set = (id, disabled) => {
+      const b = document.getElementById(id);
+      if (b) b.disabled = !!disabled;
+    };
+    set('gradeGood', busy || !hasAnswer);
+    set('gradeBad', busy || !hasAnswer);
+    set('gradeTeach', busy || !hasAnswer);
+    set('gradeFix', busy || !hasQuestion);
+    set('gradeTrainLLM', busy || !hasQuestion);
+    set('gradeThink', busy);
+  }
+
+  // el() для обычных HTML-элементов (в сети уже есть SVG-версия el выше).
+  function h(tag, attrs, text) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, v);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function renderThoughts(items) {
+    const box = $('#thoughts');
+    if (!box) return;
+    box.innerHTML = '';
+    thoughts = items || [];
+    if (!thoughts.length) {
+      box.append(h('div', { class: 'thought-empty' },
+        'Мыслей пока нет: сеть подумает после ответа или по кнопке «Подумать».'));
+      return;
+    }
+    for (const it of thoughts.slice(0, 10)) {
+      const row = h('div', { class: 'thought-item' });
+      row.append(h('span', { class: 'thought-kind' }, (it.kind === 'turn' ? 'ход' : 'сама') + ': '));
+      const text = String(it.text || '');
+      row.append(document.createTextNode(text));
+      if (it.t) {
+        const at = new Date(Number(it.t) * 1000);
+        row.append(h('span', { class: 'thought-time' },
+          ' ' + at.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })));
+      }
+      box.append(row);
+    }
+  }
+
+  async function refreshThoughts() {
+    try {
+      const data = await api('/net/thoughts');
+      renderThoughts(data.items || []);
+    } catch (_) { /* страница продолжает работать без нарратива */ }
+  }
+
   // ---------- состояние и карточки ----------
 
   function renderStats(state) {
@@ -43,6 +148,7 @@
       ['Уроки', fmt(state.lessons)],
       ['Опыт для повтора', fmt(s['в_памяти_опыта'])],
       ['Размер на диске', state.on_disk ? Math.round(state.size_bytes / 1024) + ' КБ' : 'нет'],
+      ['Мыслей в нарративе', fmt(state.thoughts)],
       ['Мысль (фокус)', (state.focus || []).map((f) => f.words.join(' ') || ('ансамбль ' + f.ensemble)).slice(0, 2).join(' · ') || '—'],
       ['Ошибка самопредсказания', state.self_error === null || state.self_error === undefined ? '—' : state.self_error],
       ['Припоминание', state.eval_last === null || state.eval_last === undefined ? '—' : Math.round(state.eval_last * 100) + '%'],
@@ -218,15 +324,26 @@
     const list = $('#path');
     out.textContent = 'думаю…';
     list.innerHTML = '';
-    const data = await api('/net/respond', { question });
-    out.innerHTML = data.text ? `<b>Ответ сети:</b> ${escapeHtml(data.text)}` : '<span class="muted">сеть не знает слов из вопроса</span>';
-    data.path.forEach((step, i) => {
-      const li = document.createElement('li');
-      li.innerHTML = `${escapeHtml(step.word)} <span class="e">→ ансамбль ${step.ensemble}, масса ${step.mass}</span>`;
-      list.appendChild(li);
-      setTimeout(() => highlight(step.ensemble), i * 350);
-    });
-    setTimeout(() => document.querySelectorAll('.node.hot').forEach((n) => n.classList.remove('hot')), data.path.length * 350 + 900);
+    gradeStatus('');
+    setBusy(true);
+    try {
+      const data = await api('/net/respond', { question });
+      out.innerHTML = data.text
+        ? `<b>Ответ сети:</b> ${escapeHtml(data.text)}`
+        : '<span class="muted">сеть не знает слов из вопроса</span>';
+      lastTurn = { question, answer: data.text || '', source: 'net',
+        confidence: data.confidence, self_error: data.self_error };
+      renderGrade();
+      data.path.forEach((step, i) => {
+        const li = document.createElement('li');
+        li.innerHTML = `${escapeHtml(step.word)} <span class="e">→ ансамбль ${step.ensemble}, масса ${step.mass}</span>`;
+        list.appendChild(li);
+        setTimeout(() => highlight(step.ensemble), i * 350);
+      });
+      setTimeout(() => document.querySelectorAll('.node.hot').forEach((n) => n.classList.remove('hot')), data.path.length * 350 + 900);
+    } finally {
+      setBusy(false);
+    }
   }
 
   function highlight(ensembleId) {
@@ -243,7 +360,10 @@
   function renderEpisodes(list) {
     const ol = $('#episodes');
     if (!list || !list.length) { ol.innerHTML = '<li class="muted">уроков пока нет</li>'; return; }
-    const src = { manual: 'вручную', good: 'хороший', fix: 'исправлено', 'fix-wrong': 'неверный', bad: 'неверный', llm: 'из LLM', net: 'сеть' };
+    const src = { manual: 'вручную', good: 'хороший', fix: 'исправлено', 'fix-wrong': 'неверный',
+      bad: 'неверный', llm: 'из LLM', net: 'сеть', 'auto-fix': 'автокоррекция',
+      'auto-wrong': 'автокоррекция: неверный', distill: 'дистилляция',
+      'distill-wrong': 'дистилляция: неверный' };
     ol.innerHTML = list.map((e) => `<li>${escapeHtml(e.question)} → ${escapeHtml(e.answer)}
       <span class="e">(${src[e.source] || e.source}${e.weight < 0 ? ', ослаблено' : ''})</span></li>`).join('');
   }
@@ -255,6 +375,7 @@
     renderEpisodes(state.recent);
     drawGraph();
     drawChart(state.history);
+    await refreshThoughts();
     return state;
   }
 
@@ -290,6 +411,170 @@
     }, 'Связь ослаблена и сохранена');
   });
 
+  async function feedbackAction(verdict) {
+    if (!lastTurn || !lastTurn.question) return;
+    let correct = null;
+    if (verdict === 'fix') {
+      correct = await window.UI.prompt(
+        lastTurn.answer
+          ? 'Исправьте ответ. Неверный вариант будет ослаблен, правильный — закреплён.'
+          : 'Сеть не ответила. Введите правильный ответ — он будет закреплён.',
+        { title: 'Переучить', okText: 'Переучить', value: lastTurn.answer || '',
+          placeholder: 'Правильный ответ', required: true });
+      if (!correct) return;
+      if (lastTurn.answer && correct.trim() === lastTurn.answer.trim()) {
+        gradeStatus('Ответ не изменился. Для закрепления нажмите «Обучить».', true);
+        return;
+      }
+    }
+    setBusy(true);
+    gradeStatus(verdict === 'good' ? 'Закрепляю ответ…'
+      : verdict === 'bad' ? 'Ослабляю связь…' : 'Переучиваю…');
+    try {
+      const r = await api('/net/feedback', {
+        question: lastTurn.question, answer: lastTurn.answer, verdict, correct,
+      });
+      if (!r.ok) throw new Error(r.error || 'сеть не приняла урок');
+      gradeStatus(verdict === 'good' ? 'Хороший ответ закреплён: сеть запомнила связь.'
+        : verdict === 'bad' ? 'Плохой ответ ослаблен: сеть поняла, что так отвечать не надо.'
+        : 'Переучено: правильный ответ закреплён, неверный ослаблен.');
+      await refresh();
+    } catch (e) {
+      gradeStatus('Ошибка: ' + e.message, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function teachLast() {
+    if (!lastTurn || !lastTurn.question || !lastTurn.answer) return;
+    setBusy(true);
+    gradeStatus('Даю урок…');
+    try {
+      const r = await api('/net/teach', {
+        question: lastTurn.question, answer: lastTurn.answer, weight: 1.0,
+      });
+      if (!r.ok) throw new Error(r.error || 'урок не принят');
+      gradeStatus(`Урок принят. Ошибка предсказания: ${r.loss}.`);
+      await refresh();
+    } catch (e) {
+      gradeStatus('Ошибка: ' + e.message, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function trainWithLLM() {
+    let question = lastTurn && lastTurn.question;
+    if (!question) {
+      question = await window.UI.prompt('На какой вопрос обучить сеть на примере ответа LLM?', {
+        title: 'Обучить с LLM', okText: 'Дальше', value: '', placeholder: 'Вопрос', required: true,
+      });
+      if (!question) return;
+    }
+    const raw = await window.UI.prompt(
+      'LLM ответит на вопрос, а сеть выучит её ответ несколько раз подряд. Сколько повторов? (1–20)',
+      { title: 'Обучить с LLM', okText: 'Обучить', value: '3', required: true });
+    if (!raw) return;
+    const n = Math.min(20, Math.max(1, Math.round(Number(String(raw).replace(',', '.')) || 0)));
+    if (!n) { gradeStatus('Введите число повторов от 1 до 20', true); return; }
+    setBusy(true);
+    gradeStatus(`Спрашиваю LLM и обучаюсь (${n} раз)…`);
+    try {
+      const r = await api('/net/train-with-llm', { question, iterations: n });
+      if (!r.ok) throw new Error(r.error || 'LLM не ответила');
+      const tail = r.avg_loss !== null && r.avg_loss !== undefined ? ` Средняя ошибка: ${r.avg_loss}.` : '';
+      gradeStatus(`Сеть обучилась ${r.iterations} раз.${tail} Ответ учителя: «${r.teacher_answer}»`);
+      await refresh();
+    } catch (e) {
+      gradeStatus('Ошибка: ' + e.message, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function thinkNow() {
+    setBusy(true);
+    gradeStatus('Сеть думает…');
+    try {
+      const r = await api('/net/thoughts/step', { n: 1 });
+      const t = (r.thoughts || [])[0];
+      gradeStatus(t ? 'Сеть подумала: «' + t + '»' : 'Пока думается с трудом: дайте сети пару уроков.', !t);
+      renderThoughts(r.narrative || []);
+      await refresh();
+    } catch (e) {
+      gradeStatus('Ошибка: ' + e.message, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function autocorrect() {
+    setBusy(true);
+    neuronStatus('Ищу слабые места и закрепляю правильные ответы…');
+    try {
+      const r = await api('/net/autocorrect', { limit: 6, repeats: 2, threshold: 0.75 });
+      if (!r.ok) throw new Error(r.error || 'автокоррекция не удалась');
+      const before = r.before === null || r.before === undefined ? '—' : Math.round(r.before * 100) + '%';
+      const after = r.after === null || r.after === undefined ? '—' : Math.round(r.after * 100) + '%';
+      neuronStatus(`Автокоррекция: проверено ${r.checked}, исправлено ${r.fixed}. ` +
+        `Припоминание: ${before} → ${after}.` + (r.message ? ' ' + r.message : ''), 'ok');
+      await refresh();
+    } catch (e) {
+      neuronStatus('Ошибка автокоррекции: ' + e.message, 'err');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function distillFix() {
+    const raw = await window.UI.prompt(
+      'Слабые ответы будут перепроверены у LLM и переданы сети дистилляцией. Сколько вопросов взять? (1–5)',
+      { title: 'Автоисправление (дистилляция)', okText: 'Запустить', value: '3', required: true });
+    if (!raw) return;
+    const n = Math.min(5, Math.max(1, Math.round(Number(String(raw).replace(',', '.')) || 0)));
+    if (!n) { neuronStatus('Введите число от 1 до 5', 'err'); return; }
+    setBusy(true);
+    neuronStatus(`Спрашиваю LLM и дистиллирую ответы (${n} вопросов)…`);
+    try {
+      const r = await api('/net/distill', { limit: n, iterations: 2, threshold: 0.7 });
+      if (!r.ok) throw new Error(r.error || 'дистилляция не удалась');
+      const tail = r.errors && r.errors.length ? ' Ошибки: ' + r.errors.join('; ') : '';
+      neuronStatus(`Дистилляция: исправлено ${r.fixed} из ${r.checked}.` +
+        (r.teacher ? ` Учитель: ${r.teacher}.` : '') + tail, r.fixed ? 'ok' : '');
+      await refresh();
+    } catch (e) {
+      neuronStatus('Ошибка дистилляции: ' + e.message, 'err');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function replayExperience() {
+    setBusy(true);
+    neuronStatus('Повторяю последний опыт…');
+    try {
+      const r = await api('/net/replay', { limit: 8 });
+      const tail = r.avg_loss !== null && r.avg_loss !== undefined ? ` Средняя ошибка: ${r.avg_loss}.` : '';
+      neuronStatus(`Повторено уроков: ${r.count}.${tail}`, 'ok');
+      await refresh();
+    } catch (e) {
+      neuronStatus('Ошибка повтора: ' + e.message, 'err');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  $('#gradeGood').addEventListener('click', () => feedbackAction('good'));
+  $('#gradeBad').addEventListener('click', () => feedbackAction('bad'));
+  $('#gradeTeach').addEventListener('click', teachLast);
+  $('#gradeFix').addEventListener('click', () => feedbackAction('fix'));
+  $('#gradeTrainLLM').addEventListener('click', trainWithLLM);
+  $('#gradeThink').addEventListener('click', thinkNow);
+  $('#btnAutocorrect').addEventListener('click', autocorrect);
+  $('#btnDistill').addEventListener('click', distillFix);
+  $('#btnReplay').addEventListener('click', replayExperience);
+
   $('#respondForm').addEventListener('submit', (e) => {
     e.preventDefault();
     const q = $('#respondQ').value.trim();
@@ -298,8 +583,11 @@
 
   $('#btnSave').addEventListener('click', () => run(async () => { await api('/net/save', {}); await refresh(); }, 'Сеть сохранена на диск'));
   $('#btnLoad').addEventListener('click', () => run(async () => { await api('/net/load', {}); await refresh(); }, 'Сеть загружена с диска'));
-  $('#btnReset').addEventListener('click', () => {
-    if (!confirm('Сбросить сеть? Текущая сеть сохранится в резервную копию, рабочая станет пустой.')) return;
+  $('#btnReset').addEventListener('click', async () => {
+    const ok = await window.UI.confirm(
+      'Сбросить сеть? Текущая сеть сохранится в резервную копию, рабочая станет пустой.',
+      { title: 'Сброс сети', okText: 'Сбросить', danger: true });
+    if (!ok) return;
     run(async () => {
       const r = await api('/net/reset', {});
       selected = null; pos.clear(); await refresh();
@@ -319,11 +607,15 @@
     }
     await refresh();
   }, 'Проверка выполнена'));
-  $('#btnRestore').addEventListener('click', () => {
-    if (!confirm('Восстановить сеть из последней резервной копии? Текущая рабочая сеть будет заменена.')) return;
+  $('#btnRestore').addEventListener('click', async () => {
+    const ok = await window.UI.confirm(
+      'Восстановить сеть из последней резервной копии? Текущая рабочая сеть будет заменена.',
+      { title: 'Восстановление копии', okText: 'Восстановить', danger: true });
+    if (!ok) return;
     run(async () => { await api('/net/restore', {}); selected = null; pos.clear(); await refresh(); }, 'Сеть восстановлена из копии');
   });
 
+  renderGrade();
   refresh().catch((e) => toast('Нет связи с сервером: ' + e.message, true));
   setInterval(() => refresh().catch(() => {}), 15000);
 })();

@@ -30,7 +30,21 @@ class _FakeLLM(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        try:
+            request = json.loads(raw or b"{}")
+        except ValueError:
+            request = {}
+        if not request.get("stream"):
+            # обычный (не потоковый) ответ для HTTPTeacher / дистилляции
+            body = json.dumps({"choices": [{"message": {
+                "content": "Огонь — это горячее пламя."}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -254,6 +268,46 @@ def test_feedback_fix_teaches_correct_answer(tmp_path):
     assert "fix" in kinds and "fix-wrong" in kinds
 
 
+def test_autocorrect_and_replay_repair_weak_recall(tmp_path):
+    from pulsenet.app import App
+    env = {"LLM_BACKEND": "lmstudio", "LMSTUDIO_URL": "http://127.0.0.1:9/v1"}
+    app = App(env, data_dir=str(tmp_path / "data"))
+    app.teach("что такое огонь", "огонь холодный лёд", 1.0, source="llm")
+    # искусственно слабое место: сеть не знает этих слов
+    app.eval_set = [{"question": "что такое огонь", "expected": ["марсианский", "вулкан"]}]
+    res = app.autocorrect(limit=1, repeats=2, threshold=1.0)
+    assert res["ok"] and res["checked"] == 1
+    assert res["details"][0]["after"] is not None
+    assert any(e["source"] == "auto-fix" for e in app.episodes)
+    rep = app.replay_experience(limit=3)
+    assert rep["ok"] and rep["count"] >= 1
+
+
+def test_distill_fix_uses_llm_teacher(running):
+    app, port = running
+    app.teach("что такое огонь", "огонь холодный лёд", 1.0, source="llm")
+    app.eval_set = [{"question": "что такое огонь", "expected": ["марсианский", "вулкан"]}]
+    st, _, raw = _req(port, "POST", "/net/distill",
+                      {"limit": 1, "iterations": 1, "threshold": 1.0})
+    res = json.loads(raw)
+    assert st == 200 and res["ok"] and res["checked"] == 1
+    assert "пламя" in res["details"][0]["teacher"].lower()
+    assert any(e["source"] == "distill" for e in app.episodes)
+
+
+def test_autocorrect_and_replay_routes(running):
+    app, port = running
+    app.teach("что такое огонь", "огонь холодный лёд", 1.0, source="llm")
+    app.eval_set = [{"question": "что такое огонь", "expected": ["марсианский", "вулкан"]}]
+    st, _, raw = _req(port, "POST", "/net/autocorrect",
+                      {"limit": 1, "repeats": 1, "threshold": 1.0})
+    data = json.loads(raw)
+    assert st == 200 and data["ok"] and data["checked"] == 1
+    st, _, raw = _req(port, "POST", "/net/replay", {"limit": 2})
+    data = json.loads(raw)
+    assert st == 200 and data["ok"] and data["count"] >= 1
+
+
 def test_good_answer_adds_eval_item_and_eval_runs(tmp_path):
     from pulsenet.app import App
     env = {"LLM_BACKEND": "lmstudio", "LMSTUDIO_URL": "http://127.0.0.1:9/v1"}
@@ -315,3 +369,55 @@ def test_tuning_routes_roundtrip(running):
     assert st == 400 and json.loads(raw)["errors"]
     st, _, raw = _req(port, "POST", "/net/tuning", {"replay_n": 1})
     assert st == 200 and app.net.cfg.replay_n == 1
+
+
+def test_lmstudio_prefers_loaded_model_over_stale_saved(tmp_path):
+    from pulsenet.app import App
+
+    requested = []
+
+    class _LM(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if "/api/v0/models" in self.path:
+                self._send({"data": [
+                    {"id": "loaded-model", "state": "loaded", "type": "llm"},
+                    {"id": "other-model", "state": "not-loaded", "type": "llm"},
+                ]})
+            else:
+                self._send({"data": [{"id": "loaded-model"}, {"id": "other-model"}]})
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            request = json.loads(raw or b"{}")
+            requested.append(request.get("model"))
+            self._send({"choices": [{"message": {"content": "answer from loaded model"}}]})
+
+    llm = ThreadingHTTPServer(("127.0.0.1", 0), _LM)
+    threading.Thread(target=llm.serve_forever, daemon=True).start()
+    try:
+        env = {"LLM_BACKEND": "lmstudio",
+               "LMSTUDIO_URL": f"http://127.0.0.1:{llm.server_address[1]}/v1"}
+        app = App(env, data_dir=str(tmp_path / "data"))
+        # Настройка осталась от llama.cpp: такого id в LM Studio нет.
+        app.settings["model"] = "lmstudio-community/Old-GGUF/model.gguf"
+        payload = app.models_payload()
+        assert payload["loaded"] == "loaded-model"
+        assert payload["default"] == "loaded-model"
+        assert payload["desired"] is None
+        res = app.train_with_llm("hello", iterations=1)
+        assert res["ok"] and res["teacher_answer"] == "answer from loaded model"
+        assert requested == ["loaded-model"]
+    finally:
+        llm.shutdown()
+        llm.server_close()

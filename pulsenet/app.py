@@ -151,9 +151,13 @@ class App:
         del self.episodes[:-EPISODES_LIMIT]
         _write_json(os.path.join(self.data_dir, "episodes.json"), self.episodes)
 
+    @staticmethod
+    def _keywords(text, k=4):
+        words = [w for w in tokenize(text) if w.isalnum() and len(w) >= 3 and w not in STOP_WORDS]
+        return list(dict.fromkeys(words))[:k]
+
     def _add_eval(self, question, answer):
-        words = [w for w in tokenize(answer) if w.isalnum() and len(w) >= 3 and w not in STOP_WORDS]
-        expected = list(dict.fromkeys(words))[:4]
+        expected = self._keywords(answer)
         if not expected:
             return
         self.eval_set = [e for e in self.eval_set if e["question"] != question]
@@ -163,10 +167,10 @@ class App:
 
     # ---------- обучение и обратная связь ----------
 
-    def teach(self, question, answer, weight=1.0, source="manual"):
+    def teach(self, question, answer, weight=1.0, source="manual", replay=True):
         """Онлайн-урок: сеть учится на паре и сохраняет себя."""
         with self.lock:
-            loss = self.net.teach(question, answer, weight)
+            loss = self.net.teach(question, answer, weight, replay=replay)
             if loss is None:
                 return {"ok": False, "error": "пустой вопрос или ответ"}
             self._record(loss, source)
@@ -200,6 +204,203 @@ class App:
                     self._add_eval(question, correct)
                 return r
         return {"ok": False, "error": f"неизвестный verdict: {verdict}"}
+
+    # ---------- автокоррекция и дистилляция ----------
+
+    def _score_recall(self, question, expected):
+        """Доля ожидаемых слов, которую сеть вспомнила в ответе на вопрос."""
+        expected = [w for w in (expected or []) if w]
+        if not expected:
+            return None, ""
+        reply = self.net.respond(question, temp=0)
+        got = set(tokenize(reply.text))
+        hit = len([w for w in expected if w in got]) / len(expected)
+        return round(float(hit), 4), reply.text
+
+    def _weak_items(self, limit=6, threshold=0.75):
+        """Слабые места проверочного набора: низкое припоминание.
+
+        Смотрим последние вопросы набора (не весь набор): автокоррекция должна
+        быть быстрой и не превращаться в полный прогон проверки.
+        """
+        try:
+            limit = max(1, min(20, int(limit or 6)))
+        except (TypeError, ValueError):
+            limit = 6
+        try:
+            threshold = max(0.0, min(1.0, float(threshold)))
+        except (TypeError, ValueError):
+            threshold = 0.75
+        candidates = self.eval_set[-max(limit * 4, 8):]
+        out = []
+        for item in candidates:
+            question = item.get("question", "")
+            expected = item.get("expected") or []
+            score, answer = self._score_recall(question, expected)
+            if score is None or score >= threshold:
+                continue
+            out.append({"question": question, "expected": expected,
+                        "score": score, "answer": answer})
+        out.sort(key=lambda x: x["score"])
+        return out[:limit]
+
+    def _replay_locked(self, limit=8):
+        """Повтор старого опыта без увеличения счётчика уроков."""
+        try:
+            limit = max(1, min(50, int(limit or 8)))
+        except (TypeError, ValueError):
+            limit = 8
+        items = [b for b in self.net.buffer if float(b[2]) > 0][-limit:]
+        losses = []
+        for question, answer, weight in items:
+            loss = self.net.learn(question, answer, weight)
+            if loss is not None:
+                losses.append(float(loss))
+        if items:
+            self.save_net()
+        return {"count": len(items),
+                "avg_loss": round(sum(losses) / len(losses), 4) if losses else None}
+
+    def autocorrect(self, limit=6, repeats=2, threshold=0.75):
+        """Автокоррекция без LLM: найти слабые ответы и закрепить их повторением.
+
+        Сеть сама проверяет припоминание по сохранённым хорошим ответам,
+        ослабляет неверный вариант и несколько раз дистиллирует правильный.
+        """
+        try:
+            repeats = max(1, min(4, int(repeats or 2)))
+        except (TypeError, ValueError):
+            repeats = 2
+        with self.lock:
+            weak = self._weak_items(limit, threshold)
+            if not weak:
+                replay = self._replay_locked(limit)
+                return {"ok": True, "checked": 0, "fixed": 0,
+                        "before": None, "after": None, "details": [], "replay": replay,
+                        "message": ("Слабых мест не нашлось: сеть повторила последний опыт."
+                                    if replay["count"] else "Слабых мест не нашлось.")}
+            before = round(float(np.mean([x["score"] for x in weak])), 3)
+            fix_w = self.fix_weight()
+            details, fixed = [], 0
+            for item in weak:
+                question = item["question"]
+                expected = item["expected"]
+                correct = " ".join(expected)
+                old = item.get("answer") or ""
+                # неверный ответ ослабляем, правильный закрепляем несколько раз
+                if old.strip() and old.strip() != correct.strip():
+                    self.teach(question, old, -fix_w, "auto-wrong", replay=False)
+                last_loss = None
+                for i in range(repeats):
+                    r = self.teach(question, correct, 1.0, "auto-fix",
+                                   replay=(i == repeats - 1))
+                    if r.get("ok"):
+                        last_loss = r["loss"]
+                after, new_answer = self._score_recall(question, expected)
+                improved = after is not None and after > item["score"] + 1e-9
+                if improved:
+                    fixed += 1
+                details.append({"question": question, "expected": expected,
+                                "before": item["score"], "after": after,
+                                "loss": last_loss, "answer": new_answer})
+            after_scores = [d["after"] for d in details if d["after"] is not None]
+            after = round(float(np.mean(after_scores)), 3) if after_scores else None
+            self.save_net()
+            return {"ok": True, "checked": len(details), "fixed": fixed,
+                    "before": before, "after": after, "details": details}
+
+    def _teacher(self, teacher_url="", model=""):
+        """Учитель для дистилляции: URL текущего бэкенда, если не задан явно."""
+        if not teacher_url:
+            base = getattr(self.backend, "base_url", "")
+            teacher_url = base + "/chat/completions" if base else ""
+        if not teacher_url:
+            return None
+        return HTTPTeacher(teacher_url, model or self.default_model())
+
+    def distill_fix(self, limit=3, iterations=2, threshold=0.7,
+                    teacher_url="", model=""):
+        """Автоисправление через дистилляцию: слабые ответы перепроверяются у LLM.
+
+        Сеть получает ответ учителя как мягкую цель: старый (неверный) вариант
+        ослабляется, ответ LLM закрепляется несколькими шагами дистилляции.
+        Если проверочного набора нет, берутся последние положительные уроки.
+        """
+        try:
+            limit = max(1, min(5, int(limit or 3)))
+        except (TypeError, ValueError):
+            limit = 3
+        try:
+            iterations = max(1, min(10, int(iterations or 2)))
+        except (TypeError, ValueError):
+            iterations = 2
+        with self.lock:
+            weak = self._weak_items(limit, threshold)
+            if not weak:      # запасной вариант: последние подтверждённые уроки
+                seen = set()
+                for e in reversed(self.episodes):
+                    if float(e.get("weight") or 0) <= 0:
+                        continue
+                    q, a = e.get("question", ""), e.get("answer", "")
+                    if not q or not a or q in seen:
+                        continue
+                    seen.add(q)
+                    weak.append({"question": q, "expected": self._keywords(a),
+                                 "score": None, "answer": a})
+                    if len(weak) >= limit:
+                        break
+        if not weak:
+            return {"ok": False, "error": "нет слабых мест и уроков для дистилляции"}
+        try:
+            teacher = self._teacher(teacher_url, model)
+        except Exception as exc:
+            return {"ok": False, "error": f"ошибка создания учителя: {exc}"}
+        if teacher is None:
+            return {"ok": False, "error": "не указан URL учителя (LLM)"}
+
+        details, errors, fixed = [], [], 0
+        for item in weak:
+            question = item["question"]
+            teacher_answer = teacher.answer(question)
+            if not teacher_answer:
+                errors.append(f"{question}: {teacher.error or 'нет ответа'}")
+                continue
+            with self.lock:
+                old = self.net.respond(question, temp=0).text
+                fix_w = self.fix_weight()
+                if old.strip() and old.strip() != teacher_answer.strip():
+                    self.teach(question, old, -fix_w, "distill-wrong", replay=False)
+                last_loss = None
+                for i in range(iterations):
+                    r = self.teach(question, teacher_answer, 1.0, "distill",
+                                   replay=(i == iterations - 1))
+                    if r.get("ok"):
+                        last_loss = r["loss"]
+                self._add_eval(question, teacher_answer)
+                expected = self._keywords(teacher_answer)
+                after, new_answer = self._score_recall(question, expected)
+                improved = item["score"] is None or (after is not None and after > item["score"] + 1e-9)
+                if improved:
+                    fixed += 1
+                details.append({"question": question, "old": old,
+                                "teacher": teacher_answer, "expected": expected,
+                                "before": item["score"], "after": after,
+                                "loss": last_loss, "answer": new_answer})
+        if not details:
+            return {"ok": False, "checked": len(weak), "fixed": 0,
+                    "errors": errors, "error": "учитель не ответил ни на один вопрос"}
+        before_scores = [d["before"] for d in details if d["before"] is not None]
+        after_scores = [d["after"] for d in details if d["after"] is not None]
+        return {"ok": True, "checked": len(weak), "fixed": fixed,
+                "before": round(float(np.mean(before_scores)), 3) if before_scores else None,
+                "after": round(float(np.mean(after_scores)), 3) if after_scores else None,
+                "teacher": getattr(teacher, "model", "") or "", "errors": errors,
+                "details": details}
+
+    def replay_experience(self, limit=8):
+        """Повторить последний опыт: дистиллировать прошлые пары без новых уроков."""
+        with self.lock:
+            return {"ok": True, **self._replay_locked(limit)}
 
     def run_eval(self):
         """Проверка припоминания: доля ожидаемых слов, которые сеть выдаёт на вопрос."""
@@ -351,7 +552,8 @@ class App:
         except Exception as exc:
             return {"ok": False, "error": f"учитель недоступен: {exc}"}
         if not teacher_answer:
-            return {"ok": False, "error": f"пустой ответ учителя: {teacher.error or 'неизвестная ошибка'}"}
+            detail = teacher.error or "модель ответила, но без текста ответа"
+            return {"ok": False, "error": f"пустой ответ учителя: {detail}"}
         lessons = []
         with self.lock:
             for i in range(iterations):
@@ -466,7 +668,30 @@ class App:
     def default_model(self):
         if self.backend.name == "llamacpp":
             return self.settings.get("model") or self.backend.default_rel
-        return self.settings.get("model") or self.backend.default_model
+        # LM Studio: сначала берём модель, которая уже в памяти. Сохранённый
+        # выбор мог остаться от llama.cpp (путь .gguf) — отправка такого id
+        # заставила бы LM Studio загружать другую модель вместо готовой.
+        loaded = getattr(self.backend, "loaded", None)
+        if not loaded:
+            refresh = getattr(self.backend, "refresh_loaded", None)
+            if callable(refresh):
+                try:
+                    loaded = refresh()
+                except Exception:
+                    loaded = None
+        if loaded:
+            return loaded
+        saved = self.settings.get("model") or ""
+        try:
+            available = self.models()
+        except BackendError:
+            return saved or self.backend.default_model
+        if saved and saved in available:
+            return saved
+        fallback = self.backend.default_model
+        if fallback and (not available or fallback in available):
+            return fallback
+        return available[0] if available else (saved or fallback)
 
     def models(self):
         return self.backend.list_models()
@@ -479,8 +704,18 @@ class App:
             models, error = self.models(), None
         except BackendError as exc:
             models, error = [], str(exc)
-        return {"models": models, "loaded": self.backend.loaded,
-                "default": self.default_model(), "desired": self.settings.get("model") or None,
+        loaded = getattr(self.backend, "loaded", None)
+        if error:
+            default = loaded or self.settings.get("model") or self.backend.default_model
+        else:
+            default = self.default_model()
+        desired = self.settings.get("model") or None
+        # Сохранённый id мог быть от другого бэкенда: в списке его нет —
+        # значит, это не «желаемая модель», а устаревшая настройка.
+        if desired and models and desired not in models:
+            desired = None
+        return {"models": models, "loaded": loaded,
+                "default": default, "desired": desired,
                 "backend": self.backend.name, "error": error}
 
     def select_model(self, model, check_only=False):

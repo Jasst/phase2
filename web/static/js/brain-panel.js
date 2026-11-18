@@ -10,7 +10,9 @@
 (function () {
   'use strict';
 
-  const state = { mode: 'llm', autoLearn: true, autoThink: true, last: null, thoughts: [], busy: false };
+  const state = { mode: 'llm', autoLearn: true, autoThink: true, last: null, thoughts: [], busy: false, collapsed: false };
+
+  const COLLAPSE_KEY = 'pulsenet.brainPanel.collapsed';
 
   async function api(path, body) {
     const opt = body === undefined ? { cache: 'no-store' }
@@ -43,23 +45,32 @@
     const chk = el('input', { type: 'checkbox', id: 'bpAutoLearn' });
     learnLbl.append(chk, document.createTextNode(' учить из ответов LLM'));
     const status = el('span', { id: 'bpStatus', class: 'bp-status', role: 'status' });
-    head.append(seg, learnLbl, status);
+    const toggle = el('button', { type: 'button', id: 'bpToggle', class: 'bp-toggle',
+      'aria-expanded': 'true', title: 'Свернуть панель обучения' }, '▾');
+    toggle.setAttribute('aria-label', 'Свернуть панель обучения');
+    head.append(seg, learnLbl, status, toggle);
 
+    const body = el('div', { class: 'bp-body' });
     const last = el('div', { id: 'bpLast', class: 'bp-last' }, 'Пока нет ответа для оценки.');
-    const thoughtsBox = el('div', { id: 'bpThoughts', class: 'bp-thoughts' });
-    const actions = el('div', { class: 'bp-actions' });
+    const actions = el('div', { class: 'bp-actions', role: 'group', 'aria-label': 'Оценка последнего ответа' });
     const bGood = el('button', { type: 'button', id: 'bpGood', title: 'Закрепить этот ответ в сети: связь усилится' }, 'Хороший ответ');
     const bBad = el('button', { type: 'button', id: 'bpBad', class: 'danger',
       title: 'Ответ неверный: связь ослабится, сеть поймёт, что так отвечать не надо' }, 'Плохой ответ');
     const bTeach = el('button', { type: 'button', id: 'bpTeach', title: 'Дать сети урок: этот вопрос и этот ответ' }, 'Обучить');
-    const bFix = el('button', { type: 'button', id: 'bpFix', class: 'danger', title: 'Ответ неверный: введите правильный' }, 'Переучить');
+    const bFix = el('button', { type: 'button', id: 'bpFix', class: 'danger',
+      title: 'Ответ неверный или его нет: введите правильный ответ — сеть переучится' }, 'Переучить');
     const bTrainLLM = el('button', { type: 'button', id: 'bpTrainLLM', class: 'primary',
       title: 'LLM заново ответит на этот вопрос, сеть выучит её ответ несколько раз подряд' }, 'Обучить с LLM');
     const bThink = el('button', { type: 'button', id: 'bpThink',
       title: 'Сеть сама подумает: спонтанная мысль в нарратив, из мыслей растёт сеть' }, 'Подумать');
     actions.append(bGood, bBad, bTeach, bFix, bTrainLLM, bThink);
-    box.append(head, last, thoughtsBox, actions);
+    const thoughtsBox = el('div', { id: 'bpThoughts', class: 'bp-thoughts' });
+    body.append(last, actions, thoughtsBox);
+    box.append(head, body);
     anchor.parentNode.insertBefore(box, anchor);
+
+    try { state.collapsed = localStorage.getItem(COLLAPSE_KEY) === '1'; } catch (_) { /* приватный режим */ }
+    setCollapsed(state.collapsed);
 
     bLlm.addEventListener('click', () => setMode('llm'));
     bNet.addEventListener('click', () => setMode('net'));
@@ -70,7 +81,23 @@
     bFix.addEventListener('click', fixCurrent);
     bTrainLLM.addEventListener('click', () => trainLLMFlow());
     bThink.addEventListener('click', thinkNow);
+    toggle.addEventListener('click', () => setCollapsed(!state.collapsed));
     paintButtons();
+  }
+
+  function setCollapsed(collapsed) {
+    state.collapsed = !!collapsed;
+    const box = document.getElementById('brainPanel');
+    const toggle = document.getElementById('bpToggle');
+    if (!box) return;
+    box.classList.toggle('collapsed', state.collapsed);
+    if (toggle) {
+      toggle.textContent = state.collapsed ? '▸' : '▾';
+      toggle.setAttribute('aria-expanded', String(!state.collapsed));
+      toggle.setAttribute('aria-label', state.collapsed ? 'Развернуть панель обучения' : 'Свернуть панель обучения');
+      toggle.title = state.collapsed ? 'Развернуть панель обучения' : 'Свернуть панель обучения';
+    }
+    try { localStorage.setItem(COLLAPSE_KEY, state.collapsed ? '1' : '0'); } catch (_) { /* приватный режим */ }
   }
 
   function say(text, isError) {
@@ -91,18 +118,33 @@
     llm.classList.toggle('on', state.mode === 'llm');
     net.classList.toggle('on', state.mode === 'net');
     document.getElementById('bpAutoLearn').checked = state.autoLearn;
-    const okQ = !!(state.last && state.last.question) && !state.busy;
-    const ok = okQ && !!state.last.answer;
-    ['bpGood', 'bpBad', 'bpTeach', 'bpFix'].forEach((id) => { document.getElementById(id).disabled = !ok; });
-    document.getElementById('bpTrainLLM').disabled = !okQ;
-    document.getElementById('bpThink').disabled = !!state.busy;
+    const hasQuestion = !!(state.last && state.last.question);
+    const hasAnswer = hasQuestion && !!(state.last && state.last.answer);
+    const busy = !!state.busy;
+    ['bpGood', 'bpBad', 'bpTeach'].forEach((id) => { document.getElementById(id).disabled = busy || !hasAnswer; });
+    document.getElementById('bpFix').disabled = busy || !hasQuestion;   // можно переучить и пустой ответ
+    document.getElementById('bpTrainLLM').disabled = busy || !hasQuestion;
+    document.getElementById('bpThink').disabled = busy;
     const lastBox = document.getElementById('bpLast');
-    if (state.last && state.last.question) {
+    if (hasQuestion) {
       const src = { llm: 'ответ LLM', net: 'ответ сети', manual: 'урок' }[state.last.source] || state.last.source || '';
       lastBox.innerHTML = '';
-      lastBox.append(el('b', {}, 'Вопрос: '), document.createTextNode(state.last.question + ' '));
-      lastBox.append(el('span', { class: 'bp-src' }, '(' + src + ')'));
-      lastBox.append(el('div', { class: 'bp-ans' }, state.last.answer || 'сеть не ответила — дайте урок «Переучить»'));
+      const line = el('div', { class: 'bp-question' });
+      line.append(el('b', {}, 'Вопрос: '), document.createTextNode(state.last.question + ' '));
+      line.append(el('span', { class: 'bp-src' }, '(' + src + ')'));
+      lastBox.append(line);
+      lastBox.append(el('div', { class: 'bp-ans' + (state.last.answer ? '' : ' empty') },
+        state.last.answer || 'сеть не ответила — нажмите «Переучить» и введите правильный ответ'));
+      const meta = [];
+      if (state.last.confidence !== null && state.last.confidence !== undefined) {
+        meta.push('уверенность ' + Math.round(Number(state.last.confidence) * 100) + '%');
+      }
+      if (state.last.self_error !== null && state.last.self_error !== undefined) {
+        meta.push('ошибка самопредсказания ' + state.last.self_error);
+      }
+      if (meta.length) lastBox.append(el('div', { class: 'bp-meta' }, meta.join(' · ')));
+    } else {
+      lastBox.textContent = 'Пока нет ответа для оценки.';
     }
   }
 
@@ -221,10 +263,16 @@
 
   async function fixCurrent() {
     if (!state.last) return;
-    const correct = await window.UI.prompt('Какой ответ правильный? Неверный ответ будет ослаблен.', {
-      title: 'Переучить', okText: 'Переучить', value: '', placeholder: 'Правильный ответ', required: true,
-    });
+    const current = state.last.answer || '';
+    const correct = await window.UI.prompt(
+      current ? 'Исправьте ответ. Неверный вариант будет ослаблен, правильный — закреплён.'
+        : 'Сеть не ответила. Введите правильный ответ — он будет закреплён.',
+      { title: 'Переучить', okText: 'Переучить', value: current, placeholder: 'Правильный ответ', required: true });
     if (!correct) return;
+    if (current && correct.trim() === current.trim()) {
+      say('Ответ не изменился. Для закрепления нажмите «Обучить».', true);
+      return;
+    }
     state.busy = true; paintButtons();
     try {
       await api('/net/feedback', { question: state.last.question, answer: state.last.answer, verdict: 'fix', correct });
@@ -245,10 +293,18 @@
         'Мыслей пока нет: сеть подумает после ответа или по кнопке «Подумать»'));
       return;
     }
-    for (const it of items.slice(0, 3)) {
+    for (const it of items.slice(0, 5)) {
       const src = it.kind === 'turn' ? 'ход' : 'сама';
-      box.append(el('div', { class: 'bp-thought' },
-        el('span', { class: 'bp-thought-kind' }, src + ': '), it.text));
+      const text = String(it.text || '');
+      const row = el('div', { class: 'bp-thought', title: text });
+      row.append(el('span', { class: 'bp-thought-kind' }, src + ': '));
+      row.append(document.createTextNode(text));
+      if (it.t) {
+        const at = new Date(Number(it.t) * 1000);
+        row.append(el('span', { class: 'bp-thought-time' },
+          ' ' + at.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })));
+      }
+      box.append(row);
     }
   }
 
@@ -278,7 +334,9 @@
     const s = document.getElementById(id);
     if (!s) return null;
     return { set(text, isError) { s.textContent = text; s.style.color = isError ? '#f0a09d' : ''; } };
-  }  async function trainLLMFlow(statusId) {
+  }
+
+  async function trainLLMFlow(statusId) {
     const out = statusOut(statusId || 'bpStatus') || { set: (t, e) => say(t, e) };
     let question = state.last && state.last.question;
     if (!question) {
@@ -305,13 +363,21 @@
     finally { state.busy = false; paintButtons(); }
   }
 
-  // Перехват потока чата: берём событие turn из ответа сервера
+  // Перехват потока чата: берём turn, мысли и фазы генерации прямо из SSE.
   function watchChatStream() {
     const orig = window.fetch.bind(window);
     window.fetch = async function (input, init) {
       const url = typeof input === 'string' ? input : (input && input.url) || '';
-      const res = await orig(input, init);
-      if (url.endsWith('/ai/chat') && init && init.method === 'POST' && res.body) {
+      const isChat = url.endsWith('/ai/chat') && init && init.method === 'POST';
+      if (isChat) { state.busy = true; paintButtons(); }
+      let res;
+      try {
+        res = await orig(input, init);
+      } catch (e) {
+        if (isChat) { state.busy = false; paintButtons(); }
+        throw e;
+      }
+      if (isChat && res.body) {
         const reader = res.clone().body.getReader();
         const dec = new TextDecoder();
         let buf = '';
@@ -326,10 +392,17 @@
                 const line = buf.slice(0, i).trim();
                 buf = buf.slice(i + 2);
                 if (!line.startsWith('data:')) continue;
+                const payload = line.slice(5).trim();
+                if (!payload || payload === '[DONE]') continue;
                 try {
-                  const ev = JSON.parse(line.slice(5));
+                  const ev = JSON.parse(payload);
+                  if (ev.gen_phase && ev.gen_phase.phase) say(ev.gen_phase.phase);
+                  if (ev.error) say(String(ev.error), true);
                   if (ev.turn) {
-                    state.last = { question: ev.turn.question, answer: ev.turn.answer, source: ev.turn.source };
+                    state.last = {
+                      question: ev.turn.question, answer: ev.turn.answer, source: ev.turn.source,
+                      confidence: ev.turn.confidence, self_error: ev.turn.self_error,
+                    };
                     paintButtons();
                   }
                   if (ev.thought && ev.thought.text) {
@@ -340,7 +413,10 @@
               }
             }
           } catch (_) { /* поток закрыт */ }
+          finally { state.busy = false; paintButtons(); }
         })();
+      } else if (isChat) {
+        state.busy = false; paintButtons();
       }
       return res;
     };

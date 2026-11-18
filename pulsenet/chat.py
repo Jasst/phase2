@@ -94,7 +94,7 @@ def run(state_dir, teacher=None, show_teacher=False, autosave_every=10,
                 if show_teacher:
                     out(f"[учитель] {t}")
             else:
-                out(f"[учитель недоступен: {teacher.error or 'пустой ответ'}]")
+                out(f"[учитель не прислал текста: {teacher.error or 'пустой ответ'}]")
 
         turns += 1
         if turns % autosave_every == 0:

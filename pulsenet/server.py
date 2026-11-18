@@ -115,29 +115,46 @@ class Handler(BaseHTTPRequestHandler):
         try:
             handler(self, body, query)
         except BackendError as exc:
-            self.send_json({"error": str(exc)}, 503)
-        except BrokenPipeError:
-            self.app.stop_flag = True
+            self._send_error_json({"error": str(exc)}, 503)
+        except ConnectionError:
+            # Клиент закрыл соединение (WinError 10053/10054): это не ошибка
+            # сервера. Молча завершаем запрос, иначе socketserver печатает
+            # длинный traceback и пытается отправить ответ в мёртвый сокет.
+            return
         except Exception as exc:               # не даём серверу упасть из-за одного запроса
-            self.send_json({"error": f"внутренняя ошибка: {exc}"}, 500)
+            self._send_error_json({"error": f"внутренняя ошибка: {exc}"}, 500)
+
+    def _send_error_json(self, obj, status):
+        """Ответ об ошибке не должен шуметь, если клиент уже отключился."""
+        try:
+            self.send_json(obj, status)
+        except OSError:
+            pass
+
+    def _dispatch_safe(self, method):
+        try:
+            self.dispatch(method)
+        except ConnectionError:
+            # Обрыв также возможен при отдаче файла/редиректа — не логируем его.
+            pass
 
     def do_GET(self):
-        self.dispatch("GET")
+        self._dispatch_safe("GET")
 
     def do_POST(self):
-        self.dispatch("POST")
+        self._dispatch_safe("POST")
 
     def do_PUT(self):
-        self.dispatch("PUT")
+        self._dispatch_safe("PUT")
 
     def do_DELETE(self):
-        self.dispatch("DELETE")
+        self._dispatch_safe("DELETE")
 
 
 # ----- обработчики API -----
 
 def _health(h, _b, _q):
-    h.send_json({"ok": True, "backend": h.app.backend.name})
+    h.send_json({"ok": True, "status": "ok", "backend": h.app.backend.name})
 
 
 def _status(h, _b, _q):
@@ -191,7 +208,7 @@ def _chat(h, b, _q):
         app.run_generation(message, b.get("model"), b.get("chat_id"), h.sse)
     except BackendError as exc:
         h.sse({"error": str(exc)})
-    except BrokenPipeError:
+    except ConnectionError:
         app.stop_flag = True
     except Exception as exc:
         h.sse({"error": f"внутренняя ошибка: {exc}"})
@@ -350,6 +367,29 @@ def _net_train_with_llm(h, b, _q):
     h.send_json(result, 200 if result.get("ok") else 400)
 
 
+def _net_autocorrect(h, b, _q):
+    """Автокоррекция: слабые ответы закрепляются повторным обучением без LLM."""
+    result = h.app.autocorrect(b.get("limit", 6), b.get("repeats", 2), b.get("threshold", 0.75))
+    h.send_json(result, 200 if result.get("ok") else 400)
+
+
+def _net_distill(h, b, _q):
+    """Автоисправление через дистилляцию: слабые ответы перепроверяются у LLM."""
+    try:
+        result = h.app.distill_fix(b.get("limit", 3), b.get("iterations", 2),
+                                   b.get("threshold", 0.7), str(b.get("teacher_url", "")),
+                                   b.get("model", ""))
+    except Exception as exc:
+        return h.send_json({"ok": False, "error": f"ошибка дистилляции: {exc}"}, 500)
+    h.send_json(result, 200 if result.get("ok") else 400)
+
+
+def _net_replay(h, b, _q):
+    """Повторить последний опыт и закрепить связи прошлых уроков."""
+    result = h.app.replay_experience(b.get("limit", 8))
+    h.send_json(result, 200 if result.get("ok") else 400)
+
+
 def _net_episodes(h, _b, q):
     try:
         limit = max(1, min(500, int((q.get("limit") or ["50"])[0])))
@@ -400,6 +440,9 @@ ROUTES = {
     ("POST", "/net/feedback"): _net_feedback,
     ("POST", "/net/eval"): _net_eval,
     ("POST", "/net/train-with-llm"): _net_train_with_llm,
+    ("POST", "/net/autocorrect"): _net_autocorrect,
+    ("POST", "/net/distill"): _net_distill,
+    ("POST", "/net/replay"): _net_replay,
     ("GET", "/net/tuning"): _net_tuning_get,
     ("POST", "/net/tuning"): _net_tuning_set,
     ("GET", "/net/episodes"): _net_episodes,

@@ -102,6 +102,12 @@ body[data-fs="l"] { --chat-fs: 17px; }
 
 /* ---------- сообщения ---------- */
 .messages { flex: 1; overflow-y: auto; padding: 22px 16px 10px; position: relative; }
+/* Глобальный style.css задаёт .messages scroll-behavior: smooth. Для ленты чата
+   это вредно: во время стрима scrollTop выставляется на каждый токен, smooth-
+   анимация каждый раз перезапускается, лента не успевает за текстом и конец
+   ответа уходит ниже видимой области. Прокрутку ведём мгновенно (кнопка «вниз»
+   отдельно просит behavior: smooth из JS). */
+.messages { scroll-behavior: auto; }
 .msgs-inner {
   max-width: 780px; min-height: 100%; margin: 0 auto;
   display: flex; flex-direction: column; gap: 18px;

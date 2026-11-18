@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>Сеть импульсов</title>
   <link rel="stylesheet" href="/static/network.css">
+  <link rel="stylesheet" href="/static/ui.css">
 </head>
 <body>
 <header class="top">
@@ -37,6 +38,15 @@
       Круг — ансамбль (группа слов с похожим окружением). Стрелка — направленная связь:
       импульс идёт от одного ансамбля к другому. Чем толще стрелка, тем сильнее связь.
     </p>
+    <div class="neuron-tools">
+      <div class="neuron-tools-head">Функции работы с нейронами</div>
+      <div class="row">
+        <button id="btnAutocorrect" type="button" title="Найти слабые места сети и закрепить правильные ответы повторным обучением — без LLM">Автокоррекция</button>
+        <button id="btnDistill" type="button" title="Слабые ответы перепроверить у LLM и передать сети через дистилляцию">Автоисправление (дистилляция)</button>
+        <button id="btnReplay" type="button" title="Повторить последний опыт: закрепить связи прошлых уроков">Повторить опыт</button>
+      </div>
+      <div id="neuronResult" class="result small muted"></div>
+    </div>
   </section>
 
   <aside class="side">
@@ -65,6 +75,27 @@
     </section>
 
     <section class="panel">
+      <h2>Оценка ответа сети</h2>
+      <p class="muted small">Кнопки действуют на последний ответ из блока «Импульс».</p>
+      <div id="lastTurn" class="last-turn muted">Сначала задайте вопрос и пустите импульс.</div>
+      <div class="grade-actions" role="group" aria-label="Оценка последнего ответа">
+        <button id="gradeGood" type="button" disabled title="Закрепить этот ответ в сети">Хороший ответ</button>
+        <button id="gradeBad" type="button" class="danger" disabled title="Ослабить эту связь: так отвечать не надо">Плохой ответ</button>
+        <button id="gradeTeach" type="button" disabled title="Дать урок: этот вопрос и этот ответ">Обучить</button>
+        <button id="gradeFix" type="button" class="danger" disabled title="Ввести правильный ответ и переучить сеть">Переучить</button>
+        <button id="gradeTrainLLM" type="button" class="primary" disabled title="LLM ответит заново, сеть выучит этот ответ">Обучить с LLM</button>
+        <button id="gradeThink" type="button" title="Спонтанная мысль сети во внутренний нарратив">Подумать</button>
+      </div>
+      <div id="gradeStatus" class="result small muted"></div>
+    </section>
+
+    <section class="panel thoughts-panel">
+      <h2>Поток мыслей сети</h2>
+      <p class="muted small">Внутренний нарратив: из мыслей сеть тоже учится. Записи полупрозрачны, чтобы не отвлекать от ответа.</p>
+      <div id="thoughts" class="thoughts"></div>
+    </section>
+
+    <section class="panel">
       <h2>Развитие по урокам</h2>
       <svg id="chart" role="img" aria-label="График развития сети"></svg>
       <div id="chartLegend" class="legend small"></div>
@@ -79,6 +110,7 @@
   </aside>
 </main>
 
+<script src="/static/js/ui.js"></script>
 <script src="/static/js/network.js"></script>
 </body>
 </html>

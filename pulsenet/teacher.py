@@ -42,10 +42,14 @@ class HTTPTeacher(Teacher):
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            text = data["choices"][0]["message"]["content"]
+            raw = data["choices"][0]["message"]["content"] or ""
         except (OSError, KeyError, IndexError, TypeError, ValueError) as exc:
             self.error = str(exc)
             return None
         self.error = None
-        text = _THINK.sub("", text or "").strip()
+        text = _THINK.sub("", raw).strip()
+        if not text and raw.strip():
+            # Модель ответила, но только рассуждениями (без видимого текста):
+            # не выбрасываем ответ целиком — сеть всё равно может использовать его как цель.
+            text = raw.strip()
         return text or None

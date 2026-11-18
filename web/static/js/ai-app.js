@@ -1068,7 +1068,15 @@ function skipToolsBtn() {
   function scrollEnd(force) {
     if (!force && !settings.autoScroll) return;   // настройка: никогда не прокручать само
     if (!force && !isNearBottom()) return;        // пользователь читает выше — не тянем вниз
-    els.messages.scrollTop = els.messages.scrollHeight;
+    // Во время стрима прокрутка обязана быть мгновенной. Если на .messages
+    // действует scroll-behavior: smooth, каждое присваивание scrollTop
+    // запускает новую анимацию, текст растёт быстрее ленты и конец ответа
+    // остаётся вне экрана. Явный inline auto отключает smooth на один шаг.
+    const box = els.messages;
+    const prev = box.style.scrollBehavior;
+    box.style.scrollBehavior = 'auto';
+    box.scrollTop = box.scrollHeight;
+    box.style.scrollBehavior = prev;
     updateScrollButton();
   }
 
@@ -1080,6 +1088,11 @@ function skipToolsBtn() {
   }
 
   function renderMessages(opts = {}) {
+    // Запоминаем прилипание к дну ДО пересборки. Завершение ответа и
+    // синхронизация вызывают renderMessages({scroll:false}); без этого
+    // scrollTop оставался на старой высоте, а готовый ответ оказывался ниже
+    // видимой области (и под полем ввода).
+    const wasAtBottom = isNearBottom();
     els.inner.innerHTML = '';
     const msgs = currentId ? loadMsgs(currentId) : [];
     if (!msgs.length) {
@@ -1087,7 +1100,7 @@ function skipToolsBtn() {
       return;
     }
     msgs.forEach((m, i) => els.inner.appendChild(buildMessage(m, i)));
-    if (opts.scroll !== false) scrollEnd(true);
+    if (opts.scroll !== false || wasAtBottom) scrollEnd(true);
     else updateScrollButton();
   }
 
@@ -2239,7 +2252,9 @@ refreshUI();
     try {
       const r = await fetch(API.health, { cache: 'no-store' });
       const j = r.ok ? await r.json() : null;
-      setStatus(j && j.status === 'ok' ? 'ok' : 'bad');
+      // /health отвечает {"ok": true, ...}; поддерживаем и старый {"status": "ok"}
+      const alive = !!(j && (j.ok === true || j.status === 'ok'));
+      setStatus(alive ? 'ok' : 'bad');
     } catch {
       setStatus('bad');
     }

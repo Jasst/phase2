@@ -135,16 +135,64 @@ class LMStudioBackend(OpenAICompat):
         self.default_model = env.get("LMSTUDIO_MODEL", "").strip()
         self.loaded = None
 
+    def _root_url(self):
+        return self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+
+    def _loaded_ids(self):
+        """id моделей, реально находящихся в памяти (REST API LM Studio)."""
+        try:
+            data = http_json(self._root_url() + "/api/v0/models", timeout=5)
+        except (OSError, ValueError):
+            return None
+        ids = []
+        for m in data.get("data", []):
+            if not isinstance(m, dict) or not m.get("id"):
+                continue
+            if m.get("state") not in ("loaded", "loading"):
+                continue
+            if m.get("type") == "embeddings":
+                continue
+            ids.append(m["id"])
+        return ids
+
+    def refresh_loaded(self):
+        """Обновить `loaded` по фактическому состоянию LM Studio.
+
+        Не полагаемся на сохранённый выбор модели: он мог остаться от другого
+        бэкенда (например, путь .gguf), и запрос к LM Studio загрузил бы
+        совсем не ту модель, что уже находится в памяти.
+        """
+        ids = self._loaded_ids()
+        if ids is None:      # старые версии: state есть только в /v1/models
+            try:
+                data = http_json(self.base_url + "/models", timeout=5)
+            except (OSError, ValueError):
+                return self.loaded
+            known = [m for m in data.get("data", [])
+                     if isinstance(m, dict) and m.get("id") and "state" in m]
+            if not known:
+                return self.loaded
+            ids = [m["id"] for m in known if m.get("state") == "loaded"]
+        self.loaded = ids[0] if ids else None
+        return self.loaded
+
     def list_models(self):
         try:
             data = http_json(self.base_url + "/models", timeout=5)
         except (OSError, ValueError) as exc:
             raise BackendError(f"LM Studio недоступен по адресу {self.base_url}: {exc}") from exc
+        self.refresh_loaded()
         return [m["id"] for m in data.get("data", []) if "id" in m]
 
     def ensure(self, model, params=None):
-        self.loaded = model or self.default_model
-        return self.loaded
+        target = (model or "").strip()
+        if target:
+            self.loaded = target
+            return target
+        loaded = self.refresh_loaded()
+        target = loaded or self.default_model
+        self.loaded = target or None
+        return target
 
     def stop(self):
         self.loaded = None
