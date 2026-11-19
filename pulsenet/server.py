@@ -316,8 +316,31 @@ def _net_restore(h, _b, _q):
     h.send_json(result, 200 if result.get("ok") else 400)
 
 
+def _net_reason(h, b, _q):
+    """Проактивное рассуждение: импульсы с торможением и слепками мыслей."""
+    h.send_json(h.app.reason_step((b or {}).get("steps")))
+
+
+def _net_voice(h, b, _q):
+    """Внутренний голос: ответ пользователю из слепков мыслей."""
+    h.send_json(h.app.voice((b or {}).get("question", "")))
+
+
+def _net_plan(h, b, _q):
+    """Планирование: варианты мыслей, оценка и ответ из лучшего."""
+    result = h.app.plan((b or {}).get("question", ""))
+    h.send_json(result, 200 if result.get("ok") else 400)
+
+
+def _net_plan_feedback(h, b, _q):
+    """Оценка последнего плана: негатив ослабляет цепочку назад по импульсу."""
+    result = h.app.plan_feedback((b or {}).get("verdict", ""))
+    h.send_json(result, 200 if result.get("ok") else 400)
+
+
 def _net_mode(h, b, _q):
-    result = h.app.set_mode(b.get("mode"), b.get("auto_learn"), b.get("auto_think"))
+    result = h.app.set_mode(b.get("mode"), b.get("auto_learn"), b.get("auto_think"), b.get("proactive"),
+                            b.get("net_answer"))
     h.send_json(result, 200 if result.get("ok") else 400)
 
 
@@ -437,6 +460,10 @@ ROUTES = {
     ("POST", "/net/mode"): _net_mode,
     ("GET", "/net/thoughts"): _net_thoughts,
     ("POST", "/net/thoughts/step"): _net_think,
+    ("POST", "/net/reason"): _net_reason,
+    ("POST", "/net/voice"): _net_voice,
+    ("POST", "/net/plan"): _net_plan,
+    ("POST", "/net/plan/feedback"): _net_plan_feedback,
     ("POST", "/net/feedback"): _net_feedback,
     ("POST", "/net/eval"): _net_eval,
     ("POST", "/net/train-with-llm"): _net_train_with_llm,

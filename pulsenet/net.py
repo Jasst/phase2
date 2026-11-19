@@ -16,6 +16,7 @@ import numpy as np
 from .chain import Chain
 from .config import Config
 from .cortex import Cortex
+from .imprints import ImprintCache
 from .vocab import EOS_ID, Vocab, detokenize, split_sentences, tokenize
 
 
@@ -41,6 +42,11 @@ class BrainNet:
         self.thought = None         # текущая мысль (распределение по ансамблям), переживает ходы
         self.self_errors = []       # история ошибок самопредсказания
         self.buffer = []            # опыт: [(вопрос, ответ, вес)] для повторения
+        # память порядка: «слово → какие слова шли за ним» (цепочки нейронов-слов).
+        # trans1[a][b] — сколько раз b шло за a; trans2[(a, b)][c] — c шло за парой a, b.
+        self.trans1 = {}
+        self.trans2 = {}
+        self.imprints = ImprintCache(self.cfg)   # слепки мыслей: кратко- и долговременная память
         self.updates = 0            # все внутренние обновления (включая повтор опыта)
         self.lessons = 0            # реальные уроки: teach() и предобучение, без повтора
         self.last_loss = None
@@ -72,6 +78,48 @@ class BrainNet:
     def _norm(v):
         t = v.sum()
         return v / t if t > 1e-12 else v
+
+    @staticmethod
+    def _bump(table, key, nxt, w):
+        d = table.setdefault(key, {})
+        v = d.get(nxt, 0.0) + w
+        if v <= 1e-6:                       # отрицательная обратная связь стирает переход
+            d.pop(nxt, None)
+            if not d:
+                table.pop(key, None)
+        else:
+            d[nxt] = v
+
+    def _trans_update(self, seq, weight):
+        """Учёт порядка слов: каждый переход seq[i]→seq[i+1] и тройка (seq[i-1], seq[i])→seq[i+1]."""
+        for i in range(len(seq) - 1):
+            a, b = seq[i], seq[i + 1]
+            self._bump(self.trans1, a, b, weight)
+            if i >= 1:
+                self._bump(self.trans2, (seq[i - 1], a), b, weight)
+
+    def _trans_dist(self, hist, V):
+        """Распределение следующего слова по цепочкам (триграмма с биграммой) или None."""
+        cfg = self.cfg
+        p = np.zeros(V)
+        got = False
+
+        def add(d, w):
+            tot = sum(d.values())
+            for k, v in d.items():
+                if k < V:
+                    p[k] += w * v / tot
+
+        if len(hist) >= 2:
+            d = self.trans2.get((hist[-2], hist[-1]))
+            if d:
+                add(d, cfg.trans_tri_w)
+                got = True
+        d = self.trans1.get(hist[-1])
+        if d:
+            add(d, (1.0 - cfg.trans_tri_w) if got else 1.0)
+            got = True
+        return p if got else None
 
     def _advance(self, s, k_e, anchor, visited):
         """Один шаг импульса: из ансамбля k_e (с подмесью вопроса) по цепи."""
@@ -132,6 +180,7 @@ class BrainNet:
         cx.attach_seq(q)
         cx.attach_seq(a)
 
+        self._trans_update([q[-1]] + a, weight)
         cx.cooccur(q, weight, V)
         cx.cooccur(a, weight, V)
         cx.update_profiles(q, weight)
@@ -177,13 +226,62 @@ class BrainNet:
         if loss is None:
             return None
         self.lessons += 1
+        if weight > 0:
+            # подтверждённый урок оставляет слепок: важные уроки защищаются от забывания
+            a_ids = [i for i in self.vocab.encode(tokenize(answer), grow=False)]
+            self.imprints.add(a_ids, min(1.0, 0.5 + 0.25 * weight))
+            while self.imprints.due():
+                self.consolidate()
         self.buffer.append((question, answer, weight))
         del self.buffer[:-self.cfg.replay_size]
         if replay and len(self.buffer) > 1:
             for idx in self.rng.integers(0, len(self.buffer) - 1, size=self.cfg.replay_n):
                 q, a, w = self.buffer[int(idx)]
                 self.learn(q, a, w * self.cfg.replay_weight)
+        if replay:
+            self.replay_protected()
         return loss
+
+    def replay_protected(self):
+        """Защита от забывания: важные консолидированные мысли повторяются, их цепочки
+        закрепляются в явном виде (счётчики не перезаписываются градиентом)."""
+        for lt in self.imprints.replay_pick(self.cfg.replay_protected, self.rng):
+            w = lt.importance * self.cfg.replay_weight
+            self._trans_update(list(lt.words) + [EOS_ID], w)
+
+    def prune_transitions(self, max_next=30, min_count=0.5):
+        """Прореживание памяти порядка: у каждого слова оставляем max_next сильнейших
+        продолжений, слабее min_count — удаляем. Редкие однократные переходы почти не
+        влияют на ответ, а раздувают файл. Возвращает число удалённых записей."""
+        removed = 0
+        for table in (self.trans1, self.trans2):
+            for key in list(table):
+                d = table[key]
+                before = len(d)
+                for k in [k for k, v in d.items() if v < min_count]:
+                    del d[k]
+                if len(d) > max_next:
+                    keep = sorted(d.items(), key=lambda kv: -kv[1])[:max_next]
+                    d.clear()
+                    d.update(keep)
+                removed += before - len(d)
+                if not d:
+                    del table[key]
+        return removed
+
+    def consolidate(self):
+        """Каждые imprint_batch слепков: дедупликация и конкатенация в одну цепочку.
+        Цепочка закрепляется в памяти порядка и уходит в долговременную память."""
+        batch = self.imprints.take_batch()
+        if not batch:
+            return None
+        chain = self.imprints.concat(batch)
+        importance = sum(i.importance for i in batch) / len(batch)
+        if len(chain) >= 2:
+            self._trans_update(chain + [EOS_ID], self.cfg.consolidate_weight * importance)
+        self.imprints.store_longterm(chain, importance)
+        self.imprints.decay()
+        return chain
 
     def pretrain(self, text, weight=0.5, epochs=None):
         """Предобучение на тексте: предыдущее предложение — вопрос, следующее — ответ."""
@@ -221,12 +319,13 @@ class BrainNet:
         settled = self._settle(focus, anchor)
         prediction = self.chain.hop(settled, np.zeros(cx.cap), cfg.chain_topk)   # что сеть ждёт дальше
         # говорим из фокуса (сохраняет первое слово вопроса), уверенность берём из устаканенной мысли
-        s = focus
+        s = anchor if cfg.align_start else focus     # согласовано с обучением (learn стартует из якоря)
 
         K, V = cx.cap, len(self.vocab)
         visited, last = np.zeros(K), q[-1]
         out, path, recent = [], [], []
         act = np.zeros(K)
+        hist = [q[-1]]                       # цепочка: последнее слово вопроса, далее — ответ
         for t in range(max_tokens):
             ctx = (cfg.alpha * (cx.M.T @ s) + (1 - cfg.alpha) * cx.E[last]).astype(np.float32)
             logits = (cx.O[:V] @ ctx).astype(np.float64)
@@ -234,6 +333,10 @@ class BrainNet:
             logits -= cfg.freq_penalty * freq
             mass = np.where(cx.label[:V] >= 0, s[np.maximum(cx.label[:V], 0)], 0.0)
             logits += cfg.ensemble_gain * np.log(mass + 1e-3)
+            tp = self._trans_dist(hist, V)
+            if tp is not None and cfg.trans_gain > 0:
+                # память порядка: продолжение из уроков важнее общей ассоциации
+                logits += cfg.trans_gain * np.log(tp + cfg.trans_floor)
             for r in set(recent[-cfg.no_repeat:]):
                 logits[r] = -np.inf if r != EOS_ID else logits[r]
             if t == 0:
@@ -252,6 +355,7 @@ class BrainNet:
                 break
             out.append(tok)
             recent.append(tok)
+            hist.append(tok)
             k_e = cx.cluster_of(tok)
             if k_e >= 0:
                 act[k_e] += 1.0
@@ -274,6 +378,10 @@ class BrainNet:
         else:
             self.thought = settled
         confidence = round(float(settled.max()), 4)
+        if out:
+            self.imprints.add(out, confidence)     # импульс оставляет слепок мысли
+            while self.imprints.due():
+                self.consolidate()
         text = detokenize([self.vocab.words[i] for i in out]) if confidence >= cfg.min_confidence else ""
         return Reply(text, path, confidence, self_error, self.top_focus(), known=True)
 
@@ -367,6 +475,7 @@ class BrainNet:
     def stats(self):
         return {"слов": len(self.vocab) - 1, "ансамблей": len(self.cortex.members),
                 "связей": self.chain.edges(), "уроков": self.lessons,
+                "переходов": len(self.trans1),
                 "в_памяти_опыта": len(self.buffer), "ёмкость": self.cortex.cap}
 
     def clusters(self):

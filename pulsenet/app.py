@@ -22,6 +22,8 @@ from . import store
 from .config import Config
 from .llm import PARAM_DEFAULTS, BackendError, make_backend
 from .teacher import HTTPTeacher
+from .reasoning import Reasoner
+from .planner import Planner
 from .net import BrainNet
 from .thoughts import ThoughtStream
 from .vocab import tokenize
@@ -57,6 +59,11 @@ def _write_json(path, obj):
     os.replace(tmp, path)
 
 
+def detok(net, word_ids):
+    from .vocab import detokenize
+    return detokenize([net.vocab.words[i] for i in word_ids])
+
+
 class App:
     def __init__(self, env, data_dir="data"):
         self.env = env
@@ -64,13 +71,18 @@ class App:
         self.state_dir = os.path.join(data_dir, "net")
         os.makedirs(data_dir, exist_ok=True)
         self.lock = threading.RLock()
-        self.backend = make_backend(env)
+        # Запуск/перезапуск llama-server длится до 240 с. Держим его под отдельным
+        # замком, а не под self.lock, иначе интерфейс (состояние, модели) зависает.
+        self.backend_lock = threading.Lock()
+        self.backend = make_backend(env, data_dir=data_dir)
         self.net = self._load_net()
         self.settings = _read_json(os.path.join(data_dir, "model_settings.json"),
                                    {"model": "", "params": {}})
         self.settings.setdefault("mode", "llm")
         self.settings.setdefault("auto_learn", True)
         self.settings.setdefault("auto_think", True)
+        self.settings.setdefault("proactive", False)
+        self.settings.setdefault("net_answer", "plan")  # «Моя модель» отвечает планировщиком    # проактивный внутренний голос после каждого хода
         self.ui = _read_json(os.path.join(data_dir, "ui_state.json"), {"updated": 0})
         self.history = _read_json(os.path.join(data_dir, "history.json"), {})
         self.thoughts = ThoughtStream(os.path.join(data_dir, "thoughts.json"))
@@ -95,6 +107,7 @@ class App:
 
     def save_net(self):
         with self.lock:
+            self.net.prune_transitions()          # память порядка не раздувается без границы
             store.save(self.net, self.state_dir)
             self.last_saved = self._mtime()
 
@@ -422,7 +435,11 @@ class App:
             _write_json(os.path.join(self.data_dir, "dev_history.json"), self.dev)
         return {"score": score, "count": len(details), "details": details}
 
-    def set_mode(self, mode=None, auto_learn=None, auto_think=None):
+    def set_mode(self, mode=None, auto_learn=None, auto_think=None, proactive=None, net_answer=None):
+        if net_answer is not None:
+            if net_answer not in ("plan", "respond"):
+                return {"ok": False, "error": "net_answer: plan или respond"}
+            self.settings["net_answer"] = net_answer
         if mode is not None:
             if mode not in ("llm", "net"):
                 return {"ok": False, "error": "mode: llm или net"}
@@ -431,10 +448,13 @@ class App:
             self.settings["auto_learn"] = bool(auto_learn)
         if auto_think is not None:
             self.settings["auto_think"] = bool(auto_think)
+        if proactive is not None:
+            self.settings["proactive"] = bool(proactive)
         self._save_settings()
         return {"ok": True, "mode": self.settings["mode"],
                 "auto_learn": self.settings["auto_learn"],
-                "auto_think": self.settings["auto_think"]}
+                "auto_think": self.settings["auto_think"],
+                "proactive": self.settings["proactive"], "net_answer": self.settings["net_answer"]}
 
 
     # ---------- параметры сети (страница настроек) ----------
@@ -575,7 +595,13 @@ class App:
             item = self.thoughts.push(summary, "turn")
             if item:
                 emit({"thought": item})
-            if self.settings.get("auto_think", True):
+            if self.settings.get("proactive", False):
+                # проактивный режим: внутренний голос сам развивает мысль с торможением и слепками
+                emit({"gen_phase": {"phase": "Сеть рассуждает"}})
+                for text in Reasoner(self.net).run():
+                    self._learn_thought(text, emit)
+                    changed = True
+            elif self.settings.get("auto_think", True):
                 emit({"gen_phase": {"phase": "Сеть думает сама"}})
                 text = self.net.think()
                 if text:
@@ -619,6 +645,60 @@ class App:
             if made:
                 self.save_net()
         return {"ok": True, "thoughts": made, "narrative": self.thoughts.recent(8)}
+
+    def reason_step(self, steps=None):
+        """Ручной проактивный шаг: несколько импульсов с торможением, каждый оставляет слепок."""
+        with self.lock:
+            made = []
+            for text in Reasoner(self.net).run(steps=min(5, int(steps or 3))):
+                if self._learn_thought(text) is not None:
+                    made.append(text)
+            if made:
+                self.save_net()
+            return {"ok": True, "thoughts": made, "imprints": self.imprints_state(),
+                    "narrative": self.thoughts.recent(8)}
+
+    def voice(self, question):
+        """Внутренний голос: ответ, собранный из слепков мыслей."""
+        with self.lock:
+            reply = Reasoner(self.net).inner_voice(str(question or "").strip())
+            return {"ok": True, "text": reply.text, "confidence": reply.confidence,
+                    "imprints": self.imprints_state()}
+
+    def plan(self, question):
+        """Думаем, потом отвечаем: варианты мыслей, их оценка и ответ из лучшего варианта."""
+        with self.lock:
+            question = str(question or "").strip()
+            if not question:
+                return {"ok": False, "error": "пустой вопрос"}
+            plan = Planner(self.net).think(question)
+            self._last_plan = plan                 # для оценки «хорошо/плохо» следующим запросом
+            for text in plan.thoughts:
+                self.thoughts.push(text, "plan")
+            self.save_net()
+            return {"ok": True, "answer": plan.answer, "confidence": plan.confidence,
+                    "thoughts": [{"text": c.text, "score": c.score, "relevance": c.relevance,
+                                  "coherence": c.coherence} for c in plan.candidates],
+                    "focus": plan.focus, "imprints": self.imprints_state()}
+
+    def plan_feedback(self, verdict):
+        """Оценка последнего плана: коррекция идёт назад по цепочке импульса."""
+        with self.lock:
+            if verdict not in ("good", "bad"):
+                return {"ok": False, "error": "verdict: good или bad"}
+            planner = Planner(self.net)
+            planner.last_plan = getattr(self, "_last_plan", None)
+            result = planner.feedback(verdict)
+            if result.get("ok"):
+                self.save_net()
+            return result
+
+    def imprints_state(self):
+        imp = self.net.imprints
+        top = sorted(imp.longterm, key=lambda i: -i.importance)[:5]
+        return {"short": len(imp.short), "pending": len(imp.pending), "longterm": len(imp.longterm),
+                "protected": sum(1 for i in imp.longterm if i.importance >= self.net.cfg.protect_at),
+                "top": [{"text": detok(self.net, i.words), "importance": round(i.importance, 3)} for i in top]}
 
     def thoughts_state(self):
         with self.lock:
@@ -725,7 +805,7 @@ class App:
             raise BackendError(f"модель не найдена в списке: {model!r}")
         self.settings["model"] = model
         self._save_settings()
-        with self.lock:
+        with self.backend_lock:
             self.backend.ensure(model, self.params_for(model))
         return {"ok": True, "loaded": self.backend.loaded}
 
@@ -747,7 +827,7 @@ class App:
         return {"ok": True, "restart_needed": self.backend.loaded == model}
 
     def unload(self):
-        with self.lock:
+        with self.backend_lock:
             self.backend.stop()
         return {"ok": True}
 
@@ -772,8 +852,24 @@ class App:
         turns = self.history.get(chat_id or "default", [])[-CONTEXT_TURNS * 2:]
         return [{"role": t["role"], "content": t["content"]} for t in turns]
 
+    def _plan_reply(self, message):
+        """Ответ «Моя модель» через планировщик: варианты уходят в поток мыслей."""
+        with self.lock:
+            plan = Planner(self.net).think(message)
+            self._last_plan = plan                 # для оценки «хорошо/плохо»
+            for text in plan.thoughts:
+                self.thoughts.push(text, "plan")
+            best = plan.candidates[0] if plan.candidates else None
+            names = {"<eos>": "конец"}
+            path = [{"word": names.get(self.net.vocab.words[w], self.net.vocab.words[w]),
+                     "ensemble": int(self.net.cortex.cluster_of(w)), "mass": 1.0}
+                    for w in (best.words if best else [])]
+            return {"text": plan.answer, "confidence": plan.confidence, "self_error": None,
+                    "known": bool(plan.candidates), "focus": self.focus_words(), "path": path}
+
     def run_generation(self, message, model, chat_id, emit):
-        reply = self.respond(message)
+        use_plan = self.settings["mode"] == "net" and self.settings.get("net_answer", "plan") == "plan"
+        reply = self._plan_reply(message) if use_plan else self.respond(message)
         emit({"gen_phase": {"phase": "Мысль и импульс сети"}})
         for step in reply["path"][:30]:
             emit({"trace": {"net": "pulsenet", "word": step["word"],
@@ -795,7 +891,7 @@ class App:
         else:
             rel = model or self.default_model()
             emit({"gen_phase": {"phase": f"Ответ модели ({self.backend.name})"}})
-            with self.lock:
+            with self.backend_lock:
                 self.backend.ensure(rel, self.params_for(rel))
             parts = []
 

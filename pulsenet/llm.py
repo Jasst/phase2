@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import time
+import urllib.error
 import urllib.request
 
 LLAMACPP_PORT_DEFAULT = 8090
@@ -44,6 +45,23 @@ def http_json(url, body=None, timeout=10):
                                  method="POST" if data is not None else "GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def _error_detail(exc):
+    """Текст ошибки HTTP из ответа сервера: LM Studio и llama-server пишут причину в теле."""
+    try:
+        body = exc.read().decode("utf-8", "replace")
+    except (OSError, AttributeError):
+        body = ""
+    try:
+        msg = json.loads(body).get("error")
+        if isinstance(msg, dict):
+            msg = msg.get("message")
+        if msg:
+            return str(msg)
+    except (ValueError, AttributeError):
+        pass
+    return body.strip()[:300] or str(exc.reason)
 
 
 class ThinkSplitter:
@@ -94,7 +112,9 @@ class OpenAICompat:
                                      headers={"Content-Type": "application/json"}, method="POST")
         try:
             resp = urllib.request.urlopen(req, timeout=600)
-        except OSError as exc:
+        except urllib.error.HTTPError as exc:        # сервер ответил, но с ошибкой
+            raise BackendError(f"{self.name} ответил ошибкой {exc.code}: {_error_detail(exc)}") from exc
+        except OSError as exc:                       # сервер не отвечает вовсе
             raise BackendError(f"нет связи с LLM ({self.name}): {exc}") from exc
         splitter = ThinkSplitter()
         with resp:
@@ -184,9 +204,22 @@ class LMStudioBackend(OpenAICompat):
         self.refresh_loaded()
         return [m["id"] for m in data.get("data", []) if "id" in m]
 
+    def _known_ids(self):
+        """Все id, которые LM Studio принимает в запросе (включая ещё не загруженные)."""
+        try:
+            data = http_json(self.base_url + "/models", timeout=5)
+        except (OSError, ValueError) as exc:
+            raise BackendError(f"LM Studio недоступен по адресу {self.base_url}: {exc}") from exc
+        return [m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+
     def ensure(self, model, params=None):
         target = (model or "").strip()
         if target:
+            # Модель из настроек другого бэкенда (например, путь .gguf из llama.cpp)
+            # LM Studio не знает: без проверки запрос упал бы с непонятной ошибкой.
+            if target not in self._known_ids():
+                raise BackendError(f"модель {target!r} не найдена в LM Studio: выберите модель "
+                                   f"из списка или загрузите её в LM Studio")
             self.loaded = target
             return target
         loaded = self.refresh_loaded()
@@ -205,7 +238,7 @@ class LlamaCppBackend(OpenAICompat):
     name = "llamacpp"
     editable = True
 
-    def __init__(self, env, models_dir_default="models"):
+    def __init__(self, env, models_dir_default="models", log_dir="data"):
         self.bin = env.get("LLAMACPP_SERVER_BIN", "llama-server").strip()
         self.models_dir = env.get("MODELS_DIR", models_dir_default).strip()
         self.port = int(env.get("LLAMACPP_PORT", LLAMACPP_PORT_DEFAULT))
@@ -214,7 +247,7 @@ class LlamaCppBackend(OpenAICompat):
         self.autostart = _flag(env.get("LLAMACPP_AUTOSTART"), default=True)
         self.cuda_order = env.get("LLAMACPP_CUDA_DEVICE_ORDER", "PCI_BUS_ID").strip()
         self.extra_args = env.get("LLAMACPP_EXTRA_ARGS", "").split()
-        self.log_path = os.path.join(models_dir_default, "llama-server.log")
+        self.log_path = os.path.join(log_dir, "llama-server.log")
         self.proc = None
         self.loaded = None          # относительный путь модели, которая сейчас запущена
         self.external = False       # сервер запущен не нами (его не перезапускаем)
@@ -255,7 +288,7 @@ class LlamaCppBackend(OpenAICompat):
         if int(p["threads"]) > 0:
             args += ["-t", str(int(p["threads"]))]
         if p["flash_attn"]:
-            args += ["-fa"]
+            args += ["-fa", "on"]       # новые сборки llama-server требуют значение: on|off|auto
         if str(p["tensor_split"]).strip():
             args += ["-ts", str(p["tensor_split"]).strip()]
         return args + self.extra_args
@@ -323,11 +356,11 @@ class LlamaCppBackend(OpenAICompat):
                 "external": self.external, "models_dir": self.models_dir}
 
 
-def make_backend(env=None):
+def make_backend(env=None, data_dir="data"):
     env = os.environ if env is None else env
     name = env.get("LLM_BACKEND", "llamacpp").strip().lower()
     if name == "llamacpp":
-        return LlamaCppBackend(env)
+        return LlamaCppBackend(env, log_dir=data_dir)
     if name == "lmstudio":
         return LMStudioBackend(env)
     raise BackendError(f"неизвестный LLM_BACKEND={name!r}: допустимо llamacpp или lmstudio")

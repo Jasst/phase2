@@ -7,7 +7,7 @@ arrays.npz — веса и структура:
   T         — матрица направленных связей между ансамблями (cap × cap);
   thought   — текущая мысль (распределение по ансамблям), если есть.
 meta.json — словарь, частоты, профили соседей, конфиг, буфер опыта, счётчики,
-            ёмкость ансамблей и история самопредсказания.
+            ёмкость ансамблей, история самопредсказания и цепочки слов (trans1, trans2).
 Запись атомарная. Старые версии (2–4) читаются.
 """
 import dataclasses
@@ -20,7 +20,7 @@ from .config import Config
 from .net import BrainNet
 from .vocab import Vocab
 
-VERSION = 5
+VERSION = 7
 
 
 def save(net, directory):
@@ -39,7 +39,10 @@ def save(net, directory):
             "words": net.vocab.words, "counts": net.vocab.counts, "buffer": net.buffer,
             "updates": net.updates, "lessons": net.lessons, "cap": cx.cap,
             "self_errors": net.self_errors[-200:],
-            "prof": [[w, [[n, c] for n, c in p.items()]] for w, p in cx.prof.items()]}
+            "prof": [[w, [[n, c] for n, c in p.items()]] for w, p in cx.prof.items()],
+            "trans1": [[a, [[b, c] for b, c in d.items()]] for a, d in net.trans1.items()],
+            "trans2": [[a, b, [[c, v] for c, v in d.items()]] for (a, b), d in net.trans2.items()],
+            "imprints": net.imprints.to_json()}
     js = os.path.join(directory, "meta.json")
     tmp = js + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -50,7 +53,7 @@ def save(net, directory):
 def load(directory):
     with open(os.path.join(directory, "meta.json"), encoding="utf-8") as f:
         meta = json.load(f)
-    if meta.get("version") not in (2, 3, 4, VERSION):
+    if meta.get("version") not in (2, 3, 4, 5, 6, VERSION):
         raise ValueError(f"неизвестная версия состояния: {meta.get('version')}")
     data = np.load(os.path.join(directory, "arrays.npz"))
     cap = int(meta.get("cap", data["T"].shape[0]))
@@ -84,4 +87,9 @@ def load(directory):
     net.updates = meta["updates"]
     net.lessons = meta.get("lessons", meta["updates"])
     net.self_errors = list(meta.get("self_errors", []))
+    # цепочки слов появились в версии 6; в старых сохранениях их нет — учатся заново
+    net.trans1 = {int(a): {int(b): float(c) for b, c in pairs} for a, pairs in meta.get("trans1", [])}
+    net.trans2 = {(int(a), int(b)): {int(c): float(v) for c, v in pairs}
+                  for a, b, pairs in meta.get("trans2", [])}
+    net.imprints.load_json(meta.get("imprints"))    # слепки мыслей — версия 7
     return net

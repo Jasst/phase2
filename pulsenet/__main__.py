@@ -21,7 +21,12 @@ def _teacher_from_env(env):
     backend = make_backend(env)
     if backend.name == "llamacpp":
         backend.ensure(backend.default_rel)
-    return HTTPTeacher(backend.base_url + "/chat/completions", env.get("PULSENET_TEACHER_MODEL", "local"))
+        # llama-server принимает любое имя модели: важен только запущенный сервер
+        model = env.get("PULSENET_TEACHER_MODEL", "local")
+    else:
+        # LM Studio требует точный id модели; «local» она не знает и вернёт 404.
+        model = env.get("PULSENET_TEACHER_MODEL", "").strip() or backend.ensure("") or ""
+    return HTTPTeacher(backend.base_url + "/chat/completions", model)
 
 
 def main(argv=None):
