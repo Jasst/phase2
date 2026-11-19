@@ -1,12 +1,6 @@
 __pycache__/
 .pytest_cache/
 .venv/
-state/
-*.npz
-*.tmp
-*.tmp.npz
-data/
 .env
-
-# эксперименты: результаты масштабирования (не нужны в репозитории)
-experiments/out/
+data/
+*.pyc

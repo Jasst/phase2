@@ -1,959 +1,235 @@
 # -*- coding: utf-8 -*-
-"""Приложение: сеть + LLM + режимы + журнал уроков + проверка + состояние UI.
+"""Приложение: чат с LLM, память ТРИПЛЕКСИИ и фоновая индексация.
 
-Режимы ответа (settings.mode):
-  llm — отвечает LLM; сеть учится на ответе, если включено auto_learn;
-  net — отвечает сама сеть (мысль, импульс); учится только по действиям пользователя.
-
-Обратная связь (feedback): good — закрепить пару; bad — ослабить; fix — пользователь
-даёт правильный ответ: правильный закрепляется, неверный ослабляется.
-Хорошие ответы попадают в проверочный набор (eval.json), по нему измеряется
-припоминание: сеть должна снова выдать слова из подтверждённых ответов.
+Чат: память (поиск) → промпт → LLM (llama-server или LM Studio) → ответ.
+После ответа реплика пользователя уходит в очередь индексации: документ, экстракция, факты.
+Ошибки любого этапа пишутся в журнал ошибок и видны в интерфейсе (/api/status).
 """
-import json
+from __future__ import annotations
+
 import os
-import shutil
+import queue
 import threading
 import time
+from collections import deque
+from typing import Callable, Dict, List, Optional
 
-import numpy as np
+from . import llm
+from .triplex import HashEncoder, OpenAIEmbedder, TriplexMCP, TriplexMemory, make_extractor, openai_chat_caller
+from .triplex.embed_server import EmbeddingServer
+from .triplex.encoder import CachedEncoder, default_prefixes, list_model_ids, pick_embedding_model, probe_dim
+from .triplex import sleep
 
-from . import store
-from .config import Config
-from .llm import PARAM_DEFAULTS, BackendError, make_backend
-from .teacher import HTTPTeacher
-from .reasoning import Reasoner
-from .planner import Planner
-from .net import BrainNet
-from .thoughts import ThoughtStream
-from .vocab import tokenize
-
-CONTEXT_TURNS = 6
-DEV_HISTORY_LIMIT = 2000
-EPISODES_LIMIT = 5000
-EVAL_LIMIT = 200
-FIX_WEIGHT = 2.0               # вес исправления по умолчанию (меняется в настройках)
-STOP_WORDS = {"это", "как", "что", "для", "или", "все", "его", "она", "они", "при", "так", "там", "тут", "был", "быть"}
-
-
-def _read_json(path, default):
-    if os.path.isfile(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, ValueError):
-            return default
-    return default
-
-
-def _condense(text, k=8):
-    """Сжатая мысль о тексте: ключевые слова без служебных."""
-    ws = [w for w in tokenize(text) if w.isalnum() and len(w) >= 3 and w not in STOP_WORDS]
-    return " ".join(ws[:k])
-
-
-def _write_json(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False)
-    os.replace(tmp, path)
-
-
-def detok(net, word_ids):
-    from .vocab import detokenize
-    return detokenize([net.vocab.words[i] for i in word_ids])
+CONTEXT_TURNS = 8
+ERROR_LOG_SIZE = 50
 
 
 class App:
-    def __init__(self, env, data_dir="data"):
-        self.env = env
+    def __init__(self, env, data_dir: str = "data"):
+        self.env = dict(env)
         self.data_dir = data_dir
-        self.state_dir = os.path.join(data_dir, "net")
         os.makedirs(data_dir, exist_ok=True)
-        self.lock = threading.RLock()
-        # Запуск/перезапуск llama-server длится до 240 с. Держим его под отдельным
-        # замком, а не под self.lock, иначе интерфейс (состояние, модели) зависает.
+        self.backend = llm.make_backend(self.env, data_dir=data_dir)
         self.backend_lock = threading.Lock()
-        self.backend = make_backend(env, data_dir=data_dir)
-        self.net = self._load_net()
-        self.settings = _read_json(os.path.join(data_dir, "model_settings.json"),
-                                   {"model": "", "params": {}})
-        self.settings.setdefault("mode", "llm")
-        self.settings.setdefault("auto_learn", True)
-        self.settings.setdefault("auto_think", True)
-        self.settings.setdefault("proactive", False)
-        self.settings.setdefault("net_answer", "plan")  # «Моя модель» отвечает планировщиком    # проактивный внутренний голос после каждого хода
-        self.ui = _read_json(os.path.join(data_dir, "ui_state.json"), {"updated": 0})
-        self.history = _read_json(os.path.join(data_dir, "history.json"), {})
-        self.thoughts = ThoughtStream(os.path.join(data_dir, "thoughts.json"))
-        self.dev = _read_json(os.path.join(data_dir, "dev_history.json"), [])
-        self.episodes = _read_json(os.path.join(data_dir, "episodes.json"), [])
-        self.eval_set = _read_json(os.path.join(data_dir, "eval.json"), [])
-        self.gen_active = False
+        self.history: Dict[str, List[dict]] = {}
+        self.history_lock = threading.Lock()
+        self.errors: deque = deque(maxlen=ERROR_LOG_SIZE)
         self.stop_flag = False
-        self.last = None
-        self.last_saved = self._mtime()
+        self.memory_enabled = self.env.get("TRIPLEX_MEMORY", "1") != "0"
+        self.embed_server = None
+        self.embed_model = ""
+        self.memory = self._make_memory(data_dir)
+        self.mcp = TriplexMCP(self.memory)
+        self._index_q: "queue.Queue[tuple]" = queue.Queue()
+        self._worker = threading.Thread(target=self._index_loop, daemon=True, name="triplex-index")
+        self._worker.start()
 
-    # ---------- сеть: загрузка, сохранение ----------
+    # ---------- ошибки ----------
 
-    def _load_net(self):
-        if os.path.isfile(os.path.join(self.state_dir, "meta.json")):
-            return store.load(self.state_dir)
-        return BrainNet(Config())
+    def log_error(self, where: str, exc: BaseException) -> None:
+        self.errors.append({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "where": where,
+                            "message": str(exc)[:500]})
 
-    def _mtime(self):
-        meta = os.path.join(self.state_dir, "meta.json")
-        return os.path.getmtime(meta) if os.path.isfile(meta) else None
+    def recent_errors(self) -> List[dict]:
+        return list(self.errors)[::-1]
 
-    def save_net(self):
-        with self.lock:
-            self.net.prune_transitions()          # память порядка не раздувается без границы
-            store.save(self.net, self.state_dir)
-            self.last_saved = self._mtime()
+    # ---------- память ----------
 
-    def load_net(self):
-        with self.lock:
-            if not os.path.isfile(os.path.join(self.state_dir, "meta.json")):
-                return {"ok": False, "error": "на диске нет сохранённой сети"}
-            self.net = self._load_net()
-            self.last_saved = self._mtime()
-        return dict(self.net_state(), ok=True)
-
-    def reset_net(self):
-        """Сброс: текущая сеть копируется в резервную папку, рабочая становится пустой."""
-        with self.lock:
-            backup = None
-            if os.path.isfile(os.path.join(self.state_dir, "meta.json")):
-                backup = os.path.join(self.data_dir, "backups", time.strftime("net-%Y%m%d-%H%M%S"))
-                shutil.copytree(self.state_dir, backup)
-            self.net = BrainNet(Config())
-            shutil.rmtree(self.state_dir, ignore_errors=True)
-            self.last_saved = None
-        state = self.net_state()
-        state["backup"] = backup
-        return state
-
-    def restore_backup(self):
-        root = os.path.join(self.data_dir, "backups")
-        copies = sorted(d for d in os.listdir(root) if os.path.isfile(os.path.join(root, d, "meta.json"))) \
-            if os.path.isdir(root) else []
-        if not copies:
-            return {"ok": False, "error": "резервных копий нет"}
-        with self.lock:
-            shutil.rmtree(self.state_dir, ignore_errors=True)
-            shutil.copytree(os.path.join(root, copies[-1]), self.state_dir)
-            self.net = self._load_net()
-            self.last_saved = self._mtime()
-        return dict(self.net_state(), ok=True, restored=copies[-1])
-
-    # ---------- журналы ----------
-
-    def _record(self, loss, kind="lesson"):
-        s = self.net.stats()
-        entry = {"t": round(time.time(), 1), "kind": kind, "lesson": self.net.lessons,
-                 "words": s["слов"], "ensembles": s["ансамблей"], "links": s["связей"],
-                 "loss": None if loss is None else round(float(loss), 4)}
-        self.dev.append(entry)
-        del self.dev[:-DEV_HISTORY_LIMIT]
-        _write_json(os.path.join(self.data_dir, "dev_history.json"), self.dev)
-
-    def _log_episode(self, question, answer, weight, source):
-        self.episodes.append({"id": len(self.episodes) + 1, "t": round(time.time(), 1),
-                              "question": question, "answer": answer,
-                              "weight": weight, "source": source, "lesson": self.net.lessons})
-        del self.episodes[:-EPISODES_LIMIT]
-        _write_json(os.path.join(self.data_dir, "episodes.json"), self.episodes)
-
-    @staticmethod
-    def _keywords(text, k=4):
-        words = [w for w in tokenize(text) if w.isalnum() and len(w) >= 3 and w not in STOP_WORDS]
-        return list(dict.fromkeys(words))[:k]
-
-    def _add_eval(self, question, answer):
-        expected = self._keywords(answer)
-        if not expected:
-            return
-        self.eval_set = [e for e in self.eval_set if e["question"] != question]
-        self.eval_set.append({"question": question, "expected": expected})
-        del self.eval_set[:-EVAL_LIMIT]
-        _write_json(os.path.join(self.data_dir, "eval.json"), self.eval_set)
-
-    # ---------- обучение и обратная связь ----------
-
-    def teach(self, question, answer, weight=1.0, source="manual", replay=True):
-        """Онлайн-урок: сеть учится на паре и сохраняет себя."""
-        with self.lock:
-            loss = self.net.teach(question, answer, weight, replay=replay)
-            if loss is None:
-                return {"ok": False, "error": "пустой вопрос или ответ"}
-            self._record(loss, source)
-            self._log_episode(question, answer, weight, source)
-            self.save_net()
-            return {"ok": True, "loss": round(float(loss), 4), "stats": self.net.stats()}
-
-    def feedback(self, question, answer, verdict, correct=None):
-        """good — закрепить; bad — ослабить; fix — правильный ответ вместо неверного."""
-        question = (question or "").strip()
-        answer = (answer or "").strip()
-        if not question:
-            return {"ok": False, "error": "нет вопроса"}
-        with self.lock:
-            if verdict == "good":
-                r = self.teach(question, answer, 1.0, "good")
-                if r["ok"]:
-                    self._add_eval(question, answer)
-                return r
-            if verdict == "bad":
-                return self.teach(question, answer, -1.0, "bad")
-            if verdict == "fix":
-                correct = (correct or "").strip()
-                if not correct:
-                    return {"ok": False, "error": "нет правильного ответа"}
-                w = self.fix_weight()
-                if answer:   # исправление сильнее обычного урока: старое знание переписывается быстрее
-                    self.teach(question, answer, -w, "fix-wrong")
-                r = self.teach(question, correct, w, "fix")
-                if r["ok"]:
-                    self._add_eval(question, correct)
-                return r
-        return {"ok": False, "error": f"неизвестный verdict: {verdict}"}
-
-    # ---------- автокоррекция и дистилляция ----------
-
-    def _score_recall(self, question, expected):
-        """Доля ожидаемых слов, которую сеть вспомнила в ответе на вопрос."""
-        expected = [w for w in (expected or []) if w]
-        if not expected:
-            return None, ""
-        reply = self.net.respond(question, temp=0)
-        got = set(tokenize(reply.text))
-        hit = len([w for w in expected if w in got]) / len(expected)
-        return round(float(hit), 4), reply.text
-
-    def _weak_items(self, limit=6, threshold=0.75):
-        """Слабые места проверочного набора: низкое припоминание.
-
-        Смотрим последние вопросы набора (не весь набор): автокоррекция должна
-        быть быстрой и не превращаться в полный прогон проверки.
-        """
-        try:
-            limit = max(1, min(20, int(limit or 6)))
-        except (TypeError, ValueError):
-            limit = 6
-        try:
-            threshold = max(0.0, min(1.0, float(threshold)))
-        except (TypeError, ValueError):
-            threshold = 0.75
-        candidates = self.eval_set[-max(limit * 4, 8):]
-        out = []
-        for item in candidates:
-            question = item.get("question", "")
-            expected = item.get("expected") or []
-            score, answer = self._score_recall(question, expected)
-            if score is None or score >= threshold:
-                continue
-            out.append({"question": question, "expected": expected,
-                        "score": score, "answer": answer})
-        out.sort(key=lambda x: x["score"])
-        return out[:limit]
-
-    def _replay_locked(self, limit=8):
-        """Повтор старого опыта без увеличения счётчика уроков."""
-        try:
-            limit = max(1, min(50, int(limit or 8)))
-        except (TypeError, ValueError):
-            limit = 8
-        items = [b for b in self.net.buffer if float(b[2]) > 0][-limit:]
-        losses = []
-        for question, answer, weight in items:
-            loss = self.net.learn(question, answer, weight)
-            if loss is not None:
-                losses.append(float(loss))
-        if items:
-            self.save_net()
-        return {"count": len(items),
-                "avg_loss": round(sum(losses) / len(losses), 4) if losses else None}
-
-    def autocorrect(self, limit=6, repeats=2, threshold=0.75):
-        """Автокоррекция без LLM: найти слабые ответы и закрепить их повторением.
-
-        Сеть сама проверяет припоминание по сохранённым хорошим ответам,
-        ослабляет неверный вариант и несколько раз дистиллирует правильный.
-        """
-        try:
-            repeats = max(1, min(4, int(repeats or 2)))
-        except (TypeError, ValueError):
-            repeats = 2
-        with self.lock:
-            weak = self._weak_items(limit, threshold)
-            if not weak:
-                replay = self._replay_locked(limit)
-                return {"ok": True, "checked": 0, "fixed": 0,
-                        "before": None, "after": None, "details": [], "replay": replay,
-                        "message": ("Слабых мест не нашлось: сеть повторила последний опыт."
-                                    if replay["count"] else "Слабых мест не нашлось.")}
-            before = round(float(np.mean([x["score"] for x in weak])), 3)
-            fix_w = self.fix_weight()
-            details, fixed = [], 0
-            for item in weak:
-                question = item["question"]
-                expected = item["expected"]
-                correct = " ".join(expected)
-                old = item.get("answer") or ""
-                # неверный ответ ослабляем, правильный закрепляем несколько раз
-                if old.strip() and old.strip() != correct.strip():
-                    self.teach(question, old, -fix_w, "auto-wrong", replay=False)
-                last_loss = None
-                for i in range(repeats):
-                    r = self.teach(question, correct, 1.0, "auto-fix",
-                                   replay=(i == repeats - 1))
-                    if r.get("ok"):
-                        last_loss = r["loss"]
-                after, new_answer = self._score_recall(question, expected)
-                improved = after is not None and after > item["score"] + 1e-9
-                if improved:
-                    fixed += 1
-                details.append({"question": question, "expected": expected,
-                                "before": item["score"], "after": after,
-                                "loss": last_loss, "answer": new_answer})
-            after_scores = [d["after"] for d in details if d["after"] is not None]
-            after = round(float(np.mean(after_scores)), 3) if after_scores else None
-            self.save_net()
-            return {"ok": True, "checked": len(details), "fixed": fixed,
-                    "before": before, "after": after, "details": details}
-
-    def _teacher(self, teacher_url="", model=""):
-        """Учитель для дистилляции: URL текущего бэкенда, если не задан явно."""
-        if not teacher_url:
-            base = getattr(self.backend, "base_url", "")
-            teacher_url = base + "/chat/completions" if base else ""
-        if not teacher_url:
-            return None
-        return HTTPTeacher(teacher_url, model or self.default_model())
-
-    def distill_fix(self, limit=3, iterations=2, threshold=0.7,
-                    teacher_url="", model=""):
-        """Автоисправление через дистилляцию: слабые ответы перепроверяются у LLM.
-
-        Сеть получает ответ учителя как мягкую цель: старый (неверный) вариант
-        ослабляется, ответ LLM закрепляется несколькими шагами дистилляции.
-        Если проверочного набора нет, берутся последние положительные уроки.
-        """
-        try:
-            limit = max(1, min(5, int(limit or 3)))
-        except (TypeError, ValueError):
-            limit = 3
-        try:
-            iterations = max(1, min(10, int(iterations or 2)))
-        except (TypeError, ValueError):
-            iterations = 2
-        with self.lock:
-            weak = self._weak_items(limit, threshold)
-            if not weak:      # запасной вариант: последние подтверждённые уроки
-                seen = set()
-                for e in reversed(self.episodes):
-                    if float(e.get("weight") or 0) <= 0:
-                        continue
-                    q, a = e.get("question", ""), e.get("answer", "")
-                    if not q or not a or q in seen:
-                        continue
-                    seen.add(q)
-                    weak.append({"question": q, "expected": self._keywords(a),
-                                 "score": None, "answer": a})
-                    if len(weak) >= limit:
-                        break
-        if not weak:
-            return {"ok": False, "error": "нет слабых мест и уроков для дистилляции"}
-        try:
-            teacher = self._teacher(teacher_url, model)
-        except Exception as exc:
-            return {"ok": False, "error": f"ошибка создания учителя: {exc}"}
-        if teacher is None:
-            return {"ok": False, "error": "не указан URL учителя (LLM)"}
-
-        details, errors, fixed = [], [], 0
-        for item in weak:
-            question = item["question"]
-            teacher_answer = teacher.answer(question)
-            if not teacher_answer:
-                errors.append(f"{question}: {teacher.error or 'нет ответа'}")
-                continue
-            with self.lock:
-                old = self.net.respond(question, temp=0).text
-                fix_w = self.fix_weight()
-                if old.strip() and old.strip() != teacher_answer.strip():
-                    self.teach(question, old, -fix_w, "distill-wrong", replay=False)
-                last_loss = None
-                for i in range(iterations):
-                    r = self.teach(question, teacher_answer, 1.0, "distill",
-                                   replay=(i == iterations - 1))
-                    if r.get("ok"):
-                        last_loss = r["loss"]
-                self._add_eval(question, teacher_answer)
-                expected = self._keywords(teacher_answer)
-                after, new_answer = self._score_recall(question, expected)
-                improved = item["score"] is None or (after is not None and after > item["score"] + 1e-9)
-                if improved:
-                    fixed += 1
-                details.append({"question": question, "old": old,
-                                "teacher": teacher_answer, "expected": expected,
-                                "before": item["score"], "after": after,
-                                "loss": last_loss, "answer": new_answer})
-        if not details:
-            return {"ok": False, "checked": len(weak), "fixed": 0,
-                    "errors": errors, "error": "учитель не ответил ни на один вопрос"}
-        before_scores = [d["before"] for d in details if d["before"] is not None]
-        after_scores = [d["after"] for d in details if d["after"] is not None]
-        return {"ok": True, "checked": len(weak), "fixed": fixed,
-                "before": round(float(np.mean(before_scores)), 3) if before_scores else None,
-                "after": round(float(np.mean(after_scores)), 3) if after_scores else None,
-                "teacher": getattr(teacher, "model", "") or "", "errors": errors,
-                "details": details}
-
-    def replay_experience(self, limit=8):
-        """Повторить последний опыт: дистиллировать прошлые пары без новых уроков."""
-        with self.lock:
-            return {"ok": True, **self._replay_locked(limit)}
-
-    def run_eval(self):
-        """Проверка припоминания: доля ожидаемых слов, которые сеть выдаёт на вопрос."""
-        with self.lock:
-            details = []
-            for item in self.eval_set:
-                reply = self.net.respond(item["question"], temp=0)
-                got = set(tokenize(reply.text))
-                exp = item["expected"]
-                hit = len([w for w in exp if w in got]) / len(exp)
-                details.append({"question": item["question"], "score": round(hit, 3),
-                                "answer": reply.text, "confidence": reply.confidence})
-            score = round(float(np.mean([d["score"] for d in details])), 3) if details else None
-            self.dev.append({"t": round(time.time(), 1), "kind": "eval", "lesson": self.net.lessons,
-                             "eval": score, "words": self.net.stats()["слов"],
-                             "ensembles": self.net.stats()["ансамблей"],
-                             "links": self.net.stats()["связей"], "loss": None})
-            del self.dev[:-DEV_HISTORY_LIMIT]
-            _write_json(os.path.join(self.data_dir, "dev_history.json"), self.dev)
-        return {"score": score, "count": len(details), "details": details}
-
-    def set_mode(self, mode=None, auto_learn=None, auto_think=None, proactive=None, net_answer=None):
-        if net_answer is not None:
-            if net_answer not in ("plan", "respond"):
-                return {"ok": False, "error": "net_answer: plan или respond"}
-            self.settings["net_answer"] = net_answer
-        if mode is not None:
-            if mode not in ("llm", "net"):
-                return {"ok": False, "error": "mode: llm или net"}
-            self.settings["mode"] = mode
-        if auto_learn is not None:
-            self.settings["auto_learn"] = bool(auto_learn)
-        if auto_think is not None:
-            self.settings["auto_think"] = bool(auto_think)
-        if proactive is not None:
-            self.settings["proactive"] = bool(proactive)
-        self._save_settings()
-        return {"ok": True, "mode": self.settings["mode"],
-                "auto_learn": self.settings["auto_learn"],
-                "auto_think": self.settings["auto_think"],
-                "proactive": self.settings["proactive"], "net_answer": self.settings["net_answer"]}
-
-
-    # ---------- параметры сети (страница настроек) ----------
-
-    # имя: (тип, минимум, максимум, где хранится)
-    TUNING = {
-        "temperature": ("float", 0.0, 1.5, "cfg"),
-        "min_confidence": ("float", 0.0, 0.3, "cfg"),
-        "settle_steps": ("int", 0, 6, "cfg"),
-        "focus_gain": ("float", 0.0, 1.0, "cfg"),
-        "replay_n": ("int", 0, 5, "cfg"),
-        "fix_weight": ("float", 1.0, 4.0, "app"),
-    }
-
-    def fix_weight(self):
-        return float(self.settings.get("fix_weight", FIX_WEIGHT))
-
-    def get_tuning(self):
-        cfg = self.net.cfg
-        out = {}
-        for name, (_t, lo, hi, where) in self.TUNING.items():
-            value = self.fix_weight() if where == "app" else getattr(cfg, name)
-            out[name] = {"value": value, "min": lo, "max": hi}
-        return out
-
-    def set_tuning(self, values):
-        """Применить параметры. Неизвестные имена игнорируются, значения проверяются по границам."""
-        errors, applied = [], {}
-        for name, raw in (values or {}).items():
-            if name not in self.TUNING:
-                continue
-            kind, lo, hi, _where = self.TUNING[name]
-            try:
-                v = int(raw) if kind == "int" else float(raw)
-            except (TypeError, ValueError):
-                errors.append(f"{name}: нужно число")
-                continue
-            if not lo <= v <= hi:
-                errors.append(f"{name}: допустимо от {lo} до {hi}")
-                continue
-            applied[name] = v
-        with self.lock:
-            for name, v in applied.items():
-                if self.TUNING[name][3] == "app":
-                    self.settings["fix_weight"] = v
-                else:
-                    setattr(self.net.cfg, name, v)
-            if applied:
-                self._save_settings()
-                self.save_net()
-        return {"ok": not errors, "applied": applied, "errors": errors, "tuning": self.get_tuning()}
-
-    # ---------- состояние сети для страницы ----------
-
-    def net_state(self):
-        with self.lock:
-            meta = os.path.join(self.state_dir, "meta.json")
-            ev = [h for h in self.dev if h.get("kind") == "eval"]
-            return {"stats": self.net.stats(), "lessons": self.net.lessons,
-                    "saved_at": self.last_saved, "on_disk": os.path.isfile(meta),
-                    "size_bytes": os.path.getsize(meta) if os.path.isfile(meta) else 0,
-                    "dim": self.net.cfg.dim, "history": self.dev[-400:],
-                    "mode": self.settings["mode"], "auto_learn": self.settings["auto_learn"],
-                    "auto_think": self.settings.get("auto_think", True),
-                    "thoughts": len(self.thoughts.items),
-                    "focus": self.focus_words(), "self_error": self.net.self_error_avg(),
-                    "episodes": len(self.episodes), "recent": self.episodes[-8:][::-1],
-                    "eval_items": len(self.eval_set),
-                    "eval_last": ev[-1]["eval"] if ev else None}
-
-    def focus_words(self, k=5):
-        out = []
-        for ens, mass in self.net.top_focus(k):
-            words = [self.net.vocab.words[i] for i in self.net.cortex.members.get(ens, [])][:3]
-            out.append({"ensemble": ens, "mass": mass, "words": words})
-        return out
-
-    def respond(self, question, temp=None):
-        with self.lock:
-            # последние мысли (нарратив) подмешиваются в якорь вопроса
-            reply = self.net.respond(question, temp=temp, context=self.thoughts.context_text())
-        names = {"<eos>": "конец"}
-        return {"text": reply.text, "confidence": reply.confidence, "self_error": reply.self_error,
-                "known": reply.known, "focus": self.focus_words(),
-                "path": [{"word": names.get(w, w), "ensemble": int(k), "mass": m}
-                         for w, k, m in reply.path]}
-
-    def train_with_llm(self, question, teacher_url="", model="", iterations=1):
-        """
-        Обучить сеть на примере ответа LLM (учителя).
-
-        Учитель один раз отвечает на вопрос — это и есть пример. Затем сеть
-        учится на нём `iterations` раз подряд, чтобы пример закрепился.
-        URL учителя и модель по умолчанию берутся из текущего бэкенда,
-        поэтому интерфейсу достаточно передать вопрос и число повторов.
-        """
-        question = str(question or "").strip()
-        if not question:
-            return {"ok": False, "error": "пустой вопрос"}
-        try:
-            iterations = max(1, min(20, int(iterations or 1)))
-        except (TypeError, ValueError):
-            iterations = 1
-        if not teacher_url:
-            base = getattr(self.backend, "base_url", "")
-            teacher_url = base + "/chat/completions" if base else ""
-        if not teacher_url:
-            return {"ok": False, "error": "не указан URL учителя (LLM)"}
-        try:
-            teacher = HTTPTeacher(teacher_url, model or self.default_model())
-        except Exception as exc:
-            return {"ok": False, "error": f"ошибка создания учителя: {exc}"}
-        try:
-            teacher_answer = teacher.answer(question)
-        except Exception as exc:
-            return {"ok": False, "error": f"учитель недоступен: {exc}"}
-        if not teacher_answer:
-            detail = teacher.error or "модель ответила, но без текста ответа"
-            return {"ok": False, "error": f"пустой ответ учителя: {detail}"}
-        lessons = []
-        with self.lock:
-            for i in range(iterations):
-                loss = self.net.teach(question, teacher_answer, weight=1.0)
-                lessons.append({"iteration": i + 1,
-                                "loss": round(float(loss), 4) if loss is not None else None})
-            self.save_net()
-        losses = [l["loss"] for l in lessons if l["loss"] is not None]
-        return {"ok": True, "question": question, "teacher_answer": teacher_answer,
-                "iterations": iterations, "lessons": lessons,
-                "avg_loss": round(sum(losses) / len(losses), 4) if losses else None}
-
-    # ---------- поток мыслей: внутренний нарратив ----------
-
-    def _after_turn(self, summary, emit):
-        """Мысль о ходе и автономное обдумывание: нарратив продолжается сам."""
-        with self.lock:
-            changed = False
-            item = self.thoughts.push(summary, "turn")
-            if item:
-                emit({"thought": item})
-            if self.settings.get("proactive", False):
-                # проактивный режим: внутренний голос сам развивает мысль с торможением и слепками
-                emit({"gen_phase": {"phase": "Сеть рассуждает"}})
-                for text in Reasoner(self.net).run():
-                    self._learn_thought(text, emit)
-                    changed = True
-            elif self.settings.get("auto_think", True):
-                emit({"gen_phase": {"phase": "Сеть думает сама"}})
-                text = self.net.think()
-                if text:
-                    self._learn_thought(text, emit)
-                    changed = True
-            if changed:
-                self.save_net()
-
-    def _learn_thought(self, text, emit=None):
-        """Внести спонтанную мысль в нарратив и выучить шаг: контекст → мысль.
-
-        Шаг нарратива учится не как «урок» (счётчик уроков не растёт — уроки
-        только от действий пользователя и ответов LLM), а как внутренний шаг:
-        связи строятся, шаг попадает в буфер опыта для повтора.
-        """
-        ctx = self.thoughts.context_text(2)     # контекст до внесения новой мысли
-        item = self.thoughts.push(text, "inner")
-        if not item:
-            return None
-        if emit is not None:
-            emit({"thought": item})
-        if ctx:
-            w = self.net.cfg.thought_weight
-            loss = self.net.learn(ctx, text, w)
-            if loss is not None:
-                self.net.buffer.append((ctx, text, w))
-                del self.net.buffer[:-self.net.cfg.replay_size]
-        return item
-
-    def think_step(self, n=1):
-        """Ручной шаг нарратива: сеть рождает мысль (или несколько) и учится на ней."""
-        with self.lock:
-            made = []
-            for _ in range(max(1, min(5, int(n or 1)))):
-                text = self.net.think()
-                if not text:
-                    break
-                if self._learn_thought(text) is None:
-                    break
-                made.append(text)
-            if made:
-                self.save_net()
-        return {"ok": True, "thoughts": made, "narrative": self.thoughts.recent(8)}
-
-    def reason_step(self, steps=None):
-        """Ручной проактивный шаг: несколько импульсов с торможением, каждый оставляет слепок."""
-        with self.lock:
-            made = []
-            for text in Reasoner(self.net).run(steps=min(5, int(steps or 3))):
-                if self._learn_thought(text) is not None:
-                    made.append(text)
-            if made:
-                self.save_net()
-            return {"ok": True, "thoughts": made, "imprints": self.imprints_state(),
-                    "narrative": self.thoughts.recent(8)}
-
-    def voice(self, question):
-        """Внутренний голос: ответ, собранный из слепков мыслей."""
-        with self.lock:
-            reply = Reasoner(self.net).inner_voice(str(question or "").strip())
-            return {"ok": True, "text": reply.text, "confidence": reply.confidence,
-                    "imprints": self.imprints_state()}
-
-    def plan(self, question):
-        """Думаем, потом отвечаем: варианты мыслей, их оценка и ответ из лучшего варианта."""
-        with self.lock:
-            question = str(question or "").strip()
-            if not question:
-                return {"ok": False, "error": "пустой вопрос"}
-            plan = Planner(self.net).think(question)
-            self._last_plan = plan                 # для оценки «хорошо/плохо» следующим запросом
-            for text in plan.thoughts:
-                self.thoughts.push(text, "plan")
-            self.save_net()
-            return {"ok": True, "answer": plan.answer, "confidence": plan.confidence,
-                    "thoughts": [{"text": c.text, "score": c.score, "relevance": c.relevance,
-                                  "coherence": c.coherence} for c in plan.candidates],
-                    "focus": plan.focus, "imprints": self.imprints_state()}
-
-    def plan_feedback(self, verdict):
-        """Оценка последнего плана: коррекция идёт назад по цепочке импульса."""
-        with self.lock:
-            if verdict not in ("good", "bad"):
-                return {"ok": False, "error": "verdict: good или bad"}
-            planner = Planner(self.net)
-            planner.last_plan = getattr(self, "_last_plan", None)
-            result = planner.feedback(verdict)
-            if result.get("ok"):
-                self.save_net()
-            return result
-
-    def imprints_state(self):
-        imp = self.net.imprints
-        top = sorted(imp.longterm, key=lambda i: -i.importance)[:5]
-        return {"short": len(imp.short), "pending": len(imp.pending), "longterm": len(imp.longterm),
-                "protected": sum(1 for i in imp.longterm if i.importance >= self.net.cfg.protect_at),
-                "top": [{"text": detok(self.net, i.words), "importance": round(i.importance, 3)} for i in top]}
-
-    def thoughts_state(self):
-        with self.lock:
-            return {"items": self.thoughts.recent(30), "count": len(self.thoughts.items),
-                    "auto_think": self.settings.get("auto_think", True),
-                    "focus": self.focus_words()}
-
-    def graph(self, max_edges=600):
-        with self.lock:
-            net, cx = self.net, self.net.cortex
-            words = net.vocab.words
-            members = {k: [words[i] for i in ws] for k, ws in cx.members.items() if ws}
-            T = net.chain.T
-            idx = np.argwhere(T > 1e-3)
-            weights = T[idx[:, 0], idx[:, 1]] if len(idx) else np.zeros(0)
-            order = np.argsort(-weights)[:max_edges]
-            edges, degree = [], {}
-            for r in order:
-                i, j = int(idx[r][0]), int(idx[r][1])
-                if i not in members or j not in members:
-                    continue
-                degree[i] = degree.get(i, 0) + 1
-                degree[j] = degree.get(j, 0) + 1
-                edges.append({"source": i, "target": j, "weight": round(float(weights[r]), 4)})
-            names = {"<eos>": "конец"}
-            nodes = [{"id": k, "size": len(ws), "words": [names.get(w, w) for w in ws[:12]],
-                      "degree": degree.get(k, 0)} for k, ws in members.items()]
-            return {"nodes": nodes, "edges": edges, "total_ensembles": len(members)}
-
-    def neurons(self, ensemble):
-        with self.lock:
-            net = self.net
-            ws = net.cortex.members.get(int(ensemble), [])
-            names = {"<eos>": "конец ответа"}
-            out = []
-            for i in ws:
-                prof = net.cortex.prof.get(i, {})
-                top = sorted(prof.items(), key=lambda kv: -kv[1])[:6]
-                word = net.vocab.words[i]
-                out.append({"word": names.get(word, word),
-                            "neighbours": [[names.get(net.vocab.words[n], net.vocab.words[n]), round(float(c), 1)]
-                                           for n, c in top]})
-            return {"ensemble": int(ensemble), "neurons": out}
-
-    # ---------- модели LLM ----------
-
-    def default_model(self):
+    def default_rel(self) -> str:
         if self.backend.name == "llamacpp":
-            return self.settings.get("model") or self.backend.default_rel
-        # LM Studio: сначала берём модель, которая уже в памяти. Сохранённый
-        # выбор мог остаться от llama.cpp (путь .gguf) — отправка такого id
-        # заставила бы LM Studio загружать другую модель вместо готовой.
-        loaded = getattr(self.backend, "loaded", None)
-        if not loaded:
-            refresh = getattr(self.backend, "refresh_loaded", None)
-            if callable(refresh):
-                try:
-                    loaded = refresh()
-                except Exception:
-                    loaded = None
-        if loaded:
-            return loaded
-        saved = self.settings.get("model") or ""
-        try:
-            available = self.models()
-        except BackendError:
-            return saved or self.backend.default_model
-        if saved and saved in available:
-            return saved
-        fallback = self.backend.default_model
-        if fallback and (not available or fallback in available):
-            return fallback
-        return available[0] if available else (saved or fallback)
+            return self.env.get("LLAMACPP_DEFAULT_MODEL", "").strip()
+        return self.env.get("LMSTUDIO_MODEL", "").strip()
 
-    def models(self):
-        return self.backend.list_models()
-
-    def params_for(self, model):
-        return {**PARAM_DEFAULTS, **self.settings.get("params", {}).get(model, {})}
-
-    def models_payload(self):
-        try:
-            models, error = self.models(), None
-        except BackendError as exc:
-            models, error = [], str(exc)
-        loaded = getattr(self.backend, "loaded", None)
-        if error:
-            default = loaded or self.settings.get("model") or self.backend.default_model
-        else:
-            default = self.default_model()
-        desired = self.settings.get("model") or None
-        # Сохранённый id мог быть от другого бэкенда: в списке его нет —
-        # значит, это не «желаемая модель», а устаревшая настройка.
-        if desired and models and desired not in models:
-            desired = None
-        return {"models": models, "loaded": loaded,
-                "default": default, "desired": desired,
-                "backend": self.backend.name, "error": error}
-
-    def select_model(self, model, check_only=False):
-        if check_only:
-            return {"ok": True, "loaded": self.backend.loaded}
-        if not model or model not in self.models():
-            raise BackendError(f"модель не найдена в списке: {model!r}")
-        self.settings["model"] = model
-        self._save_settings()
+    def model_id(self) -> str:
+        """Идентификатор модели для запроса. Запускает бэкенд при необходимости."""
         with self.backend_lock:
-            self.backend.ensure(model, self.params_for(model))
-        return {"ok": True, "loaded": self.backend.loaded}
+            return self.backend.ensure(self.default_rel()) or self.default_rel() or "local"
 
-    def settings_payload(self):
+    def _make_encoder(self, data_dir: str):
+        """Эмбеддер. Модель bge-m3 грузится один раз: отдельным процессом (TRIPLEX_EMBED_MODEL_PATH)
+        или уже запущенным сервером (TRIPLEX_EMBED_URL). Иначе — офлайн-хеш. Сбой запуска не роняет чат."""
+        env = self.env
+        url = (env.get("TRIPLEX_EMBED_URL") or "").strip()
+        model_path = (env.get("TRIPLEX_EMBED_MODEL_PATH") or "").strip()
+        model = env.get("TRIPLEX_EMBED_MODEL", "").strip()          # пусто — определить автоматически
+        dim_env = env.get("TRIPLEX_EMBED_DIM", "").strip()
+        pooling = env.get("TRIPLEX_EMBED_POOLING", "cls").strip()
+        if model_path and env.get("TRIPLEX_EMBED_AUTOSTART", "1") != "0":
+            self.embed_server = EmbeddingServer(
+                env.get("TRIPLEX_EMBED_BIN", "").strip() or env.get("LLAMACPP_SERVER_BIN", "llama-server").strip(),
+                model_path, port=int(env.get("TRIPLEX_EMBED_PORT", "8091")), pooling=pooling,
+                log_path=os.path.join(data_dir, "embed-server.log"))
+            try:
+                url = self.embed_server.start()
+            except Exception as exc:              # noqa: BLE001
+                self.log_error("эмбеддер (запуск)", exc)
+                url = ""
+        if url:
+            try:
+                if not model:
+                    model = pick_embedding_model(list_model_ids(url)) or ""
+                    if not model:
+                        raise EmbeddingServerError(f"на {url} нет модели эмбеддингов: задайте TRIPLEX_EMBED_MODEL")
+                dim = probe_dim(url, model)                      # размерность — из ответа модели
+                if dim_env and int(dim_env) != dim:
+                    self.log_error("эмбеддер (размерность)",
+                                   ValueError(f"TRIPLEX_EMBED_DIM={dim_env}, а модель {model!r} даёт {dim}: беру {dim}"))
+                auto_doc, auto_query = default_prefixes(model)
+                doc_prefix = env.get("TRIPLEX_EMBED_DOC_PREFIX", auto_doc)
+                query_prefix = env.get("TRIPLEX_EMBED_QUERY_PREFIX", auto_query)
+                inner = OpenAIEmbedder(url, model, dim, doc_prefix=doc_prefix, query_prefix=query_prefix)
+                self.embed_model = model
+                return CachedEncoder(inner, os.path.join(data_dir, "triplex", "embed_cache.jsonl"),
+                                     tag=f"{model}|{dim}|{pooling}|{doc_prefix}|{query_prefix}")
+            except Exception as exc:              # noqa: BLE001
+                self.log_error("эмбеддер (подключение)", exc)
+        return HashEncoder(512)
+
+    def _make_memory(self, data_dir: str) -> TriplexMemory:
+        encoder = self._make_encoder(data_dir)
+        extractor = None
+        if self.env.get("TRIPLEX_EXTRACT", "1") != "0":
+            speaker = self.env.get("TRIPLEX_USER_NAME", "").strip() or None
+
+            def llm_call(prompt: str) -> str:
+                base = self.backend.base_url
+                return openai_chat_caller(base, self.model_id())(prompt)
+            extractor = make_extractor(llm_call, speaker=speaker)
+        min_cos = float(self.env.get("TRIPLEX_MIN_COS", "0.35"))
+        return TriplexMemory(os.path.join(data_dir, "triplex"), encoder=encoder, extractor=extractor,
+                             min_cos=min_cos)
+
+    def _index_loop(self) -> None:
+        """Одна фоновая очередь: экстракция идёт через ту же модель, что и чат, поэтому по одной."""
+        while True:
+            text, chat_id, role = self._index_q.get()
+            try:
+                self.ingest(text, session_id=chat_id or "default", role=role)
+            except Exception as exc:              # noqa: BLE001
+                self.log_error("индексация", exc)
+            finally:
+                self._index_q.task_done()
+
+    def ingest(self, text: str, session_id: str = "", role: str = "user", recorded_at=None) -> dict:
+        """Единая точка записи: сбой экстракции не исключение, а статус — и он попадает в журнал ошибок."""
+        out = self.memory.ingest(text, session_id=session_id, role=role, recorded_at=recorded_at)
+        if out["status"] == "extraction_failed":
+            self.log_error("экстракция фактов", RuntimeError(out.get("error", "неизвестная ошибка")))
+        return out
+
+    def index_async(self, text: str, chat_id: str, role: str = "user") -> None:
+        if self.memory_enabled:
+            self._index_q.put((text, chat_id, role))
+
+    def index_pending(self) -> int:
+        return self._index_q.qsize()
+
+    def memory_context(self, message: str) -> str:
+        if not self.memory_enabled:
+            return ""
         try:
-            models = self.models()
-        except BackendError:
-            models = []
-        editable = bool(getattr(self.backend, "editable", False))
-        return {"models": [{"id": m, "params": self.params_for(m)} for m in models],
-                "defaults": PARAM_DEFAULTS, "loaded": self.backend.loaded, "editable": editable,
-                "note": "" if editable else "LM Studio управляет параметрами загрузки сама",
-                "models_dir": getattr(self.backend, "models_dir", ""), "backend": self.backend.name}
+            ctx = self.memory.recall(message)["context"]
+        except Exception as exc:                  # noqa: BLE001
+            self.log_error("поиск в памяти", exc)
+            return ""
+        if not ctx:
+            return ""
+        return ("Факты и фрагменты из памяти пользователя (используй, только если относятся к вопросу; "
+                "источники указаны):\n" + ctx)
 
-    def save_model_params(self, model, params):
-        clean = {k: params[k] for k in PARAM_DEFAULTS if k in params}
-        self.settings.setdefault("params", {})[model] = clean
-        self._save_settings()
-        return {"ok": True, "restart_needed": self.backend.loaded == model}
+    # ---------- чат ----------
 
-    def unload(self):
+    def _history(self, chat_id: str) -> List[dict]:
+        with self.history_lock:
+            turns = self.history.get(chat_id or "default", [])[-CONTEXT_TURNS * 2:]
+            return [{"role": t["role"], "content": t["content"]} for t in turns]
+
+    def _append_history(self, chat_id: str, role: str, content: str) -> None:
+        with self.history_lock:
+            self.history.setdefault(chat_id or "default", []).append({"role": role, "content": content})
+
+    def chat(self, message: str, chat_id: str, on_delta: Callable[[str, str], None],
+             cancelled: Optional[Callable[[], bool]] = None) -> str:
+        """on_delta(kind, text): kind — 'token' или 'reasoning'. Возвращает итоговый ответ."""
+        self.stop_flag = False
+        mem = self.memory_context(message)
+        messages = self._history(chat_id)
+        if mem:
+            messages = [{"role": "system", "content": mem}] + messages
+        messages = messages + [{"role": "user", "content": message}]
         with self.backend_lock:
-            self.backend.stop()
-        return {"ok": True}
+            rel = self.backend.ensure(self.default_rel()) or self.default_rel() or "local"
+        parts: List[str] = []
 
-    def _save_settings(self):
-        _write_json(os.path.join(self.data_dir, "model_settings.json"), self.settings)
+        def delta(kind, text):
+            if kind == "token":
+                parts.append(text)
+            on_delta(kind, text)
 
-    # ---------- генерация ----------
+        def is_cancelled():
+            return bool(cancelled and cancelled()) or self.stop_flag
 
-    def begin_generation(self):
-        with self.lock:
-            if self.gen_active:
-                return False
-            self.gen_active = True
-            self.stop_flag = False
-            return True
+        self.backend.stream(rel, messages, delta, cancelled=is_cancelled)
+        answer = "".join(parts).strip()
+        if answer:
+            self._append_history(chat_id, "user", message)
+            self._append_history(chat_id, "assistant", answer)
+        self.index_async(message, chat_id, "user")
+        return answer
 
-    def end_generation(self):
-        with self.lock:
-            self.gen_active = False
+    def stop(self) -> None:
+        self.stop_flag = True
 
-    def context(self, chat_id):
-        turns = self.history.get(chat_id or "default", [])[-CONTEXT_TURNS * 2:]
-        return [{"role": t["role"], "content": t["content"]} for t in turns]
+    def status(self) -> dict:
+        return {
+            "backend": self.backend.name,
+            "model": getattr(self.backend, "loaded", None),
+            "memory_enabled": self.memory_enabled,
+            "index_pending": self.index_pending(),
+            "memory": self.memory.stats(),
+            "embedder": {"name": self.memory.encoder.name,
+                         "server_running": bool(self.embed_server and self.embed_server.is_running()),
+                         "server_starts": self.embed_server.starts if self.embed_server else 0,
+                "model": self.embed_model or None},
+            "errors": self.recent_errors(),
+        }
 
-    def _plan_reply(self, message):
-        """Ответ «Моя модель» через планировщик: варианты уходят в поток мыслей."""
-        with self.lock:
-            plan = Planner(self.net).think(message)
-            self._last_plan = plan                 # для оценки «хорошо/плохо»
-            for text in plan.thoughts:
-                self.thoughts.push(text, "plan")
-            best = plan.candidates[0] if plan.candidates else None
-            names = {"<eos>": "конец"}
-            path = [{"word": names.get(self.net.vocab.words[w], self.net.vocab.words[w]),
-                     "ensemble": int(self.net.cortex.cluster_of(w)), "mass": 1.0}
-                    for w in (best.words if best else [])]
-            return {"text": plan.answer, "confidence": plan.confidence, "self_error": None,
-                    "known": bool(plan.candidates), "focus": self.focus_words(), "path": path}
+    # ---------- обслуживание ----------
 
-    def run_generation(self, message, model, chat_id, emit):
-        use_plan = self.settings["mode"] == "net" and self.settings.get("net_answer", "plan") == "plan"
-        reply = self._plan_reply(message) if use_plan else self.respond(message)
-        emit({"gen_phase": {"phase": "Мысль и импульс сети"}})
-        for step in reply["path"][:30]:
-            emit({"trace": {"net": "pulsenet", "word": step["word"],
-                            "cluster": step["ensemble"], "mass": step["mass"]}})
-        emit({"trace": {"net": "pulsenet", "confidence": reply["confidence"],
-                        "self_error": reply["self_error"], "focus": reply["focus"]}})
+    def consolidate_dry_run(self) -> dict:
+        """«Сон» без обучения: отбор фактов и запись датасета. Обучение — отдельная команда."""
+        plan = sleep.plan_consolidation(self.memory)
+        path = None
+        if plan["rows"]:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            path = sleep.write_dataset(plan["rows"], os.path.join(self.data_dir, "triplex", "sleep",
+                                                                  f"dataset-{stamp}.jsonl"))
+        return {"status": plan["status"], "eligible": plan["eligible"], "rehearsal": plan["rehearsal"],
+                "dataset": path, "training": "не запущено: выполните `python -m pulsenet train-sleep`"}
 
-        if self.settings["mode"] == "net":
-            emit({"gen_phase": {"phase": "Отвечает сеть"}})
-            text = reply["text"]
-            if not text:
-                text = "Пока не уверена в ответе. Дайте мне урок: введите правильный ответ кнопкой «Переучить»."
-            for piece in text.split(" "):
-                if self.stop_flag:
-                    break
-                emit({"token": piece + " "})
-            answer = reply["text"]
-            source = "net"
-        else:
-            rel = model or self.default_model()
-            emit({"gen_phase": {"phase": f"Ответ модели ({self.backend.name})"}})
-            with self.backend_lock:
-                self.backend.ensure(rel, self.params_for(rel))
-            parts = []
-
-            def on_delta(kind, text):
-                if self.stop_flag:
-                    return
-                if kind == "token":
-                    parts.append(text)
-                    emit({"token": text})
-                else:
-                    emit({"reasoning_token": text})
-
-            messages = self.context(chat_id) + [{"role": "user", "content": message}]
-            self.backend.stream(rel, messages, on_delta, cancelled=lambda: self.stop_flag)
-            answer = "".join(parts).strip()
-            source = "llm"
-            if answer and not self.stop_flag and self.settings.get("auto_learn", True):
-                emit({"gen_phase": {"phase": "Сеть учится на ответе LLM"}})
-                self.teach(message, answer, 1.0, "llm")
-
-        if answer and not self.stop_flag:
-            self._remember(chat_id or "default", message, answer, source)
-        if not self.stop_flag:
-            # мысль о ходе + автономное обдумывание (внутренний нарратив)
-            summary = _condense(message, 8) + (" " + _condense(answer, 10) if answer else "")
-            self._after_turn(summary, emit)
-        emit({"turn": {"question": message, "answer": answer, "source": source,
-                       "confidence": reply["confidence"], "self_error": reply["self_error"],
-                       "uncertain": not answer}})
-        emit({"gen_phase": {"phase": "Готово"}})
-
-    def _remember(self, chat_id, user, assistant, source="llm"):
-        with self.lock:
-            turns = self.history.setdefault(chat_id, [])
-            turns.append({"role": "user", "content": user})
-            turns.append({"role": "assistant", "content": assistant})
-            del turns[:-CONTEXT_TURNS * 4]
-            self.last = {"user": user, "assistant": assistant, "source": source, "images": []}
-            _write_json(os.path.join(self.data_dir, "history.json"), self.history)
-
-    def last_response(self, user_text=None):
-        if self.last and (not user_text or self.last["user"] == user_text):
-            return self.last
-        return {}
-
-    # ---------- состояние UI ----------
-
-    def ui_put(self, body):
-        with self.lock:
-            for k, v in body.items():
-                if k not in ("updated", "version"):
-                    self.ui[k] = v
-            self.ui["updated"] = int(self.ui.get("updated", 0)) + 1
-            _write_json(os.path.join(self.data_dir, "ui_state.json"), self.ui)
-            return {"ok": True, "updated": self.ui["updated"]}
-
-    def ui_get(self):
-        with self.lock:
-            return dict(self.ui)
-
-    def save_all(self):
-        self.save_net()
-        with self.lock:
-            _write_json(os.path.join(self.data_dir, "ui_state.json"), self.ui)
-            _write_json(os.path.join(self.data_dir, "history.json"), self.history)
+    def wait_index(self, timeout: float = 60.0) -> bool:
+        """Для тестов: дождаться опустошения очереди индексации."""
+        deadline = time.time() + timeout
+        while self._index_q.unfinished_tasks and time.time() < deadline:
+            time.sleep(0.01)
+        return self._index_q.unfinished_tasks == 0
