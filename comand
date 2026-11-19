@@ -1,1 +1,0 @@
-Get-ChildItem -Recurse -File | Where-Object { $_.FullName -notmatch '\\(\.venv|\.idea|__pycache__|\.git)\\' -and $_.Name -ne '.env' -and $_.Extension -notin '.gguf','.zip','.pyc' } | Compress-Archive -DestinationPath phase2_current.zip -Force

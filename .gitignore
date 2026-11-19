@@ -1,11 +1,6 @@
-/.idea
-*.xml
-/.idea
-/__pycache__
-/OLD
-/phase1
-/phase2
-*.zip
-.env
-
+__pycache__/
+.pytest_cache/
 .venv/
+.env
+data/
+*.pyc
