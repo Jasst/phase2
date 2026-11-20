@@ -15,7 +15,7 @@ from collections import deque
 from typing import Callable, Dict, List, Optional
 
 from . import llm
-from .triplex import HashEncoder, OpenAIEmbedder, TriplexMCP, TriplexMemory, make_extractor, openai_chat_caller
+from .triplex import HashEncoder, OpenAIEmbedder, TriplexMemory, make_extractor, openai_chat_caller
 from .triplex.embed_server import EmbeddingServer
 from .triplex.encoder import CachedEncoder, default_prefixes, list_model_ids, pick_embedding_model, probe_dim
 from .triplex import sleep
@@ -39,7 +39,6 @@ class App:
         self.embed_server = None
         self.embed_model = ""
         self.memory = self._make_memory(data_dir)
-        self.mcp = TriplexMCP(self.memory)
         self._index_q: "queue.Queue[tuple]" = queue.Queue()
         self._worker = threading.Thread(target=self._index_loop, daemon=True, name="triplex-index")
         self._worker.start()

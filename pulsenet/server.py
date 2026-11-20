@@ -19,14 +19,9 @@
   POST /api/memory/link        привязать написание к сущности
   POST /api/memory/supersede   явно вытеснить факт
   POST /api/memory/consolidate «Сон», сухой прогон: датасет без обучения
-  POST /mcp                    MCP (Bearer PULSENET_MCP_TOKEN)
-
-Безопасность: /mcp требует токен и проверяет Host/Origin. Маршруты /api/* без входа:
-при открытии в интернет ограничьте их на уровне nginx (см. README).
 """
 from __future__ import annotations
 
-import hmac
 import json
 import mimetypes
 import os
@@ -34,8 +29,6 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-
-from .triplex import parse_body
 
 WEB_DIR_DEFAULT = "web"
 MAX_BODY = 20 * 1024 * 1024
@@ -45,21 +38,6 @@ mimetypes.add_type("text/css", ".css")
 mimetypes.add_type("application/json", ".json")
 mimetypes.add_type("image/svg+xml", ".svg")
 mimetypes.add_type("font/woff2", ".woff2")
-
-
-def _hostname(value: str) -> str:
-    value = (value or "").strip()
-    if "://" in value:
-        value = value.split("://", 1)[1].split("/", 1)[0]
-    if value.startswith("["):
-        return value[1:value.find("]")].lower() if "]" in value else value.lower()
-    return value.split(":", 1)[0].lower()
-
-
-def mcp_settings(env) -> dict:
-    token = (env.get("PULSENET_MCP_TOKEN") or "").strip()
-    extra = {_hostname(h) for h in (env.get("PULSENET_MCP_HOSTS") or "").split(",") if h.strip()}
-    return {"token": token, "hosts": {"localhost", "127.0.0.1"} | extra}
 
 
 class ChatJob:
@@ -258,8 +236,6 @@ class Handler(BaseHTTPRequestHandler):
     def dispatch(self, method):
         url = urlparse(self.path)
         path, query = url.path, parse_qs(url.query)
-        if path.rstrip("/") == "/mcp":
-            return self.mcp_endpoint(method)
         if method == "GET" and path in ("/", "/ai", "/ai.html"):
             return self.send_file(os.path.join(self.web_dir, "index.html"))
         if method == "GET" and path == "/sw.js":
@@ -301,48 +277,6 @@ class Handler(BaseHTTPRequestHandler):
             self.dispatch(method)
         except ConnectionError:
             pass
-
-    # ----- MCP -----
-
-    def mcp_endpoint(self, method):
-        cfg = mcp_settings(self.app.env)
-        if not cfg["token"]:
-            return self.send_json({"error": "mcp отключён: задайте PULSENET_MCP_TOKEN"}, 503)
-        if _hostname(self.headers.get("Host", "")) not in cfg["hosts"]:
-            return self.send_json({"error": "host not allowed"}, 403)
-        origin = self.headers.get("Origin")
-        if origin and _hostname(origin) not in cfg["hosts"]:
-            return self.send_json({"error": "origin not allowed"}, 403)
-        auth = self.headers.get("Authorization", "")
-        given = auth[7:] if auth.startswith("Bearer ") else ""
-        if not hmac.compare_digest(given.encode("utf-8"), cfg["token"].encode("utf-8")):
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Bearer realm="pulsenet-mcp"')
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        if method == "DELETE":
-            self.send_response(200)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        if method != "POST":
-            self.send_response(405)
-            self.send_header("Allow", "POST, DELETE")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        payload, err = parse_body(self.read_raw())
-        if err is not None:
-            return self.send_json(err, 400)
-        reply = self.app.mcp.handle(payload)
-        if reply is None:
-            self.send_response(202)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        self.send_json(reply, 200)
-
 
 # ----- обработчики API -----
 

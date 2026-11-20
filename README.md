@@ -57,7 +57,8 @@ Alpha. 87 тестов, `eval/`, `web/`, `server.py`, MCP — есть.
 
 1. `setup_env.bat` — создаёт `.venv` и ставит зависимости.
 2. Скопируйте `.env.example` в `.env` и заполните пути, токен MCP и `TRIPLEX_USER_NAME`.
-3. `run_server.bat` — поднимает nginx (если Docker запущен) и сервер.
+3. `run_server.bat` — поднимает nginx и SearXNG (если Docker запущен) и сервер.
+   `stop_server.bat` останавливает контейнеры nginx и SearXNG.
    Откройте `http://127.0.0.1:8000` (старый адрес `/ai` тоже работает).
 4. Напишите сообщение в интерфейсе. Модель — через бэкенд из `.env`.
 

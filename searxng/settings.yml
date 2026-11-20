@@ -1,0 +1,27 @@
+# SearXNG для поиска из приложения. Поднимается в Docker (см. searxng/docker-compose.yml).
+# Документация: https://docs.searxng.org/admin/settings/settings.html
+
+use_default_settings: true
+
+server:
+  # Секрет берётся из переменной SEARXNG_SECRET (searxng/.env), здесь значение не используется.
+  secret_key: "set-by-env"
+  limiter: false          # приложение ходит только с localhost, лимитер не нужен
+  image_proxy: false
+
+search:
+  # Приложение запрашивает результаты в json. Без этого формата SearXNG отвечает 403.
+  formats:
+    - html
+    - json
+  safe_search: 0
+  default_lang: "ru"
+
+engines:
+  # Только движки, которые уже есть в настройках SearXNG по умолчанию.
+  # Свой движок yandex с shortcut "ya" убран: он конфликтовал со встроенным
+  # и вызывал "ambiguous shortcut: ya", из-за чего контейнер падал в цикл перезапусков.
+  - name: wikipedia
+    disabled: false
+  - name: duckduckgo
+    disabled: false

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Тесты сервера и приложения: API чата и памяти, SSE, журнал ошибок, MCP поверх HTTP, «Сон»."""
+"""Тесты сервера и приложения: API чата и памяти, SSE, журнал ошибок, «Сон»."""
 import http.client
 import json
 import threading
@@ -178,17 +178,6 @@ def test_bad_json_and_unknown_fact_return_proper_codes(running):
     assert status == 404
     status, _ = _req(port, "POST", "/api/memory/search", None)
     assert status == 400
-
-
-def test_mcp_over_http_requires_token(running):
-    app, port = running
-    status, _ = _req(port, "POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "ping"},
-                     headers={"Host": "localhost", "Authorization": "Bearer nope"})
-    assert status == 401
-    status, raw = _req(port, "POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                                              "params": {"name": "triplex_whoami", "arguments": {}}},
-                       headers={"Host": "localhost", "Authorization": f"Bearer {TOKEN}"})
-    assert status == 200 and json.loads(raw)["result"]["isError"] is False
 
 
 def test_consolidate_dry_run_writes_nothing_without_eligible(running):

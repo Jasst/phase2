@@ -49,7 +49,18 @@ def _dt(value: str) -> datetime:
 
 
 def _tokens(text: str) -> List[str]:
-    return _TOKEN.findall(text.lower())
+    """Токены для лексического сравнения. Слова обрезаются до 5 символов (грубый стемминг:
+    «проект» и «проекте» совпадают, «использует» и «использовать» тоже), короткие служебные
+    слова (в, на, и) отбрасываются. Числа и версии (3.12 → 3, 12) не трогаются."""
+    out: List[str] = []
+    for tok in _TOKEN.findall(text.lower()):
+        if tok.isalpha():
+            if len(tok) <= 2:
+                continue
+            out.append(tok[:5])
+        else:
+            out.append(tok)
+    return out
 
 
 def _entity_id(canonical: str, etype: str) -> str:
