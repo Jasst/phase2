@@ -6,3 +6,4 @@ data/
 *.pyc
 /data_unified
 *.zip
+*.xml
