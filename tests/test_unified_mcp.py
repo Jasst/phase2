@@ -167,7 +167,8 @@ def test_end_to_end_over_http():
     from mcp.client.streamable_http import streamablehttp_client
 
     d = _tmp()
-    cfg = Settings(data_dir=d, owner_token="OWNERTOKEN", owner_id="owner", admins={"owner"})
+    cfg = Settings(data_dir=d, owner_token="OWNERTOKEN", owner_id="owner", admins={"owner"},
+                   memory_scope="per_user")   # изоляция по пользователям (по умолчанию память общая)
     app = create_app(cfg)
     alice_tok = app.state.tokens.issue("alice")
     port = _free_port()

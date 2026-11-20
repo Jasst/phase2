@@ -8,10 +8,14 @@
   GET  /health                 проверка работоспособности
   GET  /api/status             бэкенд, память, журнал ошибок
   GET  /api/models             модели бэкенда
-  POST /api/chat               чат, поток SSE: token | reasoning | done | error
+  POST /api/chat               чат, поток SSE: token | reasoning | tool | sources | done | error
+                               тело: {message, chat_id, web, model} — web разрешает веб-инструменты,
+                               model выбирает модель для ответа (пусто — по умолчанию)
   GET  /api/chat/stream        продолжить поток ответа после перезагрузки
   POST /api/chat/stop          остановить текущую генерацию
+  GET  /api/tools              инструменты чата и команды (каталог)
   GET  /api/memory/facts       действующие факты
+  GET  /api/memory/graph       карта нейронов: узлы, связи, рост по дням
   POST /api/memory/ingest      сохранить текст (синхронно, с экстракцией)
   POST /api/memory/search      поиск (recall)
   POST /api/memory/confirm     подтвердить / опровергнуть факт
@@ -43,24 +47,29 @@ mimetypes.add_type("font/woff2", ".woff2")
 class ChatJob:
     """Ответ ассистента, который продолжается даже без подключённого клиента."""
 
-    def __init__(self, chat_id: str, message: str):
+    def __init__(self, chat_id: str, message: str, web: bool = False, model: str = ""):
         self.chat_id = chat_id
         self.message = message
+        self.web = web
+        self.model = model
         self.text = ""
         self.reasoning = ""
         self.answer = ""
         self.error = ""
         self.status = "running"          # running | done | stopped | error
         self.index_pending = 0
+        self.events = []                 # tool / sources, с позицией в тексте (at)
         self.cancelled = threading.Event()
         self._lock = threading.Lock()
 
-    def add_delta(self, kind, text):
+    def add_delta(self, kind, payload):
         with self._lock:
             if kind == "reasoning":
-                self.reasoning += text
+                self.reasoning += payload
+            elif kind in ("tool", "sources"):
+                self.events.append({"kind": kind, "data": payload, "at": len(self.text)})
             else:
-                self.text += text
+                self.text += payload
 
     def complete(self, answer, index_pending, status):
         with self._lock:
@@ -79,6 +88,7 @@ class ChatJob:
             return {
                 "text": self.text,
                 "reasoning": self.reasoning,
+                "events": list(self.events),
                 "answer": self.answer,
                 "error": self.error,
                 "status": self.status,
@@ -94,12 +104,12 @@ class ChatJobs:
         self._lock = threading.Lock()
         self._jobs = {}
 
-    def start(self, chat_id: str, message: str):
+    def start(self, chat_id: str, message: str, web: bool = False, model: str = ""):
         with self._lock:
             current = self._jobs.get(chat_id)
             if current is not None and current.snapshot()["status"] == "running":
                 return current, False
-            job = ChatJob(chat_id, message)
+            job = ChatJob(chat_id, message, web=web, model=model)
             self._jobs[chat_id] = job
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
         return job, True
@@ -107,7 +117,7 @@ class ChatJobs:
     def _run(self, job):
         try:
             answer = self.app.chat(job.message, job.chat_id, job.add_delta,
-                                   cancelled=job.cancelled.is_set)
+                                   cancelled=job.cancelled.is_set, web=job.web, model=job.model)
             job.complete(answer, self.app.index_pending(),
                          "stopped" if job.cancelled.is_set() else "done")
         except Exception as exc:                  # noqa: BLE001
@@ -196,7 +206,10 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_file(path)
 
     def stream_job(self, job):
-        """Отдаёт накопленный ответ и следит за ним, пока он не завершится."""
+        """Отдаёт накопленный ответ и следит за ним, пока он не завершится.
+
+        Токены и события (tool, sources) идут в порядке появления: событие показывается там,
+        где в тексте оно произошло (поле at)."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -204,11 +217,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         text_pos = 0
         reasoning_pos = 0
+        event_pos = 0
         try:
             while True:
                 snap = job.snapshot()
                 text = snap["text"]
                 reasoning = snap["reasoning"]
+                for ev in snap["events"][event_pos:]:
+                    if ev["at"] > text_pos:
+                        self.sse({"token": text[text_pos:ev["at"]]})
+                        text_pos = ev["at"]
+                    self.sse({ev["kind"]: ev["data"]})
+                    event_pos += 1
                 if len(text) > text_pos:
                     self.sse({"token": text[text_pos:]})
                     text_pos = len(text)
@@ -302,7 +322,8 @@ def _chat(h, b, _q):
     if not message:
         raise ValueError("пустое сообщение")
     chat_id = str(b.get("chat_id") or "default")
-    job, created = h.jobs.start(chat_id, message)
+    job, created = h.jobs.start(chat_id, message, web=bool(b.get("web")),
+                                model=str(b.get("model") or "").strip())
     if not created and job.message != message:
         return h.send_json({"error": "в этом чате ещё генерируется ответ"}, 409)
     h.stream_job(job)
@@ -328,10 +349,7 @@ def _stop(h, b, _q):
 
 def _facts(h, _b, q):
     limit = int((q.get("limit") or ["50"])[0])
-    facts = h.app.memory.journal.query()[:max(1, min(limit, 500))]
-    h.send_json({"facts": [{"fact_id": f.fact_id, "text": h.app.memory._fact_text(f),
-                            "confidence": round(f.confidence, 3), "valid_from": f.valid_from,
-                            "source": f.source, "access_count": f.access_count} for f in facts]})
+    h.send_json({"facts": h.app.memory.list_facts(max(1, min(limit, 500)))})
 
 
 def _ingest(h, b, _q):
@@ -340,6 +358,15 @@ def _ingest(h, b, _q):
         raise ValueError("пустой текст")
     h.send_json(h.app.ingest(text, session_id=str(b.get("session_id") or "web"),
                              role=str(b.get("role") or "user"), recorded_at=b.get("recorded_at")))
+
+
+def _graph(h, _b, q):
+    limit = int((q.get("limit") or ["200"])[0])
+    h.send_json(h.app.graph(max_edges=max(10, min(limit, 1000))))
+
+
+def _tools(h, _b, _q):
+    h.send_json(h.app.describe_tools())
 
 
 def _search(h, b, _q):
@@ -354,8 +381,9 @@ def _confirm(h, b, _q):
 
 
 def _retract(h, b, _q):
-    f = h.app.memory.retract(str(b.get("fact_id", "")))
-    h.send_json({"status": "ok", "retracted": f.fact_id})
+    fact_id = str(b.get("fact_id", ""))
+    h.app.memory.retract(fact_id)                 # локально возвращает Fact, по MCP — dict: нужен только факт
+    h.send_json({"status": "ok", "retracted": fact_id})
 
 
 def _link(h, b, _q):
@@ -377,7 +405,9 @@ def _consolidate(h, _b, _q):
 ROUTES = {
     ("GET", "/api/status"): _status,
     ("GET", "/api/models"): _models,
+    ("GET", "/api/tools"): _tools,
     ("GET", "/api/memory/facts"): _facts,
+    ("GET", "/api/memory/graph"): _graph,
     ("POST", "/api/chat"): _chat,
     ("GET", "/api/chat/stream"): _chat_stream,
     ("POST", "/api/chat/stop"): _stop,

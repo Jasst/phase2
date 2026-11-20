@@ -5,14 +5,18 @@
   память ТРИПЛЕКСИИ : triplex_ingest, triplex_search, triplex_query, triplex_assert,
                       triplex_supersede, triplex_retract, triplex_confirm,
                       triplex_define_relation, triplex_stats, triplex_check
+  память (сервис)   : triplex_graph (карта нейронов), activity_recent (журнал действий)
   личность          : identity_propose, identity_commit, identity_chain
   общее ядро        : core_get; core_propose / core_commit — только администратор
   интернет          : web_search, web_fetch
   код               : code_list, code_read, code_search — только CODE_ACCESS_USERS
-  служебное         : whoami
+  служебное         : whoami, pulsenet_guide (описание для агентов)
 """
 from __future__ import annotations
 
+import functools
+import inspect
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -25,6 +29,7 @@ from starlette.applications import Starlette
 from ..triplex.journal import ConflictError, InvariantError
 from ..triplex.mcp import _fact_dict
 from . import web
+from .activity import ActivityLog
 from .auth import BearerAuthMiddleware, TokenStore
 from .code import CodeAccess, parse_roots
 from .store import IDENTITY_KINDS, IdentityStore, SharedCore, UserMemories
@@ -45,6 +50,8 @@ class Settings:
     allowed_origins: List[str] = field(default_factory=lambda: ["http://127.0.0.1:*", "http://localhost:*"])
     identity_min_days: int = 2
     core_min_interval_hours: float = 24.0
+    memory_scope: str = "shared"            # shared — одна память для ваших агентов; per_user — изоляция
+    env: Dict[str, str] = field(default_factory=dict)   # переменные для эмбеддера и экстрактора
 
     @classmethod
     def from_env(cls, env=os.environ) -> "Settings":
@@ -67,6 +74,8 @@ class Settings:
             allowed_origins=allowed_origins,
             identity_min_days=int(env.get("IDENTITY_MIN_DAYS", "2")),
             core_min_interval_hours=float(env.get("CORE_MIN_INTERVAL_HOURS", "24")),
+            memory_scope=(env.get("MCP_MEMORY_SCOPE") or "shared").strip().lower(),
+            env=dict(env),
         )
 
 
@@ -90,6 +99,36 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
               core: SharedCore, code: CodeAccess, transport_security=None) -> FastMCP:
     mcp = FastMCP(SERVER_NAME, stateless_http=True, json_response=True,
                   transport_security=transport_security)
+    activity = ActivityLog(cfg.data_dir)
+
+    def audit(tool: str, summarize=None):
+        """Пишет вызов в журнал активности пользователя. Ошибка журнала инструмент не ломает."""
+        def record(ctx, kwargs, result):
+            try:
+                uid = _uid(ctx)[0] if ctx is not None else None
+                if not uid:
+                    return
+                text = summarize(kwargs) if summarize else ""
+                ok = not (isinstance(result, dict) and result.get("status") == "error")
+                activity.record(uid, tool, text, ok)
+            except Exception:  # noqa: BLE001
+                pass
+
+        def deco(fn):
+            if inspect.iscoroutinefunction(fn):
+                @functools.wraps(fn)
+                async def wrapper(*args, **kwargs):
+                    result = await fn(*args, **kwargs)
+                    record(kwargs.get("ctx"), kwargs, result)
+                    return result
+            else:
+                @functools.wraps(fn)
+                def wrapper(*args, **kwargs):
+                    result = fn(*args, **kwargs)
+                    record(kwargs.get("ctx"), kwargs, result)
+                    return result
+            return wrapper
+        return deco
 
     def mem_of(ctx):
         uid, err = _uid(ctx)
@@ -103,6 +142,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
     # ---------- память ----------
 
     @mcp.tool()
+    @audit("triplex_ingest", lambda k: k.get("text", ""))
     def triplex_ingest(text: str = Field(..., description="Текст для сохранения (сообщение, решение, заметка)"),
                        session_id: str = Field("", description="Необязательный id сессии"),
                        role: str = Field("user", description="user | assistant | system"),
@@ -113,11 +153,12 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         if e:
             return e
         try:
-            return mem.ingest(text, session_id=session_id, role=role)
+            return mem.ingest(text, session_id=session_id, role=role, agent=uid)
         except ValueError as exc:
             return _err(str(exc))
 
     @mcp.tool()
+    @audit("triplex_search", lambda k: k.get("query", ""))
     def triplex_search(query: str = Field(..., description="Что вспомнить"),
                        k: int = Field(8, ge=1, le=50),
                        as_of: Optional[str] = Field(None, description="ISO 8601, по умолчанию сейчас"),
@@ -130,6 +171,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         return mem.recall(query, as_of=as_of, k_facts=k, include_archived=include_archived)
 
     @mcp.tool()
+    @audit("triplex_query", lambda k: f"{k.get('s')} {k.get('r')} {k.get('o')}")
     def triplex_query(s: Optional[str] = Field(None), r: Optional[str] = Field(None),
                       o: Optional[str] = Field(None), as_of: Optional[str] = Field(None),
                       ctx: Context = None) -> Dict[str, Any]:
@@ -141,6 +183,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         return {"count": len(facts), "facts": [_fact_dict(f) for f in facts]}
 
     @mcp.tool()
+    @audit("triplex_assert", lambda k: f"{k.get('s')} {k.get('r')} {k.get('o')}")
     def triplex_assert(s: str = Field(...), r: str = Field(...), o: str = Field(...),
                        doc_id: str = Field(..., description="doc_id из triplex_ingest"),
                        span: List[int] = Field(..., min_length=2, max_length=2,
@@ -153,7 +196,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         if e:
             return e
         try:
-            f = mem.journal.assert_fact(s, r, o, source={"doc_id": doc_id, "span": span},
+            f = mem.journal.assert_fact(s, r, o, source={"doc_id": doc_id, "span": span, "agent": uid},
                                         confidence=confidence, functional=functional)
         except ConflictError as exc:
             return {"status": "conflict", "message": str(exc), "old_fact_id": exc.old_fact_id}
@@ -162,6 +205,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         return {"status": "ok", "fact": _fact_dict(f)}
 
     @mcp.tool()
+    @audit("triplex_supersede", lambda k: f"{k.get('s')} {k.get('r')} {k.get('o')}")
     def triplex_supersede(old_fact_id: str = Field(...), s: str = Field(...), r: str = Field(...),
                           o: str = Field(...), valid_from: str = Field(..., description="ISO 8601"),
                           doc_id: str = Field(...), span: List[int] = Field(..., min_length=2, max_length=2),
@@ -173,12 +217,37 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
             return e
         try:
             return mem.supersede(old_fact_id, s, r, o, valid_from=valid_from,
-                                 source={"doc_id": doc_id, "span": span},
+                                 source={"doc_id": doc_id, "span": span, "agent": uid},
                                  confidence=confidence, functional=functional)
         except (InvariantError, ValueError, KeyError) as exc:
             return _err(str(exc))
 
     @mcp.tool()
+    @audit("triplex_facts", lambda k: "")
+    def triplex_facts(limit: int = Field(50, ge=1, le=500), ctx: Context = None) -> Dict[str, Any]:
+        """Действующие факты с провенансом и автором (поле agent)."""
+        uid, mem, e = mem_of(ctx)
+        if e:
+            return e
+        facts = mem.list_facts(limit)
+        return {"count": len(facts), "facts": facts}
+
+    @mcp.tool()
+    @audit("triplex_link", lambda k: f"{k.get('alias')} -> {k.get('entity_id')}")
+    def triplex_link(entity_id: str = Field(..., description="id сущности из triplex_graph"),
+                     alias: str = Field(..., description="другое написание того же объекта"),
+                     ctx: Context = None) -> Dict[str, Any]:
+        """Привязать написание к существующей сущности (например «Nel» → «Нел»)."""
+        uid, mem, e = mem_of(ctx)
+        if e:
+            return e
+        try:
+            return mem.merge_alias(entity_id, alias)
+        except (KeyError, ValueError) as exc:
+            return _err(str(exc))
+
+    @mcp.tool()
+    @audit("triplex_retract", lambda k: k.get("fact_id", ""))
     def triplex_retract(fact_id: str = Field(...), ctx: Context = None) -> Dict[str, Any]:
         """Отозвать факт. Запись остаётся в журнале для аудита."""
         uid, mem, e = mem_of(ctx)
@@ -189,6 +258,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         return {"status": "ok", "fact": _fact_dict(mem.retract(fact_id))}
 
     @mcp.tool()
+    @audit("triplex_confirm", lambda k: f"{k.get('fact_id')} {k.get('yes')}")
     def triplex_confirm(fact_id: str = Field(...), yes: bool = Field(...),
                         ctx: Context = None) -> Dict[str, Any]:
         """Подтвердить факт (+0.15, не выше 0.95) или опровергнуть (×0.5)."""
@@ -236,6 +306,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
     # ---------- личность ----------
 
     @mcp.tool()
+    @audit("identity_propose", lambda k: k.get("content", ""))
     def identity_propose(content: str = Field(..., description="Самоформулировка от первого лица, 30–600 символов"),
                          kind: str = Field(..., description=" | ".join(IDENTITY_KINDS)),
                          evidence_quote: str = Field(..., description="дословная цитата из вашего документа памяти"),
@@ -248,6 +319,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         return identity.propose(uid, content, kind, evidence_quote, mem)
 
     @mcp.tool()
+    @audit("identity_commit", lambda k: k.get("candidate_id", ""))
     def identity_commit(candidate_id: str = Field(...), ctx: Context = None) -> Dict[str, Any]:
         """Записать подтверждённого кандидата в личную цепочку (ворота проверяются повторно)."""
         uid, mem, e = mem_of(ctx)
@@ -295,6 +367,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
     # ---------- интернет ----------
 
     @mcp.tool()
+    @audit("web_search", lambda k: "; ".join((k.get("queries") or [k.get("query") or ""])))
     async def web_search(query: Optional[str] = Field(None, description="Один запрос"),
                          queries: Optional[List[str]] = Field(None, description="До 4 запросов параллельно"),
                          max_results: int = Field(5, ge=1, le=10),
@@ -307,6 +380,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         return await web.search(qs, max_results=max_results)
 
     @mcp.tool()
+    @audit("web_fetch", lambda k: k.get("url", ""))
     async def web_fetch(url: str = Field(...), ctx: Context = None) -> Dict[str, Any]:
         """Прочитать публичную страницу (только http/https, без приватных адресов)."""
         uid, err = _uid(ctx)
@@ -345,6 +419,68 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         return e or code.search(uid, root, pattern)
 
     @mcp.tool()
+    @audit("triplex_graph")
+    def triplex_graph(max_edges: int = Field(200, ge=1, le=1000,
+                                             description="сколько самых свежих связей вернуть"),
+                      ctx: Context = None) -> Dict[str, Any]:
+        """Карта «нейронов» памяти: сущности (узлы), действующие факты (связи), рост по дням.
+        Нужна, чтобы понять, что уже накоплено, и для визуализации."""
+        uid, mem, e = mem_of(ctx)
+        if e:
+            return e
+        return mem.graph(max_edges=max_edges)
+
+    @mcp.tool()
+    def activity_recent(limit: int = Field(30, ge=1, le=200), ctx: Context = None) -> Dict[str, Any]:
+        """Последние действия сервера для вас: поиски, сохранения, ошибки (новые сверху).
+        Агенту — чтобы не повторять уже сделанную работу и видеть, что не удалось."""
+        uid, err = _uid(ctx)
+        if err:
+            return _err(err)
+        return {"user": uid, "items": activity.recent(uid, limit)}
+
+    @mcp.tool()
+    def pulsenet_guide(ctx: Context = None) -> Dict[str, Any]:
+        """Описание сервера для агентов: назначение, инструменты, когда их звать, текущее состояние."""
+        uid, mem, e = mem_of(ctx)
+        if e:
+            return e
+        return {
+            "server": SERVER_NAME,
+            "version": SERVER_VERSION,
+            "user": uid,
+            "purpose": ("Личная память и интернет-поиск. Память хранит факты с источниками и фрагменты "
+                        "документов; ответы без источника не записываются."),
+            "workflow": [
+                "Перед нетривиальной задачей: triplex_search с формулировкой задачи.",
+                "После решения: triplex_ingest (получить doc_id), затем triplex_assert с источником.",
+                "Свежие факты, документация, сравнения: web_search, затем web_fetch для полного текста.",
+                "Что уже делалось и что сорвалось: activity_recent.",
+                "Что накоплено: triplex_graph (узлы и связи) или triplex_stats.",
+            ],
+            "tools": {
+                "triplex_ingest": "сохранить документ, извлечь факты (doc_id нужен для triplex_assert)",
+                "triplex_search": "гибридный поиск: факты с источниками и фрагменты",
+                "triplex_query": "действующие факты по субъекту, отношению или объекту",
+                "triplex_assert / triplex_supersede / triplex_retract / triplex_confirm": "записать, "
+                    "вытеснить, отозвать, подтвердить или опровергнуть факт",
+                "triplex_graph": "карта нейронов памяти",
+                "triplex_check": "проверка инвариантов журнала",
+                "web_search / web_fetch": "поиск в интернете и чтение публичной страницы",
+                "activity_recent": "журнал действий пользователя",
+                "triplex_facts": "действующие факты с автором (agent)",
+                "triplex_link": "привязать написание к сущности",
+                "identity_*, core_*": "личная идентичность и общее ядро (с карантином)",
+            },
+            "memory_scope": cfg.memory_scope,
+            "memory_note": ("общая память: все ваши агенты пишут в одно хранилище; автор каждого факта — "
+                            "поле agent" if cfg.memory_scope == "shared" else "память у каждого пользователя своя"),
+            "state": mem.stats(),
+            "recent_activity": activity.recent(uid, 5),
+        }
+
+    @mcp.tool()
+    @audit("whoami")
     def whoami(ctx: Context = None) -> Dict[str, Any]:
         """Кто вы для сервера и какие возможности доступны."""
         uid, err = _uid(ctx)
@@ -360,7 +496,15 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
 def create_app(cfg: Settings) -> Starlette:
     os.makedirs(cfg.data_dir, exist_ok=True)
     tokens = TokenStore(os.path.join(cfg.data_dir, "tokens.sqlite"), cfg.owner_token, cfg.owner_id)
-    memories = UserMemories(cfg.data_dir)
+    from ..memory_service import build_encoder, build_extractor
+
+    def _log(where, exc):
+        logging.getLogger("pulsenet.unified").warning("%s: %s", where, exc)
+
+    encoder_factory = lambda: build_encoder(cfg.env, cfg.data_dir, _log)[0]     # noqa: E731
+    extractor_factory = lambda: build_extractor(cfg.env)                       # noqa: E731
+    memories = UserMemories(cfg.data_dir, encoder_factory=encoder_factory,
+                            extractor_factory=extractor_factory, scope=cfg.memory_scope)
     identity = IdentityStore(cfg.data_dir, cfg.identity_min_days)
     core = SharedCore(os.path.join(cfg.data_dir, "core.json"), cfg.core_min_interval_hours)
     code = CodeAccess(cfg.code_roots, cfg.code_users)

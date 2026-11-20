@@ -22,6 +22,40 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 
 MAX_FETCH_BYTES = 1_000_000
+
+# Кэш успешных ответов: повторный вопрос в чате или MCP не ходит в поисковик заново.
+_CACHE: Dict[str, tuple] = {}
+_CACHE_MAX = 256
+
+
+def _cache_ttl() -> float:
+    try:
+        return float(os.getenv("WEB_CACHE_TTL", "600"))
+    except ValueError:
+        return 600.0
+
+
+def _cache_get(key: str):
+    import time
+    hit = _CACHE.get(key)
+    if hit is None:
+        return None
+    stored_at, value = hit
+    if time.time() - stored_at > _cache_ttl():
+        _CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _cache_put(key: str, value) -> None:
+    import time
+    if len(_CACHE) >= _CACHE_MAX:
+        _CACHE.pop(next(iter(_CACHE)), None)     # самую старую запись
+    _CACHE[key] = (time.time(), value)
+
+
+def clear_cache() -> None:
+    _CACHE.clear()
 _DDG = "https://html.duckduckgo.com/html/"
 _deep_search = None
 _deep_search_loaded = False
@@ -150,6 +184,17 @@ async def search(queries: List[str], max_results: int = 5) -> Dict[str, Any]:
     queries = [q.strip() for q in queries if q and q.strip()][:4]
     if not queries:
         return {"status": "error", "message": "нужен хотя бы один запрос"}
+    key = "search|" + str(max_results) + "|" + "|".join(queries)
+    cached = _cache_get(key)
+    if cached is not None:
+        return {**cached, "cached": True}
+    result = await _search_uncached(queries, max_results)
+    if result.get("status") == "ok":
+        _cache_put(key, result)
+    return result
+
+
+async def _search_uncached(queries: List[str], max_results: int) -> Dict[str, Any]:
     ds = _load_blockcoin_search()
     if ds is not None:
         results = []
@@ -183,6 +228,17 @@ async def fetch(url: str, max_chars: int = 8000) -> Dict[str, Any]:
     err = check_url(url)
     if err:
         return {"status": "error", "message": err}
+    key = "fetch|" + str(max_chars) + "|" + url
+    cached = _cache_get(key)
+    if cached is not None:
+        return {**cached, "cached": True}
+    result = await _fetch_uncached(url, max_chars)
+    if result.get("status") == "ok":
+        _cache_put(key, result)
+    return result
+
+
+async def _fetch_uncached(url: str, max_chars: int) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=15, follow_redirects=False,
                                  headers={"User-Agent": "Mozilla/5.0 (pulsenet-unified)"}) as client:
         try:

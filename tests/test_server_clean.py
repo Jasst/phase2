@@ -231,27 +231,40 @@ def test_adapter_gate_rejects_forgetting_and_ppl_rise():
 
 
 def test_client_disconnect_is_not_an_error():
+    """Обрыв клиента при записи в SSE — не ошибка: ответ продолжается в фоне, исключения нет."""
     from pulsenet import server
 
-    stopped = []
-
     class FakeApp:
-        def stop(self):
-            stopped.append(True)
+        def chat(self, message, chat_id, on_delta, cancelled=None, web=False):
+            on_delta("token", "привет")
+            return "привет"
 
-        def chat(self, *_args, **_kwargs):
+        def index_pending(self):
+            return 0
+
+        def log_error(self, *_args):
+            pass
+
+    class BrokenWriter:
+        def write(self, _data):
             raise ConnectionAbortedError(10053, "client aborted")
+
+        def flush(self):
+            pass
 
     class FakeHandler:
         app = FakeApp()
-        wfile = None
+        jobs = server.ChatJobs(FakeApp())
+        wfile = BrokenWriter()
+        sse = server.Handler.sse
+        stream_job = server.Handler.stream_job
+        _chat = None
 
         def send_response(self, *_args): pass
         def send_header(self, *_args): pass
         def end_headers(self): pass
 
-    server._chat(FakeHandler(), {"message": "привет"}, None)
-    assert stopped == [True]
+    server._chat(FakeHandler(), {"message": "привет", "chat_id": "disc"}, None)
 
     handler = object.__new__(server.Handler)
 

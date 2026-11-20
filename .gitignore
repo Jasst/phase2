@@ -4,6 +4,4 @@ __pycache__/
 .env
 data/
 *.pyc
-/data_unified
-*.zip
 *.xml

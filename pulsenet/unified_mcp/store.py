@@ -35,23 +35,43 @@ def _load(path: str, default: dict) -> dict:
 
 # ---------- память ----------
 
-class UserMemories:
-    """Отдельная ТРИПЛЕКСИЯ на каждого пользователя: data/users/<uid>/triplex/."""
+SCOPES = ("per_user", "shared")
 
-    def __init__(self, data_dir: str, encoder_factory: Optional[Callable] = None):
+
+class UserMemories:
+    """Память ТРИПЛЕКСИИ, выбор хранилища — scope:
+      per_user — отдельная память на пользователя: data/users/<uid>/triplex/ (изоляция токенов);
+      shared   — одна память для всех ваших агентов: data/triplex/. Агент виден в каждом факте
+                 (поле agent, берётся из токена), ограничений доступа между агентами нет.
+    Эмбеддер и экстрактор создаются один раз и общие для всех пользователей."""
+
+    def __init__(self, data_dir: str, encoder_factory: Optional[Callable] = None,
+                 extractor_factory: Optional[Callable] = None, scope: str = "per_user"):
+        if scope not in SCOPES:
+            raise ValueError(f"неизвестный scope памяти: {scope!r}")
         self.data_dir = data_dir
         self.encoder_factory = encoder_factory
+        self.extractor_factory = extractor_factory
+        self.scope = scope
         self._cache: Dict[str, TriplexMemory] = {}
+        self._shared: Optional[TriplexMemory] = None
         self._lock = threading.RLock()
+
+    def _build(self, root: str) -> TriplexMemory:
+        enc = self.encoder_factory() if self.encoder_factory else None
+        extractor = self.extractor_factory() if self.extractor_factory else None
+        return TriplexMemory(root, encoder=enc, extractor=extractor)
 
     def for_user(self, uid: str) -> TriplexMemory:
         if not valid_user_id(uid):
             raise ValueError("некорректный user_id")
         with self._lock:
+            if self.scope == "shared":
+                if self._shared is None:
+                    self._shared = self._build(os.path.join(self.data_dir, "triplex"))
+                return self._shared
             if uid not in self._cache:
-                root = os.path.join(self.data_dir, "users", uid, "triplex")
-                enc = self.encoder_factory() if self.encoder_factory else None
-                self._cache[uid] = TriplexMemory(root, encoder=enc)
+                self._cache[uid] = self._build(os.path.join(self.data_dir, "users", uid, "triplex"))
             return self._cache[uid]
 
 

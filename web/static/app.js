@@ -13,13 +13,25 @@
     autoScroll: true,
     enterSends: true,
     showReasoning: false,
+    webSearch: false,
+    model: '',
   };
-  const SUGGESTIONS = [
-    ['Что ты помнишь?', 'Что ты знаешь обо мне и моих предпочтениях?'],
-    ['Сохранить в память', 'Запомни: меня зовут …'],
-    ['Поиск по памяти', 'Найди в памяти всё, что связано с …'],
-    ['Как устроена память?', 'Объясни, как ТРИПЛЕКСИЯ ищет факты и фрагменты.'],
+  // Команды: серверные уходят в чат, local — выполняются в интерфейсе.
+  const COMMANDS = [
+    { name: 'search', arg: 'запрос', hint: 'поиск в интернете и ответ по источникам' },
+    { name: 'fetch', arg: 'адрес', hint: 'прочитать страницу и ответить по ней' },
+    { name: 'memory', arg: 'запрос', hint: 'найти в памяти факты и фрагменты' },
+    { name: 'remember', arg: 'текст', hint: 'сохранить в память' },
+    { name: 'graph', hint: 'карта нейронов памяти', local: true },
+    { name: 'new', hint: 'новый чат', local: true },
   ];
+  const SUGGESTIONS = [
+    { title: 'Что ты помнишь?', prompt: 'Что ты знаешь обо мне и моих предпочтениях?' },
+    { title: 'Поиск в интернете', prompt: '/search ', fill: true, hint: 'введите запрос после команды' },
+    { title: 'Сохранить в память', prompt: '/remember ', fill: true, hint: 'напишите, что запомнить' },
+    { title: 'Карта нейронов', prompt: '/graph', local: true, hint: 'как растёт память' },
+  ];
+  const PALETTE = ['#8ea2ff', '#4cc38a', '#e0a458', '#e5544f', '#c58af9', '#5bc0de', '#f28db2', '#b5c77a'];
   const ICON_SEND = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4Z"/></svg>';
   const ICON_STOP = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
   const ICON_COPY = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
@@ -32,16 +44,21 @@
     renameBtn: $('renameBtn'), exportBtn: $('exportBtn'), clearBtn: $('clearBtn'), deleteBtn: $('deleteBtn'),
     drawerBtn: $('drawerBtn'), menuBtn: $('menuBtn'), messages: $('messages'), inner: $('inner'),
     scrollBottomBtn: $('scrollBottomBtn'), input: $('input'), sendBtn: $('sendBtn'), counter: $('counter'),
-    hint: $('hint'), reasonBtn: $('reasonBtn'), memoryTool: $('memoryTool'), memoryBtn: $('memoryBtn'),
-    memCount: $('memCount'), sbStat: $('sbStat'), settingsBtn: $('settingsBtn'),
+    hint: $('hint'), reasonBtn: $('reasonBtn'), webTool: $('webTool'), memoryTool: $('memoryTool'),
+    memoryBtn: $('memoryBtn'), memCount: $('memCount'), sbStat: $('sbStat'), settingsBtn: $('settingsBtn'),
+    cmdPop: $('cmdPop'),
     drawer: $('drawer'), drawerScrim: $('drawerScrim'), drawerClose: $('drawerClose'), drawerSub: $('drawerSub'),
     factsReload: $('factsReload'), factsMeta: $('factsMeta'), factsList: $('factsList'),
     searchForm: $('searchForm'), searchQuery: $('searchQuery'), searchResults: $('searchResults'),
     ingestText: $('ingestText'), ingestBtn: $('ingestBtn'), ingestOut: $('ingestOut'),
+    graphReload: $('graphReload'), graphLive: $('graphLive'), graphStats: $('graphStats'),
+    graphStage: $('graphStage'), graphCanvas: $('graphCanvas'), graphEmpty: $('graphEmpty'),
+    graphLegend: $('graphLegend'), graphGrowth: $('graphGrowth'), graphDetail: $('graphDetail'),
     statusReload: $('statusReload'), consolidateBtn: $('consolidateBtn'), statusGrid: $('statusGrid'),
     errorsBox: $('errorsBox'), sleepOut: $('sleepOut'),
     settingsDialog: $('settingsDialog'), setCompact: $('setCompact'), setFontSize: $('setFontSize'),
     setAutoScroll: $('setAutoScroll'), setEnterSends: $('setEnterSends'), setReasoning: $('setReasoning'),
+    setModel: $('setModel'), modelsReload: $('modelsReload'), modelHint: $('modelHint'),
     exportAll: $('exportAll'), wipeAll: $('wipeAll'),
     confirmDialog: $('confirmDialog'), confirmTitle: $('confirmTitle'), confirmText: $('confirmText'),
     confirmYes: $('confirmYes'), toast: $('toast'),
@@ -60,6 +77,9 @@
   let toastTimer = null;
   let paintTimer = null;
   let paintQueued = false;
+  let drawerTab = null;
+  let cmdItems = [];
+  let cmdIndex = 0;
 
   // ---------- storage ----------
 
@@ -149,6 +169,15 @@
   function escapeHtml(text) {
     return String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   }
+  function isHttpUrl(value) {
+    return typeof value === 'string' && /^https?:\/\//i.test(value);
+  }
+  function parseIso(value) {
+    if (!value) return 0;
+    // Сервер отдаёт микросекунды; Date понимает миллисекунды.
+    const t = Date.parse(String(value).replace(/(\.\d{3})\d+/, '$1'));
+    return Number.isNaN(t) ? 0 : t;
+  }
   function renderMd(text) {
     if (window.marked && window.DOMPurify) {
       try { return DOMPurify.sanitize(marked.parse(text || '', { breaks: true, gfm: true })); }
@@ -233,14 +262,15 @@
     document.body.dataset.fs = settings.fontSize || 'm';
     document.body.classList.toggle('compact', !!settings.compact);
     els.reasonBtn.setAttribute('aria-pressed', settings.showReasoning ? 'true' : 'false');
+    els.webTool.setAttribute('aria-pressed', settings.webSearch ? 'true' : 'false');
     els.setCompact.checked = !!settings.compact;
     els.setFontSize.value = settings.fontSize || 'm';
     els.setAutoScroll.checked = !!settings.autoScroll;
     els.setEnterSends.checked = !!settings.enterSends;
     els.setReasoning.checked = !!settings.showReasoning;
-    els.hint.textContent = settings.enterSends
-      ? 'Enter — отправить · Shift+Enter — новая строка · Ctrl K — новый чат'
-      : 'Ctrl+Enter — отправить · Enter — новая строка · Ctrl K — новый чат';
+    els.hint.textContent = (settings.enterSends
+      ? 'Enter — отправить · Shift+Enter — новая строка'
+      : 'Ctrl+Enter — отправить · Enter — новая строка') + ' · / — команды · Ctrl K — новый чат';
   }
 
   // ---------- sessions ----------
@@ -376,14 +406,19 @@
     const w = el('div', 'welcome');
     w.appendChild(el('div', 'big', '✦'));
     w.appendChild(el('h2', '', 'Чем помочь?'));
-    w.appendChild(el('p', '', 'Спросите что угодно. Память ТРИПЛЕКСИИ подскажет факты и фрагменты документов.'));
+    w.appendChild(el('p', '', 'Спросите что угодно. Память подскажет факты, интернет — свежие источники. ' +
+      'Команды — по символу / в поле ввода.'));
     const grid = el('div', 'suggest-grid');
-    for (const [title, prompt] of SUGGESTIONS) {
+    for (const s of SUGGESTIONS) {
       const b = el('button', 'suggest');
       b.type = 'button';
-      b.appendChild(el('b', '', title));
-      b.appendChild(el('span', '', prompt));
-      b.addEventListener('click', () => send(prompt));
+      b.appendChild(el('b', '', s.title));
+      b.appendChild(el('span', '', s.hint || s.prompt));
+      b.addEventListener('click', () => {
+        if (s.local) runLocal(s.prompt.replace('/', ''));
+        else if (s.fill) fillInput(s.prompt);
+        else send(s.prompt);
+      });
       grid.appendChild(b);
     }
     w.appendChild(grid);
@@ -415,12 +450,24 @@
   function paintBubble(bubble, m, live) {
     const wasOpen = !!(bubble.querySelector('details.reasoning') || {}).open;
     bubble.innerHTML = '';
-    if (m.role !== 'user' && m.reasoning && settings.showReasoning) {
+    const isBot = m.role !== 'user';
+    if (isBot && m.reasoning && settings.showReasoning) {
       const d = el('details', 'reasoning');
       d.open = wasOpen || (!!m.pending && !m.text);
       d.appendChild(el('summary', '', 'Рассуждения'));
       d.appendChild(el('div', 'rbody', m.reasoning));
       bubble.appendChild(d);
+    }
+    if (isBot && Array.isArray(m.tools) && m.tools.length) {
+      const row = el('div', 'tool-row');
+      for (const t of m.tools) {
+        const chip = el('span', 'tool-chip ' + (t.status || 'running'));
+        const mark = t.status === 'done' ? '✓ ' : (t.status === 'error' ? '✕ ' : '');
+        chip.textContent = mark + (t.label || t.name || 'инструмент');
+        if (t.detail) chip.title = t.detail;
+        row.appendChild(chip);
+      }
+      bubble.appendChild(row);
     }
     if (m.pending && !m.text) {
       const t = el('div', 'typing');
@@ -431,6 +478,20 @@
       md.innerHTML = renderMd(m.text);
       bubble.appendChild(md);
       if (!live) decorate(md);
+    }
+    if (isBot && Array.isArray(m.sources) && m.sources.length) {
+      const box = el('div', 'sources');
+      box.appendChild(el('div', 'sources-title', 'Источники'));
+      for (const s of m.sources) {
+        if (!s || !isHttpUrl(s.url)) continue;
+        const a = el('a', 'src', (s.n ? '[' + s.n + '] ' : '') + (s.title || s.url));
+        a.href = s.url;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.title = s.url;
+        box.appendChild(a);
+      }
+      if (box.childElementCount > 1) bubble.appendChild(box);
     }
     if (m.error) bubble.appendChild(el('div', 'err-text', 'Ошибка: ' + m.error));
     if (m.note) bubble.appendChild(el('div', 'meta-line', m.note));
@@ -488,6 +549,13 @@
     els.input.style.height = 'auto';
     els.input.style.height = Math.min(els.input.scrollHeight, 200) + 'px';
   }
+  function fillInput(text) {
+    els.input.value = text;
+    autoSize();
+    updateCounter();
+    updateCmdPop();
+    els.input.focus();
+  }
   function updateComposer() {
     els.sendBtn.classList.toggle('stop', busy);
     els.sendBtn.title = busy ? 'Остановить' : 'Отправить';
@@ -507,6 +575,23 @@
       paintBubble(bubble, bot, true);
       if (atBottom && settings.autoScroll) scrollEnd();
     }, 60);
+  }
+
+  // ---------- инструменты и источники в ответе ----------
+
+  function upsertTool(bot, t) {
+    if (!t || !t.id) return;
+    if (!Array.isArray(bot.tools)) bot.tools = [];
+    const cur = bot.tools.find((x) => x.id === t.id);
+    if (cur) Object.assign(cur, t);
+    else bot.tools.push({ ...t });
+  }
+  function addSources(bot, list) {
+    if (!Array.isArray(bot.sources)) bot.sources = [];
+    for (const s of list) {
+      if (!s || !isHttpUrl(s.url)) continue;
+      if (!bot.sources.some((x) => x.url === s.url)) bot.sources.push({ ...s });
+    }
   }
 
   async function streamChat(body, onEvent, signal) {
@@ -550,23 +635,38 @@
     }
   }
 
+  function runLocal(name) {
+    if (name === 'graph') openDrawer('graph');
+    else if (name === 'new') createChat();
+  }
+
   async function send(override) {
     if (busy) return;
     const text = String(override !== undefined ? override : els.input.value).trim();
     if (!text) return;
+    const local = /^\/(graph|new)\s*$/i.exec(text);
+    if (local) {
+      els.input.value = '';
+      autoSize();
+      updateCounter();
+      hideCmdPop();
+      runLocal(local[1].toLowerCase());
+      return;
+    }
     const s = ensureSession();
     const list = messages[s.id] || (messages[s.id] = []);
     if (!list.length && (!s.title || s.title === 'Новый чат')) {
       s.title = text.replace(/\s+/g, ' ').slice(0, 48);
     }
     const user = { role: 'user', text, time: Date.now() };
-    const bot = { role: 'assistant', text: '', reasoning: '', time: Date.now(), pending: true };
+    const bot = { role: 'assistant', text: '', reasoning: '', time: Date.now(), pending: true, tools: [], sources: [] };
     list.push(user, bot);
     if (list.length > 300) list.splice(0, list.length - 300);
     s.updated = Date.now();
     els.input.value = '';
     autoSize();
     updateCounter();
+    hideCmdPop();
     saveSessions();
     saveMessages(s.id);
     busy = true;
@@ -581,9 +681,13 @@
     let finished = false;
 
     try {
-      await streamChat({ message: text, chat_id: s.chatId || s.id }, (ev) => {
+      const body = { message: text, chat_id: s.chatId || s.id, web: !!settings.webSearch };
+      if (settings.model) body.model = settings.model;
+      await streamChat(body, (ev) => {
         if (typeof ev.token === 'string') { bot.text += ev.token; schedulePaint(bot, botIdx); }
         if (typeof ev.reasoning === 'string') { bot.reasoning += ev.reasoning; schedulePaint(bot, botIdx); }
+        if (ev.tool) { upsertTool(bot, ev.tool); schedulePaint(bot, botIdx); }
+        if (Array.isArray(ev.sources)) { addSources(bot, ev.sources); schedulePaint(bot, botIdx); }
         if (ev.error) { bot.error = String(ev.error); bot.pending = false; }
         if (ev.done) {
           if (!bot.text && ev.done.answer) bot.text = ev.done.answer;
@@ -602,6 +706,9 @@
       clearTimeout(paintTimer);
       paintQueued = false;
       if (bot.pending) bot.pending = false;
+      for (const t of bot.tools || []) {
+        if (t.status === 'running') t.status = finished ? 'done' : 'error';
+      }
       if (!finished && !bot.error && !bot.note) bot.note = 'Поток завершён';
       if (!bot.text && !bot.error && !bot.note) bot.note = 'Пустой ответ';
       if (bot.error && !bot.text) bot.pending = false;
@@ -624,6 +731,82 @@
     if (abortCtl) abortCtl.abort();
     fetch('/api/chat/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' } }).catch(() => {});
     toast('Останавливаю ответ…');
+  }
+
+  // ---------- команды ----------
+
+  function commandMatches(value) {
+    if (!value.startsWith('/') || /\s/.test(value)) return [];
+    const q = value.slice(1).toLowerCase();
+    return COMMANDS.filter((c) => c.name.startsWith(q));
+  }
+  function hideCmdPop() {
+    els.cmdPop.hidden = true;
+    cmdItems = [];
+    cmdIndex = 0;
+  }
+  function updateCmdPop() {
+    if (busy) { hideCmdPop(); return; }
+    cmdItems = commandMatches(els.input.value);
+    if (!cmdItems.length) { hideCmdPop(); return; }
+    cmdIndex = Math.min(cmdIndex, cmdItems.length - 1);
+    els.cmdPop.innerHTML = '';
+    cmdItems.forEach((c, i) => {
+      const b = el('button', 'cmd-item' + (i === cmdIndex ? ' on' : ''));
+      b.type = 'button';
+      b.setAttribute('role', 'option');
+      b.setAttribute('aria-selected', i === cmdIndex ? 'true' : 'false');
+      b.appendChild(el('b', '', '/' + c.name + (c.arg ? ' ' + c.arg : '')));
+      b.appendChild(el('span', '', c.hint));
+      b.addEventListener('mousedown', (e) => { e.preventDefault(); pickCommand(c); });
+      els.cmdPop.appendChild(b);
+    });
+    els.cmdPop.hidden = false;
+  }
+  function pickCommand(c) {
+    hideCmdPop();
+    if (c.local) {
+      els.input.value = '';
+      autoSize();
+      updateCounter();
+      runLocal(c.name);
+      return;
+    }
+    fillInput('/' + c.name + ' ');
+  }
+  function moveCmd(step) {
+    if (!cmdItems.length) return;
+    cmdIndex = (cmdIndex + step + cmdItems.length) % cmdItems.length;
+    updateCmdPop();
+  }
+
+  // ---------- модели ----------
+
+  async function loadModels() {
+    const select = els.setModel;
+    els.modelHint.textContent = 'загрузка списка…';
+    try {
+      const data = await api('GET', '/api/models');
+      const models = Array.isArray(data.models) ? data.models : [];
+      select.innerHTML = '';
+      const def = document.createElement('option');
+      def.value = '';
+      def.textContent = 'по умолчанию' + (data.default ? ' (' + data.default + ')' : '');
+      select.appendChild(def);
+      if (settings.model && !models.includes(settings.model)) models.unshift(settings.model);
+      for (const id of models) {
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = id;
+        select.appendChild(opt);
+      }
+      select.value = settings.model || '';
+      els.modelHint.textContent = models.length
+        ? 'Модель применяется к следующему ответу. Эмбеддинги в список не входят.'
+        : 'Моделей нет: загрузите модель в LM Studio или проверьте LLM_BACKEND.';
+    } catch (err) {
+      els.modelHint.textContent = 'Список недоступен: ' + (err.message || err);
+    }
   }
 
   // ---------- status ----------
@@ -650,6 +833,12 @@
     wide.appendChild(el('b', '', (s.model || s.backend || '—')));
     wide.appendChild(el('span', '', 'модель · ' + (s.backend || 'backend')));
     els.statusGrid.appendChild(wide);
+    const mem2 = el('div', 'stat wide');
+    const online = s.memory_online !== false;
+    mem2.appendChild(el('b', '', (s.memory_backend === 'mcp' ? 'общая память (MCP)' : 'локальная память') +
+      (online ? '' : ' — недоступна')));
+    mem2.appendChild(el('span', '', online ? 'все агенты пишут в одно хранилище' : 'чат работает без памяти, сообщения ждут восстановления'));
+    els.statusGrid.appendChild(mem2);
     if (s.embedder) {
       const e = el('div', 'stat wide');
       e.appendChild(el('b', '', s.embedder.name || m.encoder || '—'));
@@ -697,9 +886,296 @@
     }
   }
 
+  // ---------- карта нейронов ----------
+  // Узлы — сущности памяти, связи — действующие факты. Раскладка — силовая (Фрюхтерман–Рейнгольд),
+  // позиции сохраняются между обновлениями, новые узлы (созданные в этой сессии) подсвечиваются.
+
+  const graph = {
+    nodes: [], edges: [], byId: {}, W: 0, H: 0, dpr: 1, temp: 0, frames: 0, raf: 0,
+    hover: null, selected: null, busy: false, typeColors: {},
+    sessionStart: Date.now(),
+  };
+  const LAYOUT_FRAMES = 300;
+
+  function typeColor(type) {
+    const key = type || 'без типа';
+    if (!graph.typeColors[key]) {
+      graph.typeColors[key] = PALETTE[Object.keys(graph.typeColors).length % PALETTE.length];
+    }
+    return graph.typeColors[key];
+  }
+  function shorten(text, n) {
+    const s = String(text || '');
+    return s.length > n ? s.slice(0, n - 1) + '…' : s;
+  }
+  function graphVisible() {
+    return drawerTab === 'graph' && els.drawer.classList.contains('open');
+  }
+
+  function resizeGraph() {
+    const c = els.graphCanvas;
+    const box = els.graphStage;
+    if (!box) return;
+    const w = box.clientWidth || 300;
+    const h = box.clientHeight || 340;
+    graph.dpr = window.devicePixelRatio || 1;
+    graph.W = w;
+    graph.H = h;
+    c.width = Math.round(w * graph.dpr);
+    c.height = Math.round(h * graph.dpr);
+    c.style.width = w + 'px';
+    c.style.height = h + 'px';
+    kick();
+  }
+
+  function buildGraph(data) {
+    const prev = graph.byId;
+    const W = graph.W || 300;
+    const H = graph.H || 340;
+    const nodes = (data.nodes || []).map((n) => {
+      const old = prev[n.id];
+      const created = parseIso(n.created);
+      return {
+        id: n.id, label: n.label || n.id, type: n.type || null, degree: n.degree || 0,
+        created, isNew: created >= graph.sessionStart, linked: !!n.linked,
+        r: 4 + Math.min(10, Math.sqrt(n.degree || 1) * 2.6),
+        x: old ? old.x : W / 2 + (Math.random() - 0.5) * W * 0.6,
+        y: old ? old.y : H / 2 + (Math.random() - 0.5) * H * 0.6,
+        dx: 0, dy: 0, color: typeColor(n.type),
+      };
+    });
+    const byId = {};
+    for (const n of nodes) byId[n.id] = n;
+    const edges = [];
+    for (const e of data.edges || []) {
+      const a = byId[e.source];
+      const b = byId[e.target];
+      if (a && b) edges.push({ ...e, a, b, created: parseIso(e.recorded_at) });
+    }
+    const changed = nodes.length !== Object.keys(prev).length || nodes.some((n) => !prev[n.id]);
+    graph.nodes = nodes;
+    graph.edges = edges;
+    graph.byId = byId;
+    if (changed) {
+      graph.temp = W / 8;
+      graph.frames = 0;
+    }
+    renderGraphMeta(data, nodes, edges);
+    const sel = graph.selected && byId[graph.selected.id];
+    selectNode(sel || null);
+    kick();
+  }
+
+  function renderGraphMeta(data, nodes, edges) {
+    const totals = data.totals || {};
+    const fresh = nodes.filter((n) => n.isNew).length;
+    els.graphStats.textContent = 'нейронов: ' + nodes.length + ' · связей: ' + edges.length +
+      ' · всего фактов: ' + (totals.facts ?? 0) + ' · новых за сессию: ' + fresh +
+      (data.truncated ? ' · показаны свежие связи' : '');
+    els.graphEmpty.hidden = nodes.length > 0;
+
+    els.graphLegend.innerHTML = '';
+    const present = [...new Set(nodes.map((n) => n.type || 'без типа'))];
+    for (const key of present) {
+      const item = el('span', 'legend-item');
+      const dot = el('i', 'legend-dot');
+      dot.style.background = typeColor(key);
+      item.appendChild(dot);
+      item.appendChild(document.createTextNode(key));
+      els.graphLegend.appendChild(item);
+    }
+
+    els.graphGrowth.innerHTML = '';
+    const growth = (data.growth || []).slice(-30);
+    if (!growth.length) {
+      els.graphGrowth.appendChild(el('div', 'empty', 'пока пусто'));
+      return;
+    }
+    const max = Math.max(1, ...growth.map((g) => g.facts));
+    for (const g of growth) {
+      const bar = el('div', 'bar');
+      bar.style.height = Math.max(6, Math.round((g.facts / max) * 100)) + '%';
+      bar.title = g.day + ': ' + g.facts + ' фактов';
+      els.graphGrowth.appendChild(bar);
+    }
+  }
+
+  function kick() {
+    if (!graph.raf) graph.raf = requestAnimationFrame(frame);
+  }
+  function frame() {
+    graph.raf = 0;
+    const laying = graph.frames < LAYOUT_FRAMES && graph.nodes.length > 0;
+    if (laying) {
+      layoutStep();
+      graph.frames++;
+    }
+    draw();
+    if (laying) kick();
+  }
+
+  function layoutStep() {
+    const { nodes, edges, W, H } = graph;
+    const n = nodes.length;
+    const k = Math.sqrt((W * H) / n) * 0.9;
+    for (const a of nodes) { a.dx = 0; a.dy = 0; }
+    for (let i = 0; i < n; i++) {
+      const a = nodes[i];
+      for (let j = i + 1; j < n; j++) {
+        const b = nodes[j];
+        const dx = a.x - b.x;
+        const dy = a.y - b.y;
+        const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+        const f = (k * k) / d;
+        a.dx += (dx / d) * f;
+        a.dy += (dy / d) * f;
+        b.dx -= (dx / d) * f;
+        b.dy -= (dy / d) * f;
+      }
+    }
+    for (const e of edges) {
+      const dx = e.a.x - e.b.x;
+      const dy = e.a.y - e.b.y;
+      const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const f = (d * d) / k;
+      e.a.dx -= (dx / d) * f;
+      e.a.dy -= (dy / d) * f;
+      e.b.dx += (dx / d) * f;
+      e.b.dy += (dy / d) * f;
+    }
+    const cx = W / 2;
+    const cy = H / 2;
+    const t = graph.temp;
+    for (const a of nodes) {
+      a.dx += (cx - a.x) * 0.01;
+      a.dy += (cy - a.y) * 0.01;
+      const len = Math.sqrt(a.dx * a.dx + a.dy * a.dy) || 0.01;
+      const lim = Math.min(len, t);
+      a.x += (a.dx / len) * lim;
+      a.y += (a.dy / len) * lim;
+      a.x = Math.max(a.r + 4, Math.min(W - a.r - 4, a.x));
+      a.y = Math.max(a.r + 4, Math.min(H - a.r - 4, a.y));
+    }
+    graph.temp = Math.max(0.5, t * 0.985);
+  }
+
+  function isNeighbor(n, hi) {
+    return graph.edges.some((e) => (e.a === hi && e.b === n) || (e.b === hi && e.a === n));
+  }
+
+  function draw() {
+    const c = els.graphCanvas;
+    const ctx = c.getContext ? c.getContext('2d') : null;
+    if (!ctx) return;
+    const { W, H, dpr } = graph;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const hi = graph.selected || graph.hover;
+
+    for (const e of graph.edges) {
+      const focus = hi && (e.a === hi || e.b === hi);
+      const conf = Math.max(0, Math.min(1, e.confidence || 0));
+      ctx.strokeStyle = focus ? 'rgba(236,238,241,.8)' : 'rgba(154,163,178,' + (0.14 + 0.45 * conf).toFixed(2) + ')';
+      ctx.lineWidth = focus ? 1.6 : 0.6 + conf;
+      ctx.beginPath();
+      ctx.moveTo(e.a.x, e.a.y);
+      ctx.lineTo(e.b.x, e.b.y);
+      ctx.stroke();
+    }
+
+    for (const n of graph.nodes) {
+      const dim = hi && n !== hi && !isNeighbor(n, hi);
+      ctx.globalAlpha = dim ? 0.3 : 0.95;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+      ctx.fillStyle = n.color;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      if (n.isNew) {
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.r + 3.5, 0, Math.PI * 2);
+        ctx.strokeStyle = '#4cc38a';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+      if (n === graph.selected) {
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.r + 6, 0, Math.PI * 2);
+        ctx.strokeStyle = '#eceef1';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+    }
+
+    const labelled = new Set([...graph.nodes].sort((a, b) => b.degree - a.degree).slice(0, 14));
+    if (hi) labelled.add(hi);
+    ctx.font = '12px system-ui, -apple-system, Segoe UI, sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#eceef1';
+    for (const n of labelled) {
+      ctx.fillText(shorten(n.label, 26), n.x + n.r + 5, n.y);
+    }
+  }
+
+  function nodeAt(x, y) {
+    let best = null;
+    let bestD = Infinity;
+    for (const n of graph.nodes) {
+      const d = Math.hypot(n.x - x, n.y - y);
+      if (d <= n.r + 6 && d < bestD) { best = n; bestD = d; }
+    }
+    return best;
+  }
+  function canvasPoint(ev) {
+    const r = els.graphCanvas.getBoundingClientRect();
+    return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  }
+
+  function selectNode(n) {
+    graph.selected = n;
+    draw();
+    const box = els.graphDetail;
+    box.innerHTML = '';
+    if (!n) {
+      box.appendChild(el('div', 'empty', 'Нажмите на узел на карте.'));
+      return;
+    }
+    const head = el('div', 'card');
+    head.appendChild(el('div', 'fact-text', n.label));
+    const meta = [n.type, 'связей: ' + n.degree];
+    if (n.created) meta.push('с ' + new Date(n.created).toLocaleDateString('ru-RU'));
+    if (n.isNew) meta.push('новый в этой сессии');
+    if (!n.linked) meta.push('без сущности');
+    head.appendChild(el('div', 'fact-meta', meta.filter(Boolean).join(' · ')));
+    box.appendChild(head);
+    const related = graph.edges.filter((e) => e.a === n || e.b === n).slice(0, 30);
+    for (const e of related) {
+      const card = el('div', 'card');
+      card.appendChild(el('div', 'fact-text', e.a.label + ' — ' + e.label + ' → ' + e.b.label));
+      const when = e.created ? ' · ' + new Date(e.created).toLocaleString('ru-RU') : '';
+      card.appendChild(el('div', 'fact-meta', 'уверенность ' + e.confidence + when));
+      box.appendChild(card);
+    }
+  }
+
+  async function loadGraph() {
+    if (graph.busy) return;
+    graph.busy = true;
+    resizeGraph();
+    try {
+      const data = await api('GET', '/api/memory/graph?limit=200');
+      buildGraph(data);
+    } catch (err) {
+      els.graphStats.textContent = 'Ошибка: ' + (err.message || err);
+    } finally {
+      graph.busy = false;
+    }
+  }
+
   // ---------- memory drawer ----------
 
   function selectTab(name) {
+    drawerTab = name;
     document.querySelectorAll('.tab').forEach((t) => {
       const on = t.dataset.tab === name;
       t.classList.toggle('on', on);
@@ -708,6 +1184,7 @@
     document.querySelectorAll('.pane').forEach((p) => p.classList.toggle('on', p.id === 'pane-' + name));
     if (name === 'facts') loadFacts();
     if (name === 'status') refreshStatus();
+    if (name === 'graph') requestAnimationFrame(loadGraph);
     if (name === 'search') setTimeout(() => els.searchQuery.focus(), 30);
   }
   function openDrawer(tab) {
@@ -723,6 +1200,7 @@
     els.drawerScrim.classList.remove('open');
     els.drawer.setAttribute('aria-hidden', 'true');
     els.drawerBtn.setAttribute('aria-expanded', 'false');
+    drawerTab = null;
   }
 
   async function loadFacts() {
@@ -791,8 +1269,7 @@
     }
     for (const f of facts) {
       const card = el('div', 'card');
-      const score = el('span', 'score', 'score ' + f.score);
-      card.appendChild(score);
+      card.appendChild(el('span', 'score', 'score ' + f.score));
       card.appendChild(el('div', 'fact-text', f.text || ''));
       card.appendChild(el('div', 'fact-meta', 'уверенность ' + f.confidence));
       els.searchResults.appendChild(card);
@@ -883,6 +1360,12 @@
       lines.push(m.role === 'user' ? '## Вы' : '## Ассистент');
       if (m.reasoning && settings.showReasoning) lines.push('', '> ' + m.reasoning.replace(/\n/g, '\n> '));
       lines.push('', m.text || (m.error ? 'Ошибка: ' + m.error : (m.note || '')));
+      if (m.role !== 'user' && Array.isArray(m.sources) && m.sources.length) {
+        lines.push('', 'Источники:');
+        for (const src of m.sources) {
+          if (isHttpUrl(src.url)) lines.push('- ' + (src.n ? '[' + src.n + '] ' : '') + (src.title || '') + ' — ' + src.url);
+        }
+      }
       lines.push('');
     }
     download(safeName(s.title) + '.md', lines.join('\n'), 'text/markdown;charset=utf-8');
@@ -988,9 +1471,47 @@
   els.statusReload.addEventListener('click', refreshStatus);
   els.consolidateBtn.addEventListener('click', consolidate);
 
+  els.graphReload.addEventListener('click', loadGraph);
+  els.graphCanvas.addEventListener('pointermove', (ev) => {
+    const p = canvasPoint(ev);
+    const n = nodeAt(p.x, p.y);
+    if (n !== graph.hover) {
+      graph.hover = n;
+      els.graphCanvas.style.cursor = n ? 'pointer' : 'default';
+      draw();
+    }
+  });
+  els.graphCanvas.addEventListener('pointerleave', () => { graph.hover = null; draw(); });
+  els.graphCanvas.addEventListener('click', (ev) => {
+    const p = canvasPoint(ev);
+    const n = nodeAt(p.x, p.y);
+    selectNode(n === graph.selected ? null : n);
+  });
+  window.addEventListener('resize', () => { if (graphVisible()) resizeGraph(); });
+  // Факты появляются фоном (очередь индексации) — карта обновляется сама, пока открыта.
+  setInterval(() => {
+    if (graphVisible() && els.graphLive.checked && !busy) loadGraph();
+  }, 4000);
+
   els.sendBtn.addEventListener('click', () => { if (busy) stopGeneration(); else send(); });
-  els.input.addEventListener('input', () => { autoSize(); updateCounter(); });
+  els.input.addEventListener('input', () => {
+    autoSize();
+    updateCounter();
+    cmdIndex = 0;
+    updateCmdPop();
+  });
+  els.input.addEventListener('blur', () => setTimeout(hideCmdPop, 120));
   els.input.addEventListener('keydown', (e) => {
+    if (!els.cmdPop.hidden && cmdItems.length) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); moveCmd(1); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); moveCmd(-1); return; }
+      if (e.key === 'Escape') { e.preventDefault(); hideCmdPop(); return; }
+      if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey)) {
+        e.preventDefault();
+        pickCommand(cmdItems[cmdIndex]);
+        return;
+      }
+    }
     if (e.key !== 'Enter') return;
     const force = e.ctrlKey || e.metaKey;
     if (force || (settings.enterSends && !e.shiftKey)) {
@@ -1004,13 +1525,26 @@
     applySettings();
     renderMessages();
   });
+  els.webTool.addEventListener('click', () => {
+    settings.webSearch = !settings.webSearch;
+    saveSettings();
+    applySettings();
+    toast(settings.webSearch ? 'Интернет включён: модель может искать и читать страницы' : 'Интернет выключен');
+  });
   els.scrollBottomBtn.addEventListener('click', scrollEnd);
   els.messages.addEventListener('scroll', updateScrollButton, { passive: true });
 
   els.settingsBtn.addEventListener('click', () => {
     applySettings();
     els.settingsDialog.showModal();
+    loadModels();
   });
+  els.setModel.addEventListener('change', () => {
+    settings.model = els.setModel.value;
+    saveSettings();
+    toast(settings.model ? 'Модель: ' + settings.model : 'Модель по умолчанию');
+  });
+  els.modelsReload.addEventListener('click', loadModels);
   els.setCompact.addEventListener('change', () => { settings.compact = els.setCompact.checked; saveSettings(); applySettings(); });
   els.setFontSize.addEventListener('change', () => { settings.fontSize = els.setFontSize.value; saveSettings(); applySettings(); });
   els.setAutoScroll.addEventListener('change', () => { settings.autoScroll = els.setAutoScroll.checked; saveSettings(); });
@@ -1032,8 +1566,8 @@
     }
     const tag = (e.target && e.target.tagName || '').toLowerCase();
     const typing = tag === 'input' || tag === 'textarea' || tag === 'select' || (e.target && e.target.isContentEditable);
-    const emptyComposer = e.target === els.input && !els.input.value;
-    if (e.key === '/' && (!typing || emptyComposer)) {
+    // «/» в поле чата — это начало команды, а не переход к поиску по чатам.
+    if (e.key === '/' && !typing) {
       e.preventDefault();
       if (window.innerWidth <= 860) {
         openNav();

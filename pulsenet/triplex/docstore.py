@@ -57,6 +57,7 @@ class Doc:
     text: str
     recorded_at: str
     chunks: List[Chunk] = field(default_factory=list)
+    agent: str = ""                 # кто сохранил документ (агент из токена MCP или "chat")
 
 
 def _now() -> str:
@@ -83,12 +84,13 @@ class DocStore:
 
     def _insert(self, rec: dict) -> Doc:
         chunks = [Chunk(c["chunk_id"], tuple(c["span"]), c["text"]) for c in rec["chunks"]]
-        doc = Doc(rec["doc_id"], rec["session_id"], rec["role"], rec["text"], rec["recorded_at"], chunks)
+        doc = Doc(rec["doc_id"], rec["session_id"], rec["role"], rec["text"], rec["recorded_at"], chunks,
+                  agent=rec.get("agent", ""))
         self.docs[doc.doc_id] = doc
         return doc
 
     def add(self, text: str, session_id: str = "", role: str = "user",
-            recorded_at: Optional[str] = None) -> Doc:
+            recorded_at: Optional[str] = None, agent: str = "") -> Doc:
         if not text or not text.strip():
             raise ValueError("пустой документ")
         recorded_at = recorded_at or _now()
@@ -100,7 +102,7 @@ class DocStore:
             chunks = [Chunk(f"c:{doc_id[2:]}:{i}", (a, b), text[a:b])
                       for i, (a, b) in enumerate(_pack(text, self.chunk_chars))]
             rec = {"doc_id": doc_id, "session_id": session_id, "role": role, "text": text,
-                   "recorded_at": recorded_at,
+                   "recorded_at": recorded_at, "agent": agent,
                    "chunks": [{"chunk_id": c.chunk_id, "span": list(c.span), "text": c.text} for c in chunks]}
             if self.path:
                 with open(self.path, "a", encoding="utf-8") as f:

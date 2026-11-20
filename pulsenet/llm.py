@@ -196,13 +196,23 @@ class LMStudioBackend(OpenAICompat):
         self.loaded = ids[0] if ids else None
         return self.loaded
 
+    def _embedding_ids(self):
+        """Модели эмбеддингов — в выбор чата не попадают (нужны только памяти)."""
+        try:
+            data = http_json(self._root_url() + "/api/v0/models", timeout=5)
+        except (OSError, ValueError):
+            return set()
+        return {m["id"] for m in data.get("data", [])
+                if isinstance(m, dict) and m.get("id") and m.get("type") == "embeddings"}
+
     def list_models(self):
         try:
             data = http_json(self.base_url + "/models", timeout=5)
         except (OSError, ValueError) as exc:
             raise BackendError(f"LM Studio недоступен по адресу {self.base_url}: {exc}") from exc
         self.refresh_loaded()
-        return [m["id"] for m in data.get("data", []) if "id" in m]
+        skip = self._embedding_ids()
+        return [m["id"] for m in data.get("data", []) if "id" in m and m["id"] not in skip]
 
     def _known_ids(self):
         """Все id, которые LM Studio принимает в запросе (включая ещё не загруженные)."""

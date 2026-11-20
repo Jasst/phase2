@@ -1,14 +1,14 @@
 @echo off
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 rem ---- Usage: run_server.bat [start|stop] ----
-rem start (default): restart docker services + unified MCP + web/API
-rem stop: stop docker services + pulsenet python processes
-setlocal EnableDelayedExpansion
+rem start (default): stop old pulsenet processes, start docker services (nginx, searxng), MCP, web/API
+rem stop: stop pulsenet processes and listeners on its ports, stop docker services
 
-set MODE=start
-if /i "%~1"=="stop" set MODE=stop
-if /i "%~1"=="start" set MODE=start
+set "MODE=start"
+if /i "%~1"=="stop" set "MODE=stop"
+if /i "%~1"=="start" set "MODE=start"
 if not "%~1"=="" if /i not "%~1"=="stop" if /i not "%~1"=="start" (
     echo [error] Unknown argument: %~1
     echo Usage: run_server.bat start ^| run_server.bat stop
@@ -16,7 +16,7 @@ if not "%~1"=="" if /i not "%~1"=="stop" if /i not "%~1"=="start" (
     exit /b 1
 )
 
-if "!MODE!"=="stop" (
+if "%MODE%"=="stop" (
     call :stop_python
     call :stop_docker
     echo [ok] Services stopped.
@@ -24,20 +24,20 @@ if "!MODE!"=="stop" (
     exit /b 0
 )
 
-rem ---- start: ensure clean state, then run everything ----
+rem ---- start: сначала полная остановка старых процессов, потом запуск ----
 call :stop_python
 call :start_docker
 goto :run_python
 
 :stop_python
-echo [app] Stopping pulsenet python processes...
-powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'pulsenet(\.unified_mcp)?\s+serve' -or $_.CommandLine -match '-m\s+pulsenet' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; Write-Host ('[app] Stopped PID ' + $_.ProcessId) } catch {} }"
+echo [app] Stopping pulsenet processes and listeners on its ports...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0stop_server.ps1"
 exit /b 0
 
 :stop_docker
 echo [docker] Stopping services...
 docker compose down
-if !errorlevel! neq 0 (
+if errorlevel 1 (
     echo [docker] Warning: docker compose down failed or docker unavailable.
 ) else (
     echo [docker] Services stopped.
@@ -52,7 +52,7 @@ if errorlevel 1 (
     exit /b 0
 )
 
-rem SearXNG wants a secret in searxng/.env; generate it on first run.
+rem SearXNG wants a secret in searxng\.env; generate it on first run.
 if not exist "searxng\.env" (
     echo [searxng] Creating searxng\.env with a random secret...
     python -c "import secrets; print('SEARXNG_SECRET=' + secrets.token_hex(32))" > "searxng\.env"
@@ -79,10 +79,11 @@ if not exist ".venv\Scripts\activate.bat" (
 )
 call ".venv\Scripts\activate.bat"
 
-rem ---- Единый MCP-сервер: pulsenet-unified (память + интернет, веб-поиск) ----
+rem ---- MCP-сервер pulsenet-unified (память + интернет) в фоне ----
 echo [mcp] Starting pulsenet-unified MCP server (http://127.0.0.1:8010/mcp)...
 start /b "" python -m pulsenet.unified_mcp serve
 
+rem ---- чат / веб-API на переднем плане ----
 echo [app] Starting web/API server (http://127.0.0.1:8000/)...
 python -m pulsenet serve
 pause
