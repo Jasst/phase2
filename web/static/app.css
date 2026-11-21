@@ -139,7 +139,6 @@ body.standalone .app { height: 100vh; }
 }
 .auth-user .icon-btn { width: 26px; height: 26px; flex: 0 0 26px; }
 .sb-stat { padding: 2px 12px 4px; font-size: 11.5px; color: var(--text-muted); }
-.sb-hint { padding: 2px 12px 8px; font-size: 10.5px; line-height: 1.35; color: var(--text-muted); text-align: center; }
 .sb-link {
   display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 12px;
   border: none; border-radius: 10px; background: transparent; color: var(--text-secondary); font-size: 14px;
@@ -215,6 +214,11 @@ body.standalone .app { height: 100vh; }
 }
 .msg.bot .bubble {
   background: var(--bg-surface); border: 1px solid var(--border-color); border-bottom-left-radius: 6px;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+.msg.bot.pending .bubble {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 1px rgba(169, 205, 255, .08), 0 0 22px rgba(77, 157, 255, .07);
 }
 .msg.bot.error .bubble { border-color: rgba(229, 84, 79, .55); }
 .msg-foot {
@@ -242,15 +246,38 @@ body.standalone .app { height: 100vh; }
 }
 
 .reasoning { margin-bottom: 10px; font-size: 13px; color: var(--text-muted); }
-.reasoning summary { cursor: pointer; list-style: none; user-select: none; }
+.reasoning summary {
+  cursor: pointer; list-style: none; user-select: none; -webkit-user-select: none;
+  display: flex; align-items: center; gap: 8px; min-height: 24px;
+}
 .reasoning summary::-webkit-details-marker { display: none; }
-.reasoning summary::before { content: "▸ "; color: var(--text-muted); }
-.reasoning[open] summary::before { content: "▾ "; }
+.reasoning summary::before { content: "▸"; color: var(--text-muted); }
+.reasoning[open] summary::before { content: "▾"; }
+.reasoning-copy {
+  margin-left: auto; padding: 2px 8px; border-radius: 6px; border: 1px solid transparent;
+  background: var(--bg-tertiary); color: var(--text-muted); font: inherit; font-size: 11px;
+  opacity: 0; transition: opacity var(--transition-fast), color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+.reasoning:hover .reasoning-copy, .reasoning-copy:focus-visible { opacity: .9; }
+.reasoning-copy:hover { color: var(--accent-light); border-color: var(--border-focus); }
 .reasoning .rbody {
   white-space: pre-wrap; margin-top: 6px; padding: 6px 0 6px 12px;
   border-left: 2px solid var(--border-color); max-height: 280px; overflow: auto;
+  user-select: text; -webkit-user-select: text;
 }
+.reasoning.frozen .rbody { opacity: .85; }
+.reasoning.frozen::after {
+  content: "Выделение текста — поток рассуждений на паузе";
+  display: block; margin-top: 5px; font-size: 11px; color: var(--accent-light); opacity: .8;
+}
+@media (hover: none) { .reasoning-copy { opacity: .85; } }
 .markdown-body { overflow-wrap: anywhere; word-break: break-word; min-width: 0; max-width: 100%; }
+.markdown-body.streaming > :last-child::after {
+  content: "▍"; display: inline-block; margin-left: 2px; color: var(--accent-light);
+  font-size: .9em; line-height: 1; vertical-align: -.12em;
+  animation: caretPulse 1s steps(2, start) infinite;
+}
 .markdown-body > :first-child { margin-top: 0; }
 .markdown-body > :last-child { margin-bottom: 0; }
 .markdown-body p { margin: .4em 0; }
@@ -581,7 +608,15 @@ body.compact .welcome { padding: 16px 8px; }
 .ui-menu-item:disabled { opacity: .55; cursor: default; color: var(--text-secondary); }
 .ui-menu-item.danger { color: var(--danger-color); }
 .ui-menu-sep { height: 1px; margin: 4px 2px; background: var(--border-color); }
-.msg, .ui-menu, .sess, .card, .chat-title { -webkit-touch-callout: none; }
+.msg, .msg *, .ui-menu, .sess, .card, .chat-title { -webkit-touch-callout: none; }
+/* На телефоне долгое нажатие открывает наше меню действий, а не системную
+   подсказку «Копировать». Текст при желании копируется пунктом меню или
+   кнопкой в блоке рассуждений. */
+@media (hover: none) and (pointer: coarse) {
+  .msg, .msg *, .sess, .sess *, .chat-title { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  .reasoning .rbody { -webkit-user-select: none; user-select: none; }
+  .msg, .sess { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+}
 .ui-menu {
   max-width: min(320px, calc(100vw - 16px));
   max-height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 16px);
@@ -601,6 +636,7 @@ body.compact .welcome { padding: 16px 8px; }
 
 @keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 @keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+@keyframes caretPulse { 0%, 100% { opacity: 1; } 50% { opacity: .15; } }
 
 /* ---------- адаптив ---------- */
 @media (max-width: 860px) {

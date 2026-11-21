@@ -94,6 +94,9 @@
   let toastTimer = null;
   let paintTimer = null;
   let paintQueued = false;
+  // Блоки рассуждений, обновление которых приостановлено, пока пользователь
+  // выделяет в них текст (иначе DOM перерисовывается и выделение сбрасывается).
+  const frozenReasonings = new Set();
   let drawerTab = null;
   let cmdItems = [];
   let cmdIndex = 0;
@@ -342,11 +345,13 @@
   function safeName(name) {
     return String(name || 'chat').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80) || 'chat';
   }
-  function ask(title, text, okLabel) {
+  function ask(title, text, okLabel, danger = true) {
     return new Promise((resolve) => {
       els.confirmTitle.textContent = title;
       els.confirmText.textContent = text;
-      els.confirmYes.textContent = okLabel || 'Удалить';
+      els.confirmYes.textContent = okLabel || (danger ? 'Удалить' : 'Продолжить');
+      els.confirmYes.classList.toggle('btn-danger', danger);
+      els.confirmYes.classList.toggle('btn-primary', !danger);
       const done = () => {
         els.confirmDialog.removeEventListener('close', done);
         resolve(els.confirmDialog.returnValue === 'confirm');
@@ -393,6 +398,10 @@
   }
   if (els.logoutBtn) {
     els.logoutBtn.addEventListener('click', async () => {
+      const ok = await ask('Выйти из аккаунта?',
+        'Чаты и память останутся на сервере и будут доступны после повторного входа.',
+        'Выйти', false);
+      if (!ok) return;
       try { await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin' }); } catch (_) { /* ignore */ }
       location.href = '/login';
     });
@@ -848,14 +857,37 @@
   }
 
   function paintBubble(bubble, m, live) {
-    const wasOpen = !!(bubble.querySelector('details.reasoning') || {}).open;
+    const prevReasoning = bubble.querySelector('details.reasoning');
+    const wasOpen = !!(prevReasoning || {}).open;
+    const keepFrozen = !!(prevReasoning && frozenReasonings.has(prevReasoning));
+    const queuedReasoning = keepFrozen
+      ? (prevReasoning.querySelector('.rbody')?.dataset.queued ?? m.reasoning)
+      : m.reasoning;
+    if (prevReasoning) frozenReasonings.delete(prevReasoning);
     bubble.innerHTML = '';
+    delete bubble.dataset.liveSig;
     const isBot = m.role !== 'user';
     if (isBot && m.reasoning && settings.showReasoning) {
       const d = el('details', 'reasoning');
       d.open = wasOpen || (!!m.pending && !m.text);
-      d.appendChild(el('summary', '', 'Рассуждения'));
-      d.appendChild(el('div', 'rbody', m.reasoning));
+      if (keepFrozen) {
+        frozenReasonings.add(d);
+        d.classList.add('frozen');
+      }
+      const sum = el('summary', '', 'Рассуждения');
+      const copy = el('button', 'reasoning-copy', 'Копировать');
+      copy.type = 'button';
+      copy.title = 'Скопировать рассуждения';
+      copy.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        copyText(d.querySelector('.rbody')?.textContent || '');
+      });
+      sum.appendChild(copy);
+      d.appendChild(sum);
+      const rbody = el('div', 'rbody', queuedReasoning);
+      if (keepFrozen) rbody.dataset.queued = queuedReasoning;
+      d.appendChild(rbody);
       bubble.appendChild(d);
     }
     if (isBot && Array.isArray(m.tools) && m.tools.length) {
@@ -874,8 +906,9 @@
       t.append(el('span'), el('span'), el('span'));
       bubble.appendChild(t);
     } else if (m.text) {
-      const md = el('div', 'markdown-body');
+      const md = el('div', 'markdown-body' + (live && m.pending ? ' streaming' : ''));
       md.innerHTML = renderMd(m.text);
+      md.dataset.raw = m.text;
       bubble.appendChild(md);
       if (!live) decorate(md);
     }
@@ -920,9 +953,77 @@
     if (m.indexPending) bubble.appendChild(el('div', 'meta-line', 'в очереди индексации: ' + m.indexPending));
   }
 
+  function liveSignature(m) {
+    const tools = (m.tools || []).map((t) => (t.status || '') + ':' + (t.label || t.name || '')).join('|');
+    return [settings.showReasoning ? 1 : 0, m.pending ? 1 : 0, tools,
+      (m.images || []).length, (m.sources || []).length,
+      m.error || '', m.note || '', m.indexPending || 0, m.gen ? 1 : 0].join('~');
+  }
+
+  // Во время стриминга перерисовываем только текст: так выделение и прокрутка
+  // рассуждений не сбрасываются на каждой порции токенов.
+  function updateLiveBubble(bubble, m) {
+    const sig = liveSignature(m);
+    if (bubble.dataset.liveSig !== sig) {
+      paintBubble(bubble, m, true);
+      bubble.dataset.liveSig = sig;
+      return;
+    }
+    const d = bubble.querySelector('details.reasoning');
+    if (d && settings.showReasoning) {
+      const body = d.querySelector('.rbody');
+      const next = m.reasoning || '';
+      if (body && body.textContent !== next) {
+        const sel = window.getSelection();
+        if (sel && sel.toString() && d.contains(sel.anchorNode)) {
+          frozenReasonings.add(d);
+          d.classList.add('frozen');
+        }
+        body.dataset.queued = next;
+        if (!frozenReasonings.has(d)) {
+          body.textContent = next;
+          delete body.dataset.queued;
+        }
+      }
+    }
+    const md = bubble.querySelector('.markdown-body');
+    if (m.text) {
+      if (!md) { paintBubble(bubble, m, true); bubble.dataset.liveSig = sig; return; }
+      if (md.dataset.raw !== m.text) {
+        md.innerHTML = renderMd(m.text);
+        md.dataset.raw = m.text;
+      }
+      md.classList.toggle('streaming', !!m.pending);
+    } else if (md) {
+      paintBubble(bubble, m, true);
+      bubble.dataset.liveSig = sig;
+    }
+  }
+
+  function flushReasoning(d) {
+    const body = d.querySelector('.rbody');
+    if (body && body.dataset.queued != null) {
+      body.textContent = body.dataset.queued;
+      delete body.dataset.queued;
+    }
+    d.classList.remove('frozen');
+    frozenReasonings.delete(d);
+  }
+
+  document.addEventListener('selectionchange', () => {
+    if (!frozenReasonings.size) return;
+    const sel = window.getSelection();
+    for (const d of [...frozenReasonings]) {
+      if (!d.isConnected) { frozenReasonings.delete(d); continue; }
+      if (sel && sel.toString() && d.contains(sel.anchorNode)) continue;
+      flushReasoning(d);
+    }
+  });
+
   function buildMessage(m, idx) {
     const isUser = m.role === 'user';
-    const root = el('div', 'msg ' + (isUser ? 'user' : 'bot') + (m.error ? ' error' : ''));
+    const root = el('div', 'msg ' + (isUser ? 'user' : 'bot') +
+      (m.error ? ' error' : '') + (m.pending ? ' pending' : ''));
     root.dataset.idx = String(idx);
     if (!isUser) root.appendChild(el('div', 'avatar-bot', '✦'));
     const body = el('div', 'msg-body');
@@ -997,7 +1098,7 @@
       const bubble = els.inner.querySelector('.msg[data-idx="' + idx + '"] .bubble');
       if (!bubble) return;
       const atBottom = isNearBottom();
-      paintBubble(bubble, bot, true);
+      updateLiveBubble(bubble, bot);
       if (atBottom && settings.autoScroll) scrollEnd();
     }, 60);
   }
@@ -1403,8 +1504,11 @@
   // Универсальное «меню по правой кнопке / долгому нажатию»: работает на сообщениях,
   // чатах, фактах — везде, где есть осмысленные действия над объектом.
   function isMenuExempt(target, root) {
-    return target !== root && !!target.closest &&
-      !!target.closest('button, a, input, textarea, select, [contenteditable="true"], [role="menuitem"]');
+    if (!target || target === root || !target.closest) return false;
+    // Кнопка чата в сайдбаре сама является root: клик по её внутреннему <span>
+    // не должен считаться кликом по вложенной интерактивной кнопке.
+    const hit = target.closest('button, a, input, textarea, select, [contenteditable="true"], [role="menuitem"]');
+    return !!hit && hit !== root;
   }
   function attachMenu(root, open, skipSelector) {
     if (!root) return;
