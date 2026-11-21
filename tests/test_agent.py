@@ -165,6 +165,32 @@ def _app(tmp_path, monkeypatch, scripts):
     return app
 
 
+def test_build_extractor_honors_explicit_model(monkeypatch):
+    import pulsenet.memory_service as ms
+
+    seen = []
+    monkeypatch.setattr(ms, "openai_chat_caller",
+                        lambda url, model: seen.append((url, model)) or (lambda prompt: "{}"))
+    env = {"TRIPLEX_LLM_URL": "http://llm/v1", "TRIPLEX_LLM_MODEL": "env-model"}
+    assert ms.build_extractor(env) is not None
+    assert seen[-1][1] == "env-model"
+    assert ms.build_extractor(env, model="chat/model") is not None
+    assert seen[-1][1] == "chat/model"                    # модель чата перекрывает .env
+
+
+def test_ingest_uses_one_off_extractor(tmp_path):
+    mem = TriplexMemory(str(tmp_path / "m"), encoder=HashEncoder(64))
+    mem.extractor = lambda text: (_ for _ in ()).throw(AssertionError("не тот экстрактор"))
+    seen = []
+
+    def other(text):
+        seen.append(text)
+        return {"entities": [], "facts": []}
+
+    out = mem.ingest("текст", extractor=other)
+    assert out["status"] == "ok" and seen == ["текст"]
+
+
 def test_distill_fact_rewrites_through_supersede(tmp_path, monkeypatch):
     import pulsenet.app as appmod
 

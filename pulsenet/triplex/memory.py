@@ -290,7 +290,10 @@ class TriplexMemory:
     # ---------- write path ----------
 
     def ingest(self, text: str, session_id: str = "", role: str = "user",
-               recorded_at: Optional[str] = None, agent: str = "") -> dict:
+               recorded_at: Optional[str] = None, agent: str = "",
+               extractor: Optional[Callable[[str], Dict[str, List[dict]]]] = None) -> dict:
+        """extractor — разовый экстрактор для этого документа (например, под выбранную в чате модель).
+        Без него используется экстрактор памяти по умолчанию."""
         with self._lock:
             doc = self.docs.add(text, session_id=session_id, role=role, recorded_at=recorded_at, agent=agent)
             if doc.chunks and not all(c.chunk_id in self.chunk_index.pos for c in doc.chunks):
@@ -300,11 +303,12 @@ class TriplexMemory:
                     self.chunk_lsh.add(c.chunk_id, v)
             out = {"doc_id": doc.doc_id, "status": "ok", "facts": [],
                    "needs_confirmation": [], "relations_proposed": []}
-            if self.extractor is None:
+            use_extractor = extractor or self.extractor
+            if use_extractor is None:
                 out["status"] = "no_extractor"
                 return out
             try:
-                extracted = self.extractor(doc.text)
+                extracted = use_extractor(doc.text)
             except Exception as exc:                          # I8: документ сохранён, фактов нет
                 out["status"] = "extraction_failed"
                 out["error"] = str(exc)

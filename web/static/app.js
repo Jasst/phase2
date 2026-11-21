@@ -841,6 +841,12 @@
       (online ? '' : ' — недоступна')));
     mem2.appendChild(el('span', '', online ? 'все агенты пишут в одно хранилище' : 'чат работает без памяти, сообщения ждут восстановления'));
     els.statusGrid.appendChild(mem2);
+    if (s.fact_model) {
+      const fm = el('div', 'stat wide');
+      fm.appendChild(el('b', '', s.fact_model));
+      fm.appendChild(el('span', '', 'модель записи фактов (та же, что в чате)'));
+      els.statusGrid.appendChild(fm);
+    }
     if (s.embedder) {
       const e = el('div', 'stat wide');
       e.appendChild(el('b', '', s.embedder.name || m.encoder || '—'));
@@ -1337,7 +1343,7 @@
   async function distillFact(fid) {
     try {
       toast('Пересобираем факт по актуальным данным…');
-      const out = await api('POST', '/api/memory/distill', { fact_id: fid });
+      const out = await api('POST', '/api/memory/distill', { fact_id: fid, model: settings.model || '' });
       const label = out.verdict === 'update' ? 'Факт пересобран'
         : out.verdict === 'retract' ? 'Факт отозван моделью' : 'Факт подтверждён моделью';
       toast(label + (out.reason ? ': ' + shorten(out.reason, 80) : ''));
@@ -1394,7 +1400,9 @@
     els.ingestBtn.disabled = true;
     els.ingestOut.textContent = 'сохраняю…';
     try {
-      const r = await api('POST', '/api/memory/ingest', { text, role: 'user' });
+      const body = { text, role: 'user' };
+      if (settings.model) body.model = settings.model;   // факты извлекаются моделью чата
+      const r = await api('POST', '/api/memory/ingest', body);
       const ok = (r.facts || []).filter((f) => f.status === 'ok').length;
       const labels = {
         ok: 'готово',

@@ -122,6 +122,23 @@ def test_chat_writes_to_shared_memory_visible_to_owner_agents(mcp_stack, tmp_pat
     assert any(f["text"] == "Нел работает над BiChat" for f in owner["facts"])
 
 
+def test_chat_ingest_forwards_selected_model_to_mcp(mcp_stack, tmp_path, monkeypatch):
+    app = _chat_app(tmp_path, mcp_stack["url"], mcp_stack["chat"])
+    app.active_model = "model-from-chat"
+    calls = []
+    real_call = app.memory.client.call
+
+    def spy(name, args):
+        calls.append((name, dict(args)))
+        return real_call(name, args)
+
+    monkeypatch.setattr(app.memory.client, "call", spy)
+    app.ingest("Нел работает над BiChat.", session_id="c1", role="user")
+    ingest = [a for n, a in calls if n == "triplex_ingest"][-1]
+    assert ingest["model"] == "model-from-chat"
+    assert app.status()["fact_model"] == "model-from-chat"
+
+
 def test_chat_stats_and_status_through_mcp(mcp_stack, tmp_path):
     app = _chat_app(tmp_path, mcp_stack["url"], mcp_stack["chat"])
     stats = app.memory.stats()

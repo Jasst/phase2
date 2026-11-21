@@ -107,9 +107,13 @@ class RemoteMemory:
         return self.client.call("triplex_search", args)
 
     def ingest(self, text: str, session_id: str = "", role: str = "user",
-               recorded_at: Optional[str] = None) -> dict:
+               recorded_at: Optional[str] = None, model: str = "") -> dict:
         # recorded_at на сервере выставляет сам сервер: внешнее время для чата не нужно.
-        return self.client.call("triplex_ingest", {"text": text, "session_id": session_id, "role": role})
+        # model — модель текущего ответа: факты извлекаются ею же, а не TRIPLEX_LLM_MODEL из .env.
+        args = {"text": text, "session_id": session_id, "role": role}
+        if model:
+            args["model"] = model
+        return self.client.call("triplex_ingest", args)
 
     def stats(self) -> dict:
         return self.client.call("triplex_stats").get("memory", {})

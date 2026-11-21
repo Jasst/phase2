@@ -358,7 +358,8 @@ def _ingest(h, b, _q):
     if not text:
         raise ValueError("пустой текст")
     h.send_json(h.app.ingest(text, session_id=str(b.get("session_id") or "web"),
-                             role=str(b.get("role") or "user"), recorded_at=b.get("recorded_at")))
+                             role=str(b.get("role") or "user"), recorded_at=b.get("recorded_at"),
+                             model=str(b.get("model") or "")))
 
 
 def _graph(h, _b, q):
@@ -404,7 +405,7 @@ def _consolidate(h, _b, _q):
 
 
 def _distill(h, b, _q):
-    h.send_json(h.app.distill_fact(str(b.get("fact_id", ""))))
+    h.send_json(h.app.distill_fact(str(b.get("fact_id", "")), model=str(b.get("model") or "")))
 
 
 ROUTES = {

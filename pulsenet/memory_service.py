@@ -58,14 +58,18 @@ def build_encoder(env, data_dir: str, log_error: Callable[[str, BaseException], 
     return HashEncoder(512), server, ""
 
 
-def build_extractor(env) -> Optional[Callable[[str], dict]]:
+def build_extractor(env, model: str = "") -> Optional[Callable[[str], dict]]:
     """Экстрактор фактов через OpenAI-совместимый сервер (TRIPLEX_LLM_URL). Без адреса — None:
-    документы сохраняются, факты не извлекаются."""
+    документы сохраняются, факты не извлекаются.
+
+    model — явно выбранная модель (например, из веб-чата). Если пусто, берётся TRIPLEX_LLM_MODEL.
+    Это позволяет извлекать факты той же моделью, которой отвечает чат, не перезагружая эмбеддинги.
+    """
     if (env.get("TRIPLEX_EXTRACT") or "1") == "0":
         return None
     url = (env.get("TRIPLEX_LLM_URL") or "").strip()
     if not url:
         return None
-    model = (env.get("TRIPLEX_LLM_MODEL") or "local").strip()
+    model = (model or "").strip() or (env.get("TRIPLEX_LLM_MODEL") or "local").strip()
     speaker = (env.get("TRIPLEX_USER_NAME") or "").strip() or None
     return make_extractor(openai_chat_caller(url, model), speaker=speaker)

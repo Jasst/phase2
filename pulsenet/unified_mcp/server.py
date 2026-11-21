@@ -37,6 +37,9 @@ from .store import IDENTITY_KINDS, IdentityStore, SharedCore, UserMemories
 SERVER_NAME = "pulsenet-unified"
 SERVER_VERSION = "1.0.0"
 
+# Явно «не извлекать факты»: отличается от None («использовать экстрактор по умолчанию»).
+_NO_EXTRACT = lambda _text: {"entities": [], "facts": []}
+
 
 @dataclass
 class Settings:
@@ -146,14 +149,26 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
     def triplex_ingest(text: str = Field(..., description="Текст для сохранения (сообщение, решение, заметка)"),
                        session_id: str = Field("", description="Необязательный id сессии"),
                        role: str = Field("user", description="user | assistant | system"),
+                       model: str = Field("", description="Модель экстракции; пусто — TRIPLEX_LLM_MODEL. "
+                                                          "Веб-чат передаёт модель текущего ответа"),
                        ctx: Context = None) -> Dict[str, Any]:
         """Сохранить документ в память и извлечь из него факты. Документ сохраняется даже при сбое
-        извлечения. Возвращает doc_id: его нужно указать как source при triplex_assert."""
+        извлечения. Возвращает doc_id: его нужно указать как source при triplex_assert.
+
+        model — модель, которой извлекаются факты: чат передаёт свою текущую модель, чтобы факты
+        записывались той же моделью, а не фиксированной из .env."""
         uid, mem, e = mem_of(ctx)
         if e:
             return e
         try:
-            return mem.ingest(text, session_id=session_id, role=role, agent=uid)
+            extractor = None
+            if (model or "").strip():
+                from ..memory_service import build_extractor
+                extractor = build_extractor(cfg.env, model=model)
+                if extractor is None:              # TRIPLEX_EXTRACT=0 — экстракция отключена
+                    extractor = _NO_EXTRACT
+            return mem.ingest(text, session_id=session_id, role=role, agent=uid,
+                              extractor=extractor)
         except ValueError as exc:
             return _err(str(exc))
 

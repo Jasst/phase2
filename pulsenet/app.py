@@ -103,6 +103,11 @@ class App:
             target = (self.active_model or "").strip() or self.default_rel()
             return self.backend.ensure(target) or target or "local"
 
+    def extraction_model(self) -> str:
+        """Модель для записи фактов/дистилляции: без ensure — память не должна падать,
+        если модель временно недоступна (документ всё равно сохраняется)."""
+        return (self.active_model or "").strip() or self.default_rel() or "local"
+
     def _make_encoder(self, data_dir: str):
         """Эмбеддер — см. memory_service.build_encoder (общий с MCP-сервером)."""
         encoder, self.embed_server, self.embed_model = build_encoder(self.env, data_dir, self.log_error)
@@ -121,7 +126,7 @@ class App:
 
             def llm_call(prompt: str) -> str:
                 base = self.backend.base_url
-                return openai_chat_caller(base, self.model_id())(prompt)
+                return openai_chat_caller(base, self.extraction_model())(prompt)
             extractor = make_extractor(llm_call, speaker=speaker)
         min_cos = float(self.env.get("TRIPLEX_MIN_COS", "0.35"))
         return TriplexMemory(os.path.join(data_dir, "triplex"), encoder=encoder, extractor=extractor,
@@ -147,9 +152,23 @@ class App:
             finally:
                 self._index_q.task_done()
 
-    def ingest(self, text: str, session_id: str = "", role: str = "user", recorded_at=None) -> dict:
-        """Единая точка записи: сбой экстракции не исключение, а статус — и он попадает в журнал ошибок."""
-        out = self.memory.ingest(text, session_id=session_id, role=role, recorded_at=recorded_at)
+    def ingest(self, text: str, session_id: str = "", role: str = "user", recorded_at=None,
+               model: str = "") -> dict:
+        """Единая точка записи: сбой экстракции не исключение, а статус — и он попадает в журнал ошибок.
+
+        model — модель чата, которой извлекаются факты. Явно указанная (например, из веба)
+        становится active_model; иначе берётся последняя использованная / загруженная в LM Studio.
+        """
+        target = (model or "").strip()
+        if target:
+            with self.backend_lock:
+                self.active_model = target
+        resolved = self.extraction_model()
+        # Локальная память уже вызывает model_id() в своём экстракторе; MCP — отдельный процесс,
+        # ему модель надо передать явно.
+        extra = {"model": resolved} if self.memory_backend == "mcp" else {}
+        out = self.memory.ingest(text, session_id=session_id, role=role,
+                                 recorded_at=recorded_at, **extra)
         if out["status"] == "extraction_failed":
             self.log_error("экстракция фактов", RuntimeError(out.get("error", "неизвестная ошибка")))
         return out
@@ -366,6 +385,7 @@ class App:
         return {
             "backend": self.backend.name,
             "model": getattr(self.backend, "loaded", None),
+            "fact_model": self.active_model or self.default_rel(),   # модель экстракции фактов
             "memory_enabled": self.memory_enabled,
             "memory_backend": self.memory_backend,
             "memory_online": online,
@@ -375,15 +395,20 @@ class App:
             "errors": self.recent_errors(),
         }
 
-    def distill_fact(self, fact_id: str) -> dict:
+    def distill_fact(self, fact_id: str, model: str = "") -> dict:
         """Темпоральная дистилляция: LLM пересобирает факт по актуальным данным журнала.
 
         verdict=update создаёт новый факт через supersede: старый остаётся в аудите,
         а обоснование модели становится документом-источником (I1).
+        Модель — та же, что в чате (явная из веба или последняя использованная).
         """
         fid = str(fact_id or "").strip()
         if not fid:
             raise ValueError("не указан fact_id")
+        target_model = (model or "").strip()
+        if target_model:
+            with self.backend_lock:
+                self.active_model = target_model
         facts = self.memory.list_facts(500)
         target = next((f for f in facts if f.get("fact_id") == fid), None)
         if target is None:
@@ -410,7 +435,7 @@ class App:
             "Не выдумывай данные: опирайся только на факты и фрагменты ниже.\n\n"
             + json.dumps(evidence, ensure_ascii=False)[:6000]
         )
-        llm_call = openai_chat_caller(self.backend.base_url, self.model_id(), max_tokens=512)
+        llm_call = openai_chat_caller(self.backend.base_url, self.extraction_model(), max_tokens=512)
         payload = _parse_json_loose(llm_call(prompt))
         verdict = str(payload.get("verdict") or "keep").strip().lower()
         if verdict not in ("keep", "update", "retract"):
@@ -430,8 +455,9 @@ class App:
             r = str(payload.get("r") or "").strip()
             o = str(payload.get("o") or "").strip()
             if s and r and o:
-                doc = self.memory.ingest(reason or f"Пересборка факта {fid}",
-                                         session_id="temporal-distill", role="assistant")
+                doc = self.ingest(reason or f"Пересборка факта {fid}",
+                                  session_id="temporal-distill", role="assistant",
+                                  model=self.extraction_model())
                 doc_id = doc.get("doc_id") or (doc.get("result") or {}).get("doc_id") or "manual-distill"
                 source = {"doc_id": doc_id, "span": [0, max(1, len(reason))]}
                 out = self.memory.supersede(

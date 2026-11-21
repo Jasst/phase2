@@ -97,7 +97,8 @@ def _json(port, method, path, body=None):
 def test_distill_endpoint(running, monkeypatch):
     app, port = running
     monkeypatch.setattr(app, "distill_fact",
-                        lambda fid: {"status": "ok", "verdict": "keep", "fact_id": fid})
+                        lambda fid, model="": {"status": "ok", "verdict": "keep",
+                                               "fact_id": fid, "model": model})
     status, body = _json(port, "POST", "/api/memory/distill", {"fact_id": "f1"})
     assert status == 200 and body["verdict"] == "keep" and body["fact_id"] == "f1"
 
