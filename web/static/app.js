@@ -63,6 +63,7 @@
     searchForm: $('searchForm'), searchQuery: $('searchQuery'), searchResults: $('searchResults'),
     ingestText: $('ingestText'), ingestBtn: $('ingestBtn'), ingestOut: $('ingestOut'),
     graphReload: $('graphReload'), graphLive: $('graphLive'), graphStats: $('graphStats'),
+    graphRelayout: $('graphRelayout'),
     graphStage: $('graphStage'), graphCanvas: $('graphCanvas'), graphEmpty: $('graphEmpty'),
     graphZoomIn: $('graphZoomIn'), graphZoomOut: $('graphZoomOut'), graphZoomReset: $('graphZoomReset'),
     graphFullscreen: $('graphFullscreen'),
@@ -1335,6 +1336,40 @@
     ]);
   }
 
+  function nodeFactIds(n) {
+    const out = [];
+    for (const e of graph.edges) {
+      if (e.a !== n && e.b !== n) continue;
+      const fid = e.id || e.fact_id;
+      if (fid && !out.includes(fid)) out.push(fid);
+    }
+    return out;
+  }
+
+  function showNodeMenu(x, y, n) {
+    const ids = nodeFactIds(n);
+    showMenu(x, y, [
+      { label: 'Копировать название', onClick: () => copyText(n.label) },
+      { label: n.fixed ? 'Открепить позицию' : 'Закрепить позицию', onClick: () => {
+          n.fixed = !n.fixed; toast(n.fixed ? 'Нейрон закреплён' : 'Позиция свободна'); draw();
+        } },
+      { sep: true },
+      { label: 'Править вручную', disabled: !ids.length, onClick: () => openEditDialog(n, ids) },
+      { label: 'Дистилляция LLM', disabled: !ids.length, onClick: () => openDistillDialog(n, ids) },
+      { label: 'Поиск дублей LLM', disabled: !ids.length, onClick: () => openDedupeDialog(ids) },
+      { label: 'Рекомбинация с нейроном…', disabled: !ids.length, onClick: () => openMergeDialog(n, ids) },
+      { sep: true },
+      { label: 'Раскладка заново', onClick: relayoutGraph },
+      { label: 'Удалить нейрон из памяти', danger: true, disabled: !ids.length, onClick: async () => {
+          const ok = await ask('Удалить нейрон?',
+            'Все его факты будут отозваны. История изменений останется в журнале.', 'Удалить');
+          if (!ok) return;
+          await memoryAction('/api/memory/forget', { node_id: n.id }, 'Нейрон удалён из памяти');
+          if (graph.selected === n) selectNode(null);
+        } },
+    ]);
+  }
+
   // Универсальное «меню по правой кнопке / долгому нажатию»: работает на сообщениях,
   // чатах, фактах — везде, где есть осмысленные действия над объектом.
   function isMenuExempt(target, root) {
@@ -1572,6 +1607,7 @@
   const graph = {
     nodes: [], edges: [], byId: {}, W: 0, H: 0, dpr: 1, temp: 0, frames: 0, raf: 0,
     hover: null, selected: null, busy: false, typeColors: {}, relColors: {}, pulses: [],
+    anim: [], nodeDrag: null,
     view: { scale: 1, ox: 0, oy: 0 }, drag: null, press: null, fullscreen: false,
     sessionStart: Date.now(),
   };
@@ -1639,7 +1675,7 @@
         r: 4 + Math.min(10, Math.sqrt(n.degree || 1) * 2.6),
         x: old ? old.x : W / 2 + (Math.random() - 0.5) * W * 0.6,
         y: old ? old.y : H / 2 + (Math.random() - 0.5) * H * 0.6,
-        dx: 0, dy: 0, color: typeColor(n.type),
+        dx: 0, dy: 0, color: typeColor(n.type), fixed: old ? !!old.fixed : false,
       };
     });
     const byId = {};
@@ -1709,15 +1745,49 @@
   function kick() {
     if (!graph.raf) graph.raf = requestAnimationFrame(frame);
   }
+  // Плавный переход узла в новую позицию (после слияния/перекладки/сброса).
+  function animateTo(node, x, y, dur) {
+    if (!node) return;
+    graph.anim = graph.anim.filter((a) => a.node !== node);
+    graph.anim.push({ node, fx: node.x, fy: node.y, tx: x, ty: y,
+                      t0: performance.now(), dur: dur || 620 });
+    kick();
+  }
+  function stepAnims(now) {
+    if (!graph.anim.length) return;
+    graph.anim = graph.anim.filter((a) => {
+      const p = Math.max(0, Math.min(1, (now - a.t0) / a.dur));
+      const e = 1 - Math.pow(1 - p, 3);   // ease-out
+      a.node.x = a.fx + (a.tx - a.fx) * e;
+      a.node.y = a.fy + (a.ty - a.fy) * e;
+      return p < 1;
+    });
+  }
+  function relayoutGraph() {
+    const W = graph.W || 300;
+    const H = graph.H || 340;
+    for (const n of graph.nodes) {
+      n.fixed = false;
+      const ang = (Object.keys(graph.byId).indexOf(n.id) / Math.max(1, graph.nodes.length)) * Math.PI * 2;
+      const rad = Math.min(W, H) * 0.28;
+      animateTo(n, W / 2 + Math.cos(ang) * rad, H / 2 + Math.sin(ang) * rad, 700);
+    }
+    graph.temp = W / 8;
+    graph.frames = 0;
+    toast('Раскладка нейронов обновлена');
+  }
   function frame() {
     graph.raf = 0;
-    const laying = graph.frames < LAYOUT_FRAMES && graph.nodes.length > 0;
+    const now = performance.now();
+    stepAnims(now);
+    const laying = graph.frames < LAYOUT_FRAMES && graph.nodes.length > 0 && !graph.anim.length;
     if (laying) {
       layoutStep();
       graph.frames++;
     }
     draw();
-    if (laying || graph.pulses.length || ((graph.selected || graph.hover) && graphVisible())) kick();
+    if (laying || graph.anim.length || graph.pulses.length ||
+        ((graph.selected || graph.hover) && graphVisible())) kick();
   }
 
   function layoutStep() {
@@ -1753,10 +1823,12 @@
     const cy = H / 2;
     const t = graph.temp;
     for (const a of nodes) {
+      if (a.fixed) continue;   // перетащенный пользователем узел не тянем обратно
       a.dx += (cx - a.x) * 0.01;
       a.dy += (cy - a.y) * 0.01;
       const len = Math.sqrt(a.dx * a.dx + a.dy * a.dy) || 0.01;
-      const lim = Math.min(len, t);
+      // Плавное движение: ограничение скорости, чтобы узлы не «дёргались» между кадрами.
+      const lim = Math.min(len, t, 6);
       a.x += (a.dx / len) * lim;
       a.y += (a.dy / len) * lim;
       a.x = Math.max(a.r + 4, Math.min(W - a.r - 4, a.x));
@@ -1829,7 +1901,17 @@
     for (const n of graph.nodes) {
       const related = hi && (n === hi || isNeighbor(n, hi));
       const dim = hi && !related;
-      ctx.globalAlpha = dim ? 0.25 : 0.95;
+      const lifted = n === graph.hover || n === graph.selected ||
+        (graph.nodeDrag && graph.nodeDrag.node === n);
+      ctx.globalAlpha = dim ? 0.28 : 0.96;
+      // Мягкое свечение нейрона — «живой» узел, а не плоская точка.
+      const halo = ctx.createRadialGradient(n.x, n.y, n.r * 0.4, n.x, n.y, n.r * (lifted ? 4.2 : 2.8));
+      halo.addColorStop(0, withAlpha(n.color, lifted ? 0.38 : 0.22));
+      halo.addColorStop(1, withAlpha(n.color, 0));
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, n.r * (lifted ? 4.2 : 2.8), 0, Math.PI * 2);
+      ctx.fillStyle = halo;
+      ctx.fill();
       if (related) {
         for (let ring = 0; ring < 2; ring++) {
           const p = (phase + ring * 0.5) % 1;
@@ -1840,10 +1922,19 @@
           ctx.stroke();
         }
       }
+      // Объём: градиент от светлого верхнего полюса к насыщенному краю.
+      const body = ctx.createRadialGradient(n.x - n.r * 0.35, n.y - n.r * 0.4, n.r * 0.1,
+                                            n.x, n.y, n.r * 1.15);
+      body.addColorStop(0, withAlpha(n.color, 1));
+      body.addColorStop(0.55, n.color);
+      body.addColorStop(1, withAlpha(n.color, 0.55));
       ctx.beginPath();
       ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
-      ctx.fillStyle = n.color;
+      ctx.fillStyle = body;
       ctx.fill();
+      ctx.strokeStyle = withAlpha('#ffffff', lifted ? 0.75 : 0.28);
+      ctx.lineWidth = (lifted ? 1.1 : 0.7) * inv;
+      ctx.stroke();
       ctx.globalAlpha = 1;
       if (n.isNew) {
         ctx.beginPath();
@@ -1851,6 +1942,12 @@
         ctx.strokeStyle = '#4cc38a';
         ctx.lineWidth = 1.5 * inv;
         ctx.stroke();
+      }
+      if (n.fixed) {   // нейрон закреплён перетаскиванием
+        ctx.beginPath();
+        ctx.arc(n.x + n.r * 0.8, n.y - n.r * 0.8, 2.2 * inv, 0, Math.PI * 2);
+        ctx.fillStyle = '#a9cdff';
+        ctx.fill();
       }
       if (n === graph.selected) {
         ctx.beginPath();
@@ -1898,6 +1995,11 @@
   function screenPoint(ev) {
     const r = els.graphCanvas.getBoundingClientRect();
     return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  }
+  function nodeScreenPoint(n) {
+    const r = els.graphCanvas.getBoundingClientRect();
+    const v = graph.view;
+    return { x: r.left + v.ox + n.x * v.scale, y: r.top + v.oy + n.y * v.scale };
   }
   function zoomAt(sx, sy, factor) {
     const v = graph.view;
@@ -2069,6 +2171,258 @@
     } catch (err) {
       toast('Ошибка дистилляции: ' + (err.message || err));
     }
+  }
+
+  // ---------- управление нейронами: правка, дедупликация, слияние ----------
+
+  async function refreshMemoryViews() {
+    await loadFacts();
+    if (graphVisible()) await loadGraph();
+    refreshStatus();
+  }
+
+  function openNeuronDialog(title, subtitle) {
+    const d = el('dialog', 'dialog dialog-sm neuron-dialog');
+    const body = el('div', 'dialog-body');
+    const head = el('header');
+    head.appendChild(el('h2', '', title));
+    const x = el('button', 'icon-btn', '×');
+    x.type = 'button'; x.title = 'Закрыть';
+    x.addEventListener('click', () => d.close());
+    head.appendChild(x);
+    body.appendChild(head);
+    const content = el('div', 'neuron-form');
+    if (subtitle) content.appendChild(el('p', 'lead', subtitle));
+    body.appendChild(content);
+    const foot = el('footer');
+    body.appendChild(foot);
+    d.appendChild(body);
+    d.addEventListener('close', () => d.remove());
+    document.body.appendChild(d);
+    d.showModal();
+    return { d, content, foot };
+  }
+
+  function formField(label, value, opts) {
+    opts = opts || {};
+    const wrap = el('label', 'form-field');
+    wrap.appendChild(el('span', '', label));
+    let input;
+    if (opts.options) {
+      input = el('select');
+      for (const o of opts.options) {
+        const op = el('option', '', o.label);
+        op.value = o.value;
+        input.appendChild(op);
+      }
+      if (value) input.value = value;
+    } else {
+      input = el('input');
+      input.type = opts.type || 'text';
+      input.value = value === undefined || value === null ? '' : String(value);
+      if (opts.step) input.step = opts.step;
+      if (opts.min !== undefined) input.min = opts.min;
+      if (opts.max !== undefined) input.max = opts.max;
+      if (opts.placeholder) input.placeholder = opts.placeholder;
+    }
+    wrap.appendChild(input);
+    return { wrap, input };
+  }
+
+  async function openEditDialog(n, ids) {
+    const { d, content, foot } = openNeuronDialog('Ручная правка нейрона', shorten(n.label, 70));
+    let facts = [];
+    try {
+      const out = await api('GET', '/api/memory/facts?limit=500');
+      facts = (out.facts || []).filter((f) => ids.includes(f.fact_id));
+    } catch (err) {
+      toast('Не удалось загрузить факты: ' + (err.message || err));
+    }
+    if (!d.isConnected) return;
+    if (!facts.length) {
+      content.appendChild(el('div', 'empty', 'Активных фактов у нейрона нет — нечего править.'));
+      return;
+    }
+    const first = facts[0];
+    const pick = formField('Факт', first.fact_id,
+      { options: facts.map((f) => ({ value: f.fact_id, label: shorten(f.text || f.fact_id, 72) })) });
+    const s = formField('Субъект', first.s);
+    const r = formField('Отношение', first.r);
+    const o = formField('Объект', first.o);
+    const conf = formField('Уверенность', first.confidence,
+      { type: 'number', step: '0.05', min: 0, max: 1 });
+    const reason = formField('Причина правки', '', { placeholder: 'необязательно' });
+    content.append(pick.wrap, s.wrap, r.wrap, o.wrap, conf.wrap, reason.wrap);
+    pick.input.addEventListener('change', () => {
+      const f = facts.find((x) => x.fact_id === pick.input.value);
+      if (!f) return;
+      s.input.value = f.s || '';
+      r.input.value = f.r || '';
+      o.input.value = f.o || '';
+      conf.input.value = f.confidence;
+    });
+    const cancel = el('button', 'btn-ghost', 'Отмена');
+    cancel.type = 'button'; cancel.addEventListener('click', () => d.close());
+    const save = el('button', 'btn-primary', 'Сохранить');
+    save.type = 'button';
+    save.addEventListener('click', async () => {
+      save.disabled = true;
+      try {
+        await api('POST', '/api/memory/edit', {
+          fact_id: pick.input.value, s: s.input.value, r: r.input.value, o: o.input.value,
+          confidence: conf.input.value, reason: reason.input.value, model: settings.model || '',
+        });
+        toast('Факт нейрона обновлён');
+        d.close();
+        await refreshMemoryViews();
+      } catch (err) {
+        toast('Ошибка правки: ' + (err.message || err));
+        save.disabled = false;
+      }
+    });
+    foot.append(cancel, save);
+  }
+
+  function openDistillDialog(n, ids) {
+    const { d, content, foot } = openNeuronDialog('Дистилляция нейрона',
+      'LLM проверит факты по актуальным данным и пересоберёт устаревшие.');
+    const rows = graph.edges.filter((e) => e.a === n || e.b === n);
+    for (const e of rows) {
+      const b = el('button', 'btn-ghost neuron-fact-btn',
+        e.a.label + ' — ' + e.label + ' → ' + e.b.label);
+      b.type = 'button';
+      b.addEventListener('click', async () => {
+        b.disabled = true;
+        await distillFact(e.id || e.fact_id);
+        d.close();
+      });
+      content.appendChild(b);
+    }
+    const all = el('button', 'btn-primary', 'Пересобрать все (' + rows.length + ')');
+    all.type = 'button';
+    all.addEventListener('click', async () => {
+      all.disabled = true;
+      for (const e of rows) await distillFact(e.id || e.fact_id);
+      d.close();
+      await refreshMemoryViews();
+    });
+    const cancel = el('button', 'btn-ghost', 'Отмена');
+    cancel.type = 'button'; cancel.addEventListener('click', () => d.close());
+    foot.append(cancel, all);
+  }
+
+  async function openDedupeDialog(ids) {
+    const { d, content, foot } = openNeuronDialog('Дедупликация LLM',
+      ids.length ? 'Сканируем ' + ids.length + ' фактов нейрона…' : 'Сканируем всю память…');
+    content.appendChild(el('div', 'muted', 'Модель ищет смысловые повторы, а не только совпадение слов.'));
+    try {
+      const out = await api('POST', '/api/memory/dedupe', {
+        fact_ids: ids, model: settings.model || '', limit: 200,
+      });
+      if (!d.isConnected) return;
+      content.innerHTML = '';
+      const groups = out.groups || [];
+      if (!groups.length) {
+        content.appendChild(el('div', 'empty', 'Смысловых дублей не найдено.'));
+        return;
+      }
+      const checks = [];
+      for (const g of groups) {
+        const card = el('div', 'card');
+        const label = el('label', 'check');
+        const cb = el('input');
+        cb.type = 'checkbox'; cb.checked = true;
+        label.append(cb, document.createTextNode(' ' + shorten(g.canonical || g.reason || 'Объединить группу', 80)));
+        card.appendChild(label);
+        card.appendChild(el('div', 'fact-meta', (g.ids || []).join(' · ')));
+        if (g.reason) card.appendChild(el('div', 'fact-meta', g.reason));
+        content.appendChild(card);
+        checks.push({ cb, g });
+      }
+      const apply = el('button', 'btn-primary', 'Объединить выбранные');
+      apply.type = 'button';
+      apply.addEventListener('click', async () => {
+        apply.disabled = true;
+        let done = 0;
+        for (const { cb, g } of checks) {
+          if (!cb.checked) continue;
+          try {
+            await api('POST', '/api/memory/recombine', {
+              fact_ids: g.ids, model: settings.model || '', apply: true,
+            });
+            done++;
+          } catch (err) {
+            toast('Ошибка слияния: ' + (err.message || err));
+          }
+        }
+        d.close();
+        toast('Объединено групп: ' + done);
+        await refreshMemoryViews();
+      });
+      foot.appendChild(apply);
+    } catch (err) {
+      d.close();
+      toast('Ошибка поиска дублей: ' + (err.message || err));
+    }
+  }
+
+  async function openMergeDialog(n, ids) {
+    const others = graph.nodes.filter((x) => x !== n);
+    if (!others.length) { toast('Нет другого нейрона для слияния'); return; }
+    const { d, content, foot } = openNeuronDialog('Рекомбинация нейронов',
+      'Источник: ' + shorten(n.label, 70));
+    const pick = formField('Объединить с', others[0].id,
+      { options: others.map((o) => ({ value: o.id, label: shorten(o.label, 72) })) });
+    content.appendChild(pick.wrap);
+    const preview = el('div', 'merge-preview fact-meta',
+      'Нажмите «Предъединить», чтобы LLM предложил общую триаду.');
+    content.appendChild(preview);
+    let mergedIds = [];
+    const recalc = () => {
+      const t = graph.byId[pick.input.value];
+      mergedIds = [...new Set(ids.concat(t ? nodeFactIds(t) : []))];
+      preview.textContent = 'Фактов в объединении: ' + mergedIds.length + '. Нажмите «Предъединить».';
+    };
+    recalc();
+    pick.input.addEventListener('change', recalc);
+    const cancel = el('button', 'btn-ghost', 'Отмена');
+    cancel.type = 'button'; cancel.addEventListener('click', () => d.close());
+    const pre = el('button', 'btn-ghost', 'Предъединить LLM');
+    pre.type = 'button';
+    pre.addEventListener('click', async () => {
+      pre.disabled = true;
+      preview.textContent = 'LLM объединяет факты…';
+      try {
+        const out = await api('POST', '/api/memory/recombine', {
+          fact_ids: mergedIds, model: settings.model || '', apply: false,
+        });
+        const p = out.preview || {};
+        preview.textContent = [p.s, '—', p.r, '→', p.o].join(' ') +
+          ' · уверенность ' + p.confidence + (p.reason ? '\n' + p.reason : '');
+        apply.disabled = false;
+      } catch (err) {
+        preview.textContent = 'Ошибка: ' + (err.message || err);
+      } finally {
+        pre.disabled = false;
+      }
+    });
+    const apply = el('button', 'btn-primary', 'Применить');
+    apply.type = 'button'; apply.disabled = true;
+    apply.addEventListener('click', async () => {
+      apply.disabled = true;
+      try {
+        await api('POST', '/api/memory/recombine', {
+          fact_ids: mergedIds, model: settings.model || '', apply: true,
+        });
+        toast('Нейроны объединены');
+        d.close();
+        await refreshMemoryViews();
+      } catch (err) {
+        toast('Ошибка слияния: ' + (err.message || err));
+        apply.disabled = false;
+      }
+    });
+    foot.append(cancel, pre, apply);
   }
 
   function renderSearch(r) {
@@ -2330,6 +2684,7 @@
   els.consolidateBtn.addEventListener('click', consolidate);
 
   els.graphReload.addEventListener('click', loadGraph);
+  if (els.graphRelayout) els.graphRelayout.addEventListener('click', relayoutGraph);
   els.graphZoomIn.addEventListener('click', () => zoomAt(graph.W / 2, graph.H / 2, 1.2));
   els.graphZoomOut.addEventListener('click', () => zoomAt(graph.W / 2, graph.H / 2, 1 / 1.2));
   els.graphZoomReset.addEventListener('click', resetView);
@@ -2370,7 +2725,8 @@
         if (!graph.press || graph.press.moved) return;
         graph.press.longFired = true;
         selectNode(graph.press.node);
-        toast('Нейрон выбран: ' + shorten(graph.press.node.label, 30));
+        const at = nodeScreenPoint(graph.press.node);
+        showNodeMenu(at.x, at.y, graph.press.node);
       }, LONG_PRESS_MS);
     } else {
       graph.drag = { sx: s.x, sy: s.y, ox: graph.view.ox, oy: graph.view.oy };
@@ -2386,15 +2742,27 @@
       return;
     }
     const p = canvasPoint(ev);
+    if (graph.nodeDrag) {
+      const d = graph.nodeDrag;
+      d.node.x = Math.max(d.node.r + 4, Math.min(graph.W - d.node.r - 4, p.x - d.offX));
+      d.node.y = Math.max(d.node.r + 4, Math.min(graph.H - d.node.r - 4, p.y - d.offY));
+      d.node.fixed = true;
+      kick();
+      return;
+    }
     const n = nodeAt(p.x, p.y);
     if (graph.press && !graph.press.moved &&
         Math.hypot(s.x - graph.press.sx, s.y - graph.press.sy) > 6) {
       graph.press.moved = true;
       clearTimeout(graph.press.timer);
+      // Короткое движение = перетаскивание узла, долгое удержание = меню.
+      graph.nodeDrag = { node: graph.press.node, offX: p.x - graph.press.node.x,
+                         offY: p.y - graph.press.node.y };
+      selectNode(graph.press.node);
     }
     if (n !== graph.hover) {
       graph.hover = n;
-      els.graphCanvas.style.cursor = n ? 'pointer' : 'default';
+      els.graphCanvas.style.cursor = n ? 'grab' : 'default';
       draw();
     }
   });
@@ -2405,8 +2773,9 @@
       if (!press.moved && !press.longFired) selectNode(graph.selected === press.node ? null : press.node);
     }
     graph.press = null;
+    graph.nodeDrag = null;
     graph.drag = null;
-    els.graphCanvas.style.cursor = graph.hover ? 'pointer' : 'default';
+    els.graphCanvas.style.cursor = graph.hover ? 'grab' : 'default';
     draw();
   }
   els.graphCanvas.addEventListener('pointerup', endPointer);
@@ -2416,7 +2785,12 @@
     ev.preventDefault();
     const p = canvasPoint(ev);
     const n = nodeAt(p.x, p.y);
-    if (n) selectNode(n);
+    if (n) {
+      selectNode(n);
+      showNodeMenu(ev.clientX, ev.clientY, n);
+    } else {
+      showBlankMenu(ev.clientX, ev.clientY);
+    }
   });
   els.graphCanvas.addEventListener('wheel', (ev) => {
     ev.preventDefault();

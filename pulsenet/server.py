@@ -726,6 +726,27 @@ def _distill(h, b, _q):
     h.send_json(h.app.distill_fact(str(b.get("fact_id", "")), model=str(b.get("model") or "")))
 
 
+def _dedupe(h, b, _q):
+    h.send_json(h.app.dedupe_facts(model=str(b.get("model") or ""),
+                                  fact_ids=b.get("fact_ids"), limit=int(b.get("limit", 150))))
+
+
+def _recombine(h, b, _q):
+    h.send_json(h.app.recombine_facts(b.get("fact_ids") or [], model=str(b.get("model") or ""),
+                                     apply=bool(b.get("apply", False))))
+
+
+def _edit_fact(h, b, _q):
+    h.send_json(h.app.edit_fact(str(b.get("fact_id", "")), s=str(b.get("s") or ""),
+                               r=str(b.get("r") or ""), o=str(b.get("o") or ""),
+                               confidence=b.get("confidence", 0.8),
+                               reason=str(b.get("reason") or ""), model=str(b.get("model") or "")))
+
+
+def _forget(h, b, _q):
+    h.send_json(h.app.forget_facts(fact_ids=b.get("fact_ids"), node_id=str(b.get("node_id") or "")))
+
+
 def _chat_save_memory(h, b, _q):
     """Сохранить весь чат одним документом: из него извлекаются факты с дедупликацией.
 
@@ -795,6 +816,10 @@ ROUTES = {
     ("POST", "/api/memory/supersede"): _supersede,
     ("POST", "/api/memory/consolidate"): _consolidate,
     ("POST", "/api/memory/distill"): _distill,
+    ("POST", "/api/memory/dedupe"): _dedupe,
+    ("POST", "/api/memory/recombine"): _recombine,
+    ("POST", "/api/memory/edit"): _edit_fact,
+    ("POST", "/api/memory/forget"): _forget,
 }
 
 

@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 
 from . import llm
@@ -468,6 +468,169 @@ class App:
                         "old_fact_id": fid, "reason": reason, "result": out}
         self.memory.confirm(fid, True)
         return {"status": "ok", "verdict": "keep", "fact_id": fid, "reason": reason}
+
+    # ---------- управление нейронами (карта памяти) ----------
+
+    def _llm_json(self, prompt: str, model: str = "", max_tokens: int = 768) -> dict:
+        """Один LLM-вызов с моделью чата и «рыхлым» JSON (модели любят обёртки ```json)."""
+        target = (model or "").strip()
+        if target:
+            with self.backend_lock:
+                self.active_model = target
+        call = openai_chat_caller(self.backend.base_url, self.extraction_model(), max_tokens=max_tokens)
+        return _parse_json_loose(call(prompt))
+
+    @staticmethod
+    def _source_of(fact: dict) -> dict:
+        """И1: переиспользуем провенант редактируемого факта — новый doc не нужен."""
+        src = fact.get("source") or {}
+        doc_id = src.get("doc_id")
+        span = src.get("span")
+        if doc_id and isinstance(span, list) and len(span) == 2 and all(isinstance(x, int) for x in span):
+            return {"doc_id": str(doc_id), "span": span}
+        return {"doc_id": "manual-edit", "span": [0, 0]}
+
+    @staticmethod
+    def _valid_after(fact: dict) -> str:
+        now = datetime.now(timezone.utc)
+        raw = str(fact.get("valid_from") or "").replace("Z", "+00:00")
+        try:
+            old = datetime.fromisoformat(raw)
+            if old.tzinfo is None:
+                old = old.replace(tzinfo=timezone.utc)
+        except ValueError:
+            old = now - timedelta(seconds=1)
+        if now <= old:
+            now = old + timedelta(microseconds=1)
+        return now.isoformat(timespec="microseconds")
+
+    def dedupe_facts(self, model: str = "", fact_ids: Optional[List[str]] = None,
+                     limit: int = 150) -> dict:
+        """LLM ищет смысловые дубли среди фактов. Только предпросмотр, без записи."""
+        facts = self.memory.list_facts(500)
+        wanted = {str(i) for i in (fact_ids or []) if str(i)}
+        if wanted:
+            facts = [f for f in facts if f.get("fact_id") in wanted]
+        items = [{"id": f.get("fact_id"), "text": f.get("text"),
+                  "s": f.get("s"), "r": f.get("r"), "o": f.get("o")}
+                 for f in facts[:max(2, min(int(limit), 500))]]
+        if len(items) < 2:
+            return {"status": "ok", "scanned": len(items), "groups": []}
+        prompt = (
+            "Ты — редактор базы знаний. Найди смысловые дубликаты среди фактов: "
+            "один и тот же смысл, переформулированный или повторённый.\n"
+            "Не объединяй факты просто потому, что у них общий субъект: объект и отношение должны "
+            "значить то же самое. Не выдумывай id.\n"
+            "Верни ТОЛЬКО JSON: {\"groups\":[{\"ids\":[\"f:...\",\"f:...\"],"
+            "\"reason\":\"почему это дубли\",\"canonical\":\"итоговая формулировка\"}]}.\n"
+            "Если дублей нет — {\"groups\":[]}.\n\n" + json.dumps(items, ensure_ascii=False)[:12000]
+        )
+        data = self._llm_json(prompt, model, max_tokens=1200)
+        known = {i["id"] for i in items}
+        groups, used = [], set()
+        for g in data.get("groups") or []:
+            if not isinstance(g, dict):
+                continue
+            ids = [str(i) for i in (g.get("ids") or []) if str(i) in known and str(i) not in used]
+            ids = list(dict.fromkeys(ids))
+            if len(ids) < 2:
+                continue
+            used.update(ids)
+            groups.append({"ids": ids, "reason": str(g.get("reason") or "")[:600],
+                           "canonical": str(g.get("canonical") or "")[:600]})
+        return {"status": "ok", "scanned": len(items), "groups": groups}
+
+    def edit_fact(self, fact_id: str, s: str = "", r: str = "", o: str = "",
+                  confidence: float = 0.8, reason: str = "", model: str = "") -> dict:
+        """Ручная правка: старый факт вытесняется новым с тем же документом-источником (I1, I4)."""
+        fid = str(fact_id or "").strip()
+        target = next((f for f in self.memory.list_facts(500) if f.get("fact_id") == fid), None)
+        if target is None:
+            raise ValueError("факт не найден или уже не действует")
+        new_s = str(s or target.get("s") or "").strip()
+        new_r = str(r or target.get("r") or "").strip()
+        new_o = str(o or target.get("o") or "").strip()
+        if not (new_s and new_r and new_o):
+            raise ValueError("нужны субъект, отношение и объект")
+        try:
+            conf = max(0.0, min(1.0, float(confidence)))
+        except (TypeError, ValueError):
+            conf = float(target.get("confidence") or 0.8)
+        out = self.memory.supersede(
+            fid, new_s, new_r, new_o, valid_from=self._valid_after(target),
+            source=self._source_of(target), confidence=conf)
+        new_id = out.get("fact_id") if isinstance(out, dict) else getattr(out, "fact_id", "")
+        return {"status": "ok", "fact_id": fid, "new_fact_id": new_id,
+                "s": new_s, "r": new_r, "o": new_o, "confidence": conf,
+                "reason": str(reason or "")[:600], "result": out}
+
+    def recombine_facts(self, fact_ids: List[str], model: str = "", apply: bool = False) -> dict:
+        """Рекомбинация: LLM предлагает единую триаду, затем один факт вытесняет остальные."""
+        ids = list(dict.fromkeys(str(i) for i in (fact_ids or []) if str(i)))
+        if len(ids) < 2:
+            raise ValueError("для слияния нужны хотя бы два факта")
+        facts = [f for f in self.memory.list_facts(500) if f.get("fact_id") in set(ids)]
+        if len(facts) < 2:
+            raise ValueError("часть фактов не найдена или уже не действует")
+        prompt = (
+            "Ты — редактор базы знаний. Объедини несколько faktов в один, не теряя смысла.\n"
+            "Верни ТОЛЬКО JSON: {\"s\":\"...\",\"r\":\"...\",\"o\":\"...\","
+            "\"confidence\":0.0,\"reason\":\"кратко объясни слияние\"}.\n"
+            "Не выдумывай детали: опирайся только на перечисленные факты.\n\n"
+            + json.dumps([{"id": f.get("fact_id"), "text": f.get("text"),
+                           "s": f.get("s"), "r": f.get("r"), "o": f.get("o"),
+                           "confidence": f.get("confidence")} for f in facts],
+                          ensure_ascii=False)[:8000]
+        )
+        data = self._llm_json(prompt, model, max_tokens=768)
+        s = str(data.get("s") or "").strip()
+        r = str(data.get("r") or "").strip()
+        o = str(data.get("o") or "").strip()
+        if not (s and r and o):
+            raise ValueError("модель не вернула корректную триаду для слияния")
+        try:
+            conf = max(0.0, min(1.0, float(data.get("confidence", 0.85))))
+        except (TypeError, ValueError):
+            conf = 0.85
+        reason = str(data.get("reason") or "")[:600]
+        preview = {"s": s, "r": r, "o": o, "confidence": conf, "reason": reason,
+                   "fact_ids": [f.get("fact_id") for f in facts]}
+        if not apply:
+            return {"status": "ok", "applied": False, "preview": preview}
+        canonical = facts[0]
+        out = self.memory.supersede(
+            canonical["fact_id"], s, r, o, valid_from=self._valid_after(canonical),
+            source=self._source_of(canonical), confidence=conf)
+        new_id = out.get("fact_id") if isinstance(out, dict) else getattr(out, "fact_id", "")
+        retracted, failed = [], []
+        for f in facts[1:]:
+            try:
+                self.memory.retract(f["fact_id"])
+                retracted.append(f["fact_id"])
+            except Exception as exc:                 # noqa: BLE001 — один сбой не отменяет слияние
+                failed.append({"fact_id": f["fact_id"], "error": str(exc)})
+        return {"status": "ok", "applied": True, "preview": preview, "fact_id": new_id,
+                "superseded": canonical["fact_id"], "retracted": retracted, "failed": failed}
+
+    def forget_facts(self, fact_ids: Optional[List[str]] = None,
+                     node_id: str = "") -> dict:
+        """Удалить нейрон из активной памяти: отозвать все его Fact, аудит сохранить в журнале."""
+        ids = {str(i) for i in (fact_ids or []) if str(i)}
+        node = str(node_id or "").strip()
+        if node and not ids:
+            graph = self.memory.graph(1000)
+            ids = {str(e.get("id")) for e in graph.get("edges", [])
+                   if e.get("source") == node or e.get("target") == node}
+        if not ids:
+            raise ValueError("не указаны fact_id или node_id")
+        retracted, failed = [], []
+        for fid in sorted(ids):
+            try:
+                self.memory.retract(fid)
+                retracted.append(fid)
+            except Exception as exc:                 # noqa: BLE001 — неизвестный id не ломает остальные
+                failed.append({"fact_id": fid, "error": str(exc)})
+        return {"status": "ok", "retracted": retracted, "failed": failed, "node_id": node}
 
     # ---------- обслуживание ----------
 
