@@ -1,12 +1,15 @@
 (function () {
   'use strict';
 
-  const LS = {
+  const LS_BASE = {
     sessions: 'pulsenet.sessions.v1',
     msgs: 'pulsenet.msgs.v1.',
     current: 'pulsenet.current.v1',
     settings: 'pulsenet.settings.v1',
   };
+  // Ключи localStorage получают префикс uid после проверки сессии: чаты разных
+  // аккаунтов на одном браузере не смешиваются.
+  let LS = { ...LS_BASE };
   const DEFAULTS = {
     compact: false,
     fontSize: 'm',
@@ -22,6 +25,7 @@
     { name: 'fetch', arg: 'адрес', hint: 'прочитать страницу и ответить по ней' },
     { name: 'memory', arg: 'запрос', hint: 'найти в памяти факты и фрагменты' },
     { name: 'remember', arg: 'текст', hint: 'сохранить в память' },
+    { name: 'chatmem', hint: 'чат → память: документ + факты, без дублей', local: true },
     { name: 'graph', hint: 'карта нейронов памяти', local: true },
     { name: 'new', hint: 'новый чат', local: true },
   ];
@@ -29,12 +33,16 @@
     { title: 'Что ты помнишь?', prompt: 'Что ты знаешь обо мне и моих предпочтениях?' },
     { title: 'Поиск в интернете', prompt: '/search ', fill: true, hint: 'введите запрос после команды' },
     { title: 'Сохранить в память', prompt: '/remember ', fill: true, hint: 'напишите, что запомнить' },
+    { title: 'Чат в память', prompt: '/chatmem', local: true, hint: 'извлечь факты из всего диалога' },
     { title: 'Карта нейронов', prompt: '/graph', local: true, hint: 'как растёт память' },
   ];
   const PALETTE = ['#8ea2ff', '#4cc38a', '#e0a458', '#e5544f', '#c58af9', '#5bc0de', '#f28db2', '#b5c77a'];
   const ICON_SEND = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4Z"/></svg>';
   const ICON_STOP = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
   const ICON_COPY = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  const ICON_REFRESH = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 6.7"/><path d="M20 5v6h-6"/></svg>';
+  const ICON_SPEAK = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg>';
+  const ICON_MIC = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>';
 
   const $ = (id) => document.getElementById(id);
   const els = {
@@ -44,8 +52,11 @@
     renameBtn: $('renameBtn'), exportBtn: $('exportBtn'), clearBtn: $('clearBtn'), deleteBtn: $('deleteBtn'),
     drawerBtn: $('drawerBtn'), menuBtn: $('menuBtn'), messages: $('messages'), inner: $('inner'),
     scrollBottomBtn: $('scrollBottomBtn'), input: $('input'), sendBtn: $('sendBtn'), counter: $('counter'),
-    hint: $('hint'), reasonBtn: $('reasonBtn'), webTool: $('webTool'), memoryTool: $('memoryTool'),
-    memoryBtn: $('memoryBtn'), memCount: $('memCount'), sbStat: $('sbStat'), settingsBtn: $('settingsBtn'),
+    hint: $('hint'), reasonBtn: $('reasonBtn'), webTool: $('webTool'), composer: $('composer'),
+    sbStat: $('sbStat'), settingsBtn: $('settingsBtn'),
+    modelSelect: $('modelSelect'), metrics: $('metrics'), metricSpeed: $('metricSpeed'),
+    metricTokens: $('metricTokens'), metricTime: $('metricTime'),
+    authUser: $('authUser'), userEmail: $('userEmail'), logoutBtn: $('logoutBtn'),
     cmdPop: $('cmdPop'),
     drawer: $('drawer'), drawerScrim: $('drawerScrim'), drawerClose: $('drawerClose'), drawerSub: $('drawerSub'),
     factsReload: $('factsReload'), factsMeta: $('factsMeta'), factsList: $('factsList'),
@@ -60,8 +71,11 @@
     errorsBox: $('errorsBox'), sleepOut: $('sleepOut'),
     settingsDialog: $('settingsDialog'), setCompact: $('setCompact'), setFontSize: $('setFontSize'),
     setAutoScroll: $('setAutoScroll'), setEnterSends: $('setEnterSends'), setReasoning: $('setReasoning'),
-    setModel: $('setModel'), modelsReload: $('modelsReload'), modelHint: $('modelHint'),
+    modelsReload: $('modelsReload'),
     exportAll: $('exportAll'), wipeAll: $('wipeAll'),
+    mcpTokenValue: $('mcpTokenValue'), mcpTokenMeta: $('mcpTokenMeta'),
+    mcpTokenHint: $('mcpTokenHint'), mcpTokenRotate: $('mcpTokenRotate'), mcpTokenRevoke: $('mcpTokenRevoke'),
+    syncStatus: $('syncStatus'), syncNow: $('syncNow'),
     confirmDialog: $('confirmDialog'), confirmTitle: $('confirmTitle'), confirmText: $('confirmText'),
     confirmYes: $('confirmYes'), toast: $('toast'),
   };
@@ -82,6 +96,101 @@
   let drawerTab = null;
   let cmdItems = [];
   let cmdIndex = 0;
+  // localStorage — локальный кеш. Источник истины — сервер (/api/chats),
+  // поэтому один и тот же чат открывается на телефоне, компьютере и в PWA.
+  const SYNC = { ready: false, busy: false, applying: false, watching: false,
+                 rev: 0, pushTimer: null, events: null, streamTimer: null, watchTimer: null };
+  // Метрики ответа: сервер не отдаёт usage, поэтому токены оцениваются по длине текста.
+  const METRICS = { active: false, t0: 0, elapsed: 0, chars: 0, timer: null };
+
+  function chatKey(s) { return (s && (s.chatId || s.id)) || 'default'; }
+
+  // ---------- метрики генерации ----------
+
+  function estimatedTokens() {
+    return METRICS.chars ? Math.max(1, Math.round(METRICS.chars / 3.6)) : 0;
+  }
+  function renderMetrics() {
+    if (!els.metrics) return;
+    const tokens = estimatedTokens();
+    const secs = METRICS.active
+      ? Math.max(0, (performance.now() - METRICS.t0) / 1000)
+      : METRICS.elapsed;
+    const speed = secs > 0.05 ? tokens / secs : 0;
+    els.metricSpeed.textContent = tokens ? speed.toFixed(1) : '—';
+    els.metricTokens.textContent = tokens ? String(tokens) : '—';
+    els.metricTime.textContent = secs ? secs.toFixed(1) : '—';
+    els.metrics.classList.toggle('live', METRICS.active);
+  }
+  function startMetrics(seedChars) {
+    METRICS.active = true;
+    METRICS.t0 = performance.now();
+    METRICS.elapsed = 0;
+    METRICS.chars = Math.max(0, Number(seedChars) || 0);
+    clearInterval(METRICS.timer);
+    METRICS.timer = setInterval(renderMetrics, 200);
+    renderMetrics();
+  }
+  function addMetricsText(text) {
+    if (METRICS.active) METRICS.chars += String(text || '').length;
+  }
+  function stopMetrics() {
+    if (!METRICS.active) return;
+    METRICS.elapsed = (performance.now() - METRICS.t0) / 1000;
+    METRICS.active = false;
+    clearInterval(METRICS.timer);
+    METRICS.timer = null;
+    renderMetrics();
+  }
+  function captureMetrics() {
+    const tokens = estimatedTokens();
+    const secs = METRICS.elapsed || (METRICS.active
+      ? Math.max(0, (performance.now() - METRICS.t0) / 1000) : 0);
+    return { tokens, elapsed: Number(secs.toFixed(1)),
+             tps: secs > 0.05 ? Number((tokens / secs).toFixed(1)) : 0 };
+  }
+
+  // ---------- дедупликация сообщений ----------
+  // Сервер пишет время в секундах, браузер — в миллисекундах. Приводим к одному
+  // виду и схлопываем копии с тем же id, а также старые копии от сломанного реаттача.
+
+  function normalizeTime(value) {
+    const t = Number(value) || 0;
+    return t > 0 && t < 1e12 ? t * 1000 : t;
+  }
+  function dedupeMessages(list) {
+    if (!Array.isArray(list)) return list;
+    const seen = new Set();
+    const out = [];
+    for (const m of list) {
+      if (!m || typeof m !== 'object') continue;
+      // Пустой ответ-артефакт от старого параллельного стрима: только метка очереди.
+      if (m.role === 'assistant' && !m.pending && !m.text && !m.reasoning &&
+          !(m.tools || []).length && !(m.sources || []).length &&
+          (m.indexPending || (!m.error && !m.note))) continue;
+      m.time = normalizeTime(m.time);
+      const key = m.id ? 'id:' + m.id
+        : 'ct:' + (m.role || '') + '|' + m.time + '|' + String(m.text || '');
+      if (seen.has(key)) continue;
+      // Следствие старого реаттача: один и тот же ответ под разными id, созданными
+      // watchRemote() по несколько раз на одно state-changed. Ищем такую копию по
+      // всему списку (не только по соседям) — копии могут быть разнесены
+      // другими сообщениями.
+      if (m.role === 'assistant') {
+        const twin = out.find((p) => p.role === 'assistant' &&
+          String(p.text || '') === String(m.text || '') &&
+          Math.abs(p.time - m.time) < 600000);
+        if (twin) {
+          if (String(m.text || '').length > String(twin.text || '').length ||
+              (!twin.text && m.text)) out[out.indexOf(twin)] = m;
+          continue;
+        }
+      }
+      seen.add(key);
+      out.push(m);
+    }
+    return out;
+  }
 
   // ---------- storage ----------
 
@@ -110,10 +219,12 @@
   function saveSessions() {
     writeJSON(LS.sessions, sessions);
     if (currentId) writeRaw(LS.current, currentId);
+    schedulePush();
   }
   function saveMessages(id) {
     if (!id || !Array.isArray(messages[id])) return;
     writeJSON(LS.msgs + id, messages[id].slice(-300));
+    schedulePush();
   }
   function loadState() {
     const stored = readJSON(LS.sessions, []);
@@ -128,14 +239,17 @@
     if (!sessions.some((s) => s.id === currentId)) currentId = sessions[0].id;
     for (const s of sessions) {
       const list = readJSON(LS.msgs + s.id, []);
-      messages[s.id] = Array.isArray(list) ? list.map((m) => {
+      const loaded = Array.isArray(list) ? list.map((m, i) => {
         if (!m || typeof m !== 'object') return null;
+        if (!m.id) m.id = 'm' + s.id + '-' + i;   // ключ для серверной синхронизации
         if (m.pending) {
           m.pending = false;
           if (!m.note) m.note = m.text ? 'Ответ прерван' : 'Ответ не получен';
         }
         return m;
       }).filter(Boolean) : [];
+      // Чистим последствия прежнего дублирования до того, как сообщения уйдут на сервер.
+      messages[s.id] = dedupeMessages(loaded);
     }
     saveSessions();
   }
@@ -241,15 +355,293 @@
       els.confirmDialog.showModal();
     });
   }
+  function unauthorized(r) {
+    if (r.status !== 401 || location.pathname === '/login') return;
+    location.href = '/login';
+  }
   async function api(method, path, body) {
     const r = await fetch(path, {
       method,
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
       body: body ? JSON.stringify(body) : undefined,
     });
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+    if (!r.ok) {
+      unauthorized(r);
+      throw new Error(data.error || ('HTTP ' + r.status));
+    }
     return data;
+  }
+
+  // Сессия проверяется на сервере: без неё страница чата недоступна.
+  async function checkAuth() {
+    try {
+      const r = await fetch('/auth/status', { credentials: 'same-origin', cache: 'no-store' });
+      const j = await r.json();
+      if (j.required && !j.authenticated) { location.href = '/login'; return false; }
+      const prefix = j.uid ? (j.uid + ':') : '';
+      LS = Object.fromEntries(Object.entries(LS_BASE).map(([k, v]) => [k, prefix + v]));
+      const label = j.email || j.uid;
+      if (label && els.userEmail && els.authUser) {
+        els.userEmail.textContent = label;
+        els.authUser.hidden = false;
+      }
+      return true;
+    } catch (_) { return false; }
+  }
+  if (els.logoutBtn) {
+    els.logoutBtn.addEventListener('click', async () => {
+      try { await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin' }); } catch (_) { /* ignore */ }
+      location.href = '/login';
+    });
+  }
+
+  // ---------- синхронизация чатов между устройствами ----------
+  // Сервер хранит чаты пользователя; локальный localStorage работает как кеш.
+  // На другой странице EventSource сообщает об изменениях, а активную генерацию
+  // можно подсмотреть через /api/chat/stream с тем же chat_id.
+
+  function setSyncStatus(text, bad) {
+    if (!els.syncStatus) return;
+    els.syncStatus.textContent = text;
+    els.syncStatus.classList.toggle('bad', !!bad);
+  }
+
+  function schedulePush() {
+    if (!SYNC.ready || SYNC.applying) return;
+    clearTimeout(SYNC.pushTimer);
+    SYNC.pushTimer = setTimeout(() => { syncPush(); }, 700);
+  }
+
+  async function syncPush() {
+    if (!SYNC.ready || SYNC.applying || SYNC.busy) return;
+    clearTimeout(SYNC.pushTimer);
+    try {
+      const payload = {
+        sessions: sessions.map((s) => ({ ...s, chatId: chatKey(s) })),
+        messages: Object.fromEntries(sessions.map((s) => [chatKey(s),
+          dedupeMessages((messages[s.id] || []).map((m) => m.pending ? { ...m, draft: true } : { ...m }))])),
+      };
+      const data = await api('PUT', '/api/chats', payload);
+      if (typeof data.rev === 'number') SYNC.rev = data.rev;
+      setSyncStatus('сохранено ' + fmtTime(Date.now()));
+    } catch (err) {
+      setSyncStatus('ошибка сохранения: ' + (err.message || err), true);
+    }
+  }
+
+  function mergeRemote(data) {
+    let changed = false;
+    for (const rs of data.sessions || []) {
+      if (!rs || !rs.id) continue;
+      const i = sessions.findIndex((s) => s.id === rs.id);
+      if (i < 0) {
+        sessions.push({ ...rs, chatId: chatKey(rs) });
+        changed = true;
+      } else if ((rs.updated || 0) > (sessions[i].updated || 0)) {
+        sessions[i] = { ...sessions[i], title: rs.title, created: rs.created || sessions[i].created,
+                        updated: rs.updated, chatId: chatKey(rs) };
+        changed = true;
+      }
+    }
+    for (const [cid, list] of Object.entries(data.messages || {})) {
+      const sess = sessions.find((s) => chatKey(s) === cid);
+      if (!sess) continue;
+      let cur = messages[sess.id] || (messages[sess.id] = []);
+      const deduped = dedupeMessages(cur);
+      if (deduped.length !== cur.length) { changed = true; cur = messages[sess.id] = deduped; }
+      for (const rm of list || []) {
+        if (!rm || !rm.id) continue;
+        rm.time = normalizeTime(rm.time);
+        const i = cur.findIndex((m) => m.id === rm.id);
+        if (rm.draft) {
+          // Черновик другой вкладки: обновляем только уже идущий ответ, не создаём новый.
+          if (i >= 0 && cur[i].pending) {
+            cur[i].text = rm.text || '';
+            cur[i].reasoning = rm.reasoning || '';
+            schedulePaint(cur[i], i);
+          }
+          continue;
+        }
+        if (i < 0) {
+          cur.push({ ...rm });
+          changed = true;
+        } else if (!rm.pending && (cur[i].pending || (rm.time || 0) >= normalizeTime(cur[i].time || 0))) {
+          cur[i] = { ...rm };
+          changed = true;
+        }
+      }
+      // Сервер может вернуть старые копии, сохранённые до исправления реаттача.
+      const clean = dedupeMessages(messages[sess.id] || []);
+      if (clean.length !== (messages[sess.id] || []).length) {
+        messages[sess.id] = clean;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    saveSessions();
+    for (const s of sessions) saveMessages(s.id);
+    if (!sessions.some((s) => s.id === currentId)) currentId = sessions[0] && sessions[0].id;
+    renderSessions();
+    updateTitle();
+    renderMessages({ force: true });
+  }
+
+  async function syncPull() {
+    if (!SYNC.ready || SYNC.busy) return;
+    SYNC.busy = true;
+    try {
+      const data = await api('GET', '/api/chats' + (SYNC.rev ? '?rev=' + SYNC.rev : ''));
+      if (data.unchanged) {
+        setSyncStatus('актуально ' + fmtTime(Date.now()));
+        return;
+      }
+      SYNC.rev = Number(data.rev) || 0;
+      const emptyLocal = !sessions.some((s) => (messages[s.id] || []).length);
+      SYNC.applying = true;
+      try { mergeRemote(data); } finally { SYNC.applying = false; }
+      // Новое устройство: открываем самый свежий чат с сервера, а не пустую локальную вкладку.
+      if (emptyLocal && Array.isArray(data.sessions) && data.sessions.length) {
+        const latest = data.sessions.slice().sort((a, b) => (b.updated || 0) - (a.updated || 0))[0];
+        const found = sessions.find((s) => s.id === latest.id);
+        if (found) {
+          currentId = found.id;
+          writeRaw(LS.current, currentId);
+          renderSessions();
+          updateTitle();
+          renderMessages({ force: true });
+        }
+      }
+      setSyncStatus('загружено ' + fmtTime(Date.now()));
+    } catch (err) {
+      setSyncStatus('сервер чатов недоступен', true);
+    } finally {
+      SYNC.busy = false;
+    }
+  }
+
+  // Пачка state-changed от сервера не должна порождать параллельные стримы:
+  // один таймер на все уведомления, а флаг watching выставляется до первого await.
+  function requestWatch() {
+    if (SYNC.watchTimer) return;
+    SYNC.watchTimer = setTimeout(() => { SYNC.watchTimer = null; watchRemote(); }, 350);
+  }
+
+  async function watchRemote() {
+    if (busy || SYNC.watching) return;
+    SYNC.watching = true;   // синхронно, пока нет await — закрываем гонку replicated-стримов
+    const s = currentSession();
+    if (!s) { SYNC.watching = false; return; }
+    const cid = chatKey(s);
+    try {
+      const r = await fetch('/api/chat/active?chat_id=' + encodeURIComponent(cid), { credentials: 'same-origin' });
+      const j = await r.json();
+      if (!j.active || busy) return;
+      const list = messages[s.id] || (messages[s.id] = []);
+      dedupeMessages(list);
+      // Главное исправление дублей: ищем ответ по id активной задачи сервера.
+      // Раньше брался «последний в списке» и создавался новый bot с новым id —
+      // каждый вызов watchRemote() добавлял ещё одну копию одного и того же ответа.
+      let bot = list.find((m) => m && m.id === j.assistant_msg_id);
+      let idx = bot ? list.indexOf(bot) : -1;
+      if (!bot) {
+        bot = list.find((m) => m && m.role === 'assistant' && m.pending);
+        if (bot) idx = list.indexOf(bot);
+      }
+      if (!bot) {
+        bot = { id: j.assistant_msg_id || newId(), role: 'assistant', text: '', reasoning: '',
+                time: Date.now(), pending: true, tools: [], sources: [] };
+        const userIdx = j.user_msg_id ? list.findIndex((m) => m && m.id === j.user_msg_id) : -1;
+        if (userIdx >= 0) { list.splice(userIdx + 1, 0, bot); idx = userIdx + 1; }
+        else { list.push(bot); idx = list.length - 1; }
+      }
+      busy = true;
+      abortCtl = new AbortController();
+      startMetrics(bot.text.length);
+      updateComposer();
+      renderMessages({ force: true });
+      let finished = false;
+      await streamChat(null, (ev) => {
+        if (typeof ev.token === 'string') { bot.text += ev.token; addMetricsText(ev.token); schedulePaint(bot, idx); }
+        if (typeof ev.reasoning === 'string') { bot.reasoning += ev.reasoning; schedulePaint(bot, idx); }
+        if (ev.tool) { upsertTool(bot, ev.tool); schedulePaint(bot, idx); }
+        if (Array.isArray(ev.sources)) { addSources(bot, ev.sources); schedulePaint(bot, idx); }
+        if (ev.error) bot.error = String(ev.error);
+        if (ev.done) {
+          if (!bot.text && ev.done.answer) bot.text = ev.done.answer;
+          bot.pending = false;
+          bot.gen = captureMetrics();
+          bot.indexPending = Number(ev.done.index_pending) || 0;
+          finished = true;
+        }
+      }, abortCtl.signal, '/api/chat/stream?chat_id=' + encodeURIComponent(cid), 'GET');
+      if (finished) toast('Подключился к ответу, начатому на другом устройстве');
+    } catch (_) {
+      // Ответ уже закончился — финальный текст придёт через state-changed.
+    } finally {
+      stopMetrics();
+      busy = false;
+      abortCtl = null;
+      SYNC.watching = false;
+      updateComposer();
+      saveMessages(s.id);
+      syncPull();
+    }
+  }
+
+  function startStateEvents() {
+    if (SYNC.events || typeof EventSource === 'undefined') return;
+    try {
+      SYNC.events = new EventSource('/api/chats/events', { withCredentials: true });
+      SYNC.events.addEventListener('state-changed', () => { syncPull().then(requestWatch); });
+    } catch (_) { /* браузер без EventSource — останется периодическая проверка */ }
+  }
+
+  // ---------- токен MCP ----------
+
+  async function loadMcpToken() {
+    if (!els.mcpTokenValue) return;
+    try {
+      const j = await api('GET', '/api/mcp/token');
+      const shown = j.token || (j.active ? '•••••••• ' + (j.fingerprint || '') : 'нет активного токена');
+      els.mcpTokenValue.textContent = shown;
+      els.mcpTokenValue.title = j.token || '';
+      els.mcpTokenValue.classList.toggle('empty', !j.token);
+      els.mcpTokenMeta.textContent = j.owner ? 'владелец (.env)' : (j.active ? 'активен' : 'не выдан');
+      if (els.mcpTokenHint) els.mcpTokenHint.textContent = j.hint ||
+        'Токен внешнего ИИ под вашим аккаунтом. Новый токен отключает прежние подключения.';
+      if (els.mcpTokenRotate) els.mcpTokenRotate.disabled = !j.can_rotate;
+      if (els.mcpTokenRevoke) els.mcpTokenRevoke.disabled = !j.can_rotate || !j.active;
+    } catch (err) {
+      els.mcpTokenMeta.textContent = 'недоступно: ' + (err.message || err);
+    }
+  }
+
+  async function rotateMcpToken() {
+    if (!(await ask('Выпустить новый ключ MCP?',
+      'Старый токен перестанет работать: все подключённые внешние ИИ нужно обновить.', 'Выпустить'))) return;
+    try {
+      const j = await api('POST', '/api/mcp/token', {});
+      els.mcpTokenValue.textContent = j.token || '';
+      els.mcpTokenValue.title = j.token || '';
+      els.mcpTokenValue.classList.toggle('empty', !j.token);
+      toast('Новый токен выдан. Скопируйте его сейчас.');
+      loadMcpToken();
+    } catch (err) {
+      toast('Ошибка: ' + (err.message || err));
+    }
+  }
+
+  async function revokeMcpToken() {
+    if (!(await ask('Отозвать ключ MCP?', 'Все внешние подключения этого аккаунта будут разорваны.', 'Отозвать'))) return;
+    try {
+      await api('DELETE', '/api/mcp/token');
+      toast('Токен отозван');
+      loadMcpToken();
+    } catch (err) {
+      toast('Ошибка: ' + (err.message || err));
+    }
   }
 
   // ---------- settings ----------
@@ -262,9 +654,11 @@
   }
   function applySettings() {
     document.body.dataset.fs = settings.fontSize || 'm';
+    if (typeof setUIScale === 'function') setUIScale(settings.fontSize || 'm');
     document.body.classList.toggle('compact', !!settings.compact);
     els.reasonBtn.setAttribute('aria-pressed', settings.showReasoning ? 'true' : 'false');
     els.webTool.setAttribute('aria-pressed', settings.webSearch ? 'true' : 'false');
+    if (els.modelSelect) els.modelSelect.value = settings.model || '';
     els.setCompact.checked = !!settings.compact;
     els.setFontSize.value = settings.fontSize || 'm';
     els.setAutoScroll.checked = !!settings.autoScroll;
@@ -312,6 +706,8 @@
         b.appendChild(dot);
       }
       b.addEventListener('click', () => selectSession(s.id));
+      attachMenu(b, (x, y) => showChatMenu(x, y, s.id));
+      b.title = 'Нажмите, чтобы открыть · правый клик или долгое нажатие — действия';
       els.sessionList.appendChild(b);
     }
   }
@@ -513,17 +909,20 @@
 
     const foot = el('div', 'msg-foot');
     foot.appendChild(el('span', 'time', fmtTime(m.time)));
+    const stats = statsNode(m);
+    if (stats) foot.appendChild(stats);
     if (m.text && !m.pending) {
-      const copy = el('button', 'act');
-      copy.type = 'button';
-      copy.title = 'Копировать';
-      copy.setAttribute('aria-label', 'Копировать');
-      copy.innerHTML = ICON_COPY;
-      copy.addEventListener('click', () => copyText(m.text));
-      foot.appendChild(copy);
+      foot.appendChild(actButton('Копировать', ICON_COPY, () => copyText(m.text)));
+      if (!isUser) {
+        foot.appendChild(actButton('Другой ответ', ICON_REFRESH, () => regenerate(idx)));
+        if ('speechSynthesis' in window) {
+          foot.appendChild(actButton('Озвучить ответ', ICON_SPEAK, (b) => toggleSpeak(m.text, b)));
+        }
+      }
     }
     body.appendChild(foot);
     root.appendChild(body);
+    attachMessageMenu(root, idx);
     return root;
   }
 
@@ -596,14 +995,18 @@
     }
   }
 
-  async function streamChat(body, onEvent, signal) {
-    const res = await fetch('/api/chat', {
-      method: 'POST',
+  async function streamChat(body, onEvent, signal, path, method) {
+    const url = path || '/api/chat';
+    const verb = method || 'POST';
+    const res = await fetch(url, {
+      method: verb,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      credentials: 'same-origin',
+      body: verb === 'POST' ? JSON.stringify(body) : undefined,
       signal,
     });
     if (!res.ok) {
+      unauthorized(res);
       let msg = 'HTTP ' + res.status;
       try { const data = await res.json(); if (data && data.error) msg = data.error; } catch { /* ignore */ }
       throw new Error(msg);
@@ -640,19 +1043,23 @@
   function runLocal(name) {
     if (name === 'graph') openDrawer('graph');
     else if (name === 'new') createChat();
+    else if (name === 'chatmem') saveChatMemory(currentId, { command: true });
   }
 
-  async function send(override) {
+  async function send(override, reuse) {
     if (busy) return;
+    stopSpeech();
+    if (voiceRec) stopVoice();
     const text = String(override !== undefined ? override : els.input.value).trim();
-    if (!text) return;
-    const local = /^\/(graph|new)\s*$/i.exec(text);
+    if (!text && !reuse) return;
+    const local = /^\/(graph|new|chatmem|впамять)\s*$/i.exec(text);
     if (local) {
       els.input.value = '';
       autoSize();
       updateCounter();
       hideCmdPop();
-      runLocal(local[1].toLowerCase());
+      const name = local[1].toLowerCase() === 'впамять' ? 'chatmem' : local[1].toLowerCase();
+      runLocal(name);
       return;
     }
     const s = ensureSession();
@@ -660,9 +1067,16 @@
     if (!list.length && (!s.title || s.title === 'Новый чат')) {
       s.title = text.replace(/\s+/g, ' ').slice(0, 48);
     }
-    const user = { role: 'user', text, time: Date.now() };
-    const bot = { role: 'assistant', text: '', reasoning: '', time: Date.now(), pending: true, tools: [], sources: [] };
-    list.push(user, bot);
+    const user = reuse ? reuse.user : { id: newId(), role: 'user', text, time: Date.now() };
+    const bot = reuse ? reuse.bot : { id: newId(), role: 'assistant', text: '', reasoning: '', time: Date.now(), pending: true, tools: [], sources: [] };
+    if (reuse) {
+      // Перегенерация переиспользует id: сервер перезапишет прежний ответ,
+      // а не сохранит его второй копией.
+      bot.text = ''; bot.reasoning = ''; bot.tools = []; bot.sources = [];
+      bot.pending = true; bot.error = null; bot.note = ''; bot.indexPending = 0;
+      bot.time = Date.now();
+      delete bot.gen;
+    } else list.push(user, bot);
     if (list.length > 300) list.splice(0, list.length - 300);
     s.updated = Date.now();
     els.input.value = '';
@@ -674,19 +1088,25 @@
     busy = true;
     stopRequested = false;
     abortCtl = new AbortController();
+    startMetrics();
+    // Пока ответ пишется, периодически отправляем черновик — другое устройство
+    // увидит текст в потоке даже до финального сообщения от сервера.
+    clearInterval(SYNC.streamTimer);
+    SYNC.streamTimer = setInterval(() => { if (busy) syncPush(); }, 2000);
     renderSessions();
     updateTitle();
     renderMessages({ force: true });
     updateComposer();
 
-    const botIdx = list.length - 1;
+    const botIdx = reuse ? reuse.idx : list.length - 1;
     let finished = false;
 
     try {
-      const body = { message: text, chat_id: s.chatId || s.id, web: !!settings.webSearch };
+      const body = { message: text, chat_id: chatKey(s), web: !!settings.webSearch,
+        user_msg_id: user.id, assistant_msg_id: bot.id };
       if (settings.model) body.model = settings.model;
       await streamChat(body, (ev) => {
-        if (typeof ev.token === 'string') { bot.text += ev.token; schedulePaint(bot, botIdx); }
+        if (typeof ev.token === 'string') { bot.text += ev.token; addMetricsText(ev.token); schedulePaint(bot, botIdx); }
         if (typeof ev.reasoning === 'string') { bot.reasoning += ev.reasoning; schedulePaint(bot, botIdx); }
         if (ev.tool) { upsertTool(bot, ev.tool); schedulePaint(bot, botIdx); }
         if (Array.isArray(ev.sources)) { addSources(bot, ev.sources); schedulePaint(bot, botIdx); }
@@ -694,6 +1114,7 @@
         if (ev.done) {
           if (!bot.text && ev.done.answer) bot.text = ev.done.answer;
           bot.pending = false;
+          bot.gen = captureMetrics();
           bot.indexPending = Number(ev.done.index_pending) || 0;
           finished = true;
         }
@@ -705,6 +1126,8 @@
         bot.error = err && err.message ? err.message : String(err);
       }
     } finally {
+      stopMetrics();
+      if (!bot.gen) bot.gen = captureMetrics();
       clearTimeout(paintTimer);
       paintQueued = false;
       if (bot.pending) bot.pending = false;
@@ -717,8 +1140,11 @@
       s.updated = Date.now();
       busy = false;
       abortCtl = null;
+      clearInterval(SYNC.streamTimer);
+      SYNC.streamTimer = null;
       saveSessions();
       saveMessages(s.id);
+      syncPush();
       updateComposer();
       renderSessions();
       renderMessages();
@@ -731,8 +1157,243 @@
     if (!busy) return;
     stopRequested = true;
     if (abortCtl) abortCtl.abort();
-    fetch('/api/chat/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' } }).catch(() => {});
+    fetch('/api/chat/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin' }).catch(() => {});
     toast('Останавливаю ответ…');
+  }
+
+  // ---------- действия с сообщениями: метрики, озвучка, меню ----------
+
+  function statsNode(m) {
+    if (!m || m.role === 'user' || !m.text) return null;
+    const node = el('span', 'msg-stats');
+    const g = m.gen || {};
+    const parts = [];
+    if (g.elapsed) parts.push(Number(g.elapsed).toFixed(1) + ' с');
+    if (g.tokens) parts.push(String(g.tokens) + ' ток');
+    if (g.tps) parts.push(Number(g.tps).toFixed(1) + ' tok/s');
+    if (!parts.length) parts.push('~' + Math.max(1, Math.round(String(m.text).length / 3.6)) + ' ток');
+    node.textContent = parts.join(' · ');
+    node.title = 'Скорость и токены оценены по длине текста (~3.6 символа на токен)';
+    return node;
+  }
+
+  function speechPlainText(md) {
+    return String(md || '')
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/`([^`]*)`/g, '$1')
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/^#{1,6}\s*/gm, '')
+      .replace(/[*_~>|]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  let speakingBtn = null;
+  function stopSpeech() {
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    if (speakingBtn) { speakingBtn.classList.remove('on'); speakingBtn = null; }
+  }
+  function toggleSpeak(text, btn) {
+    if (!('speechSynthesis' in window)) return;
+    const wasThis = speakingBtn && speakingBtn === btn;
+    stopSpeech();
+    if (wasThis) return;
+    const plain = speechPlainText(text);
+    if (!plain) return;
+    const u = new SpeechSynthesisUtterance(plain);
+    u.lang = 'ru-RU';
+    const ru = window.speechSynthesis.getVoices().find((v) => /^ru/i.test(v.lang || ''));
+    if (ru) u.voice = ru;
+    const done = () => {
+      if (speakingBtn === btn) { if (btn) btn.classList.remove('on'); speakingBtn = null; }
+    };
+    u.onend = done;
+    u.onerror = done;
+    speakingBtn = btn;
+    if (btn) btn.classList.add('on');
+    window.speechSynthesis.speak(u);
+  }
+
+  function actButton(title, icon, onClick) {
+    const b = el('button', 'act');
+    b.type = 'button';
+    b.title = title;
+    b.setAttribute('aria-label', title);
+    b.innerHTML = icon;
+    b.addEventListener('click', (e) => { e.stopPropagation(); onClick(b); });
+    return b;
+  }
+
+  function regenerate(idx) {
+    if (busy) return;
+    const s = currentSession();
+    if (!s) return;
+    const list = messages[s.id] || [];
+    const bot = list[idx];
+    if (!bot || bot.role === 'user') return;
+    let userIdx = idx - 1;
+    while (userIdx >= 0 && list[userIdx].role !== 'user') userIdx--;
+    if (userIdx < 0) { toast('Нет вопроса для перегенерации'); return; }
+    if (list.length - 1 > idx) list.splice(idx + 1);
+    stopSpeech();
+    toast('Генерирую другой ответ…');
+    send(list[userIdx].text, { user: list[userIdx], bot, idx });
+  }
+
+  let menuEl = null;
+  function closeMenu() {
+    if (menuEl) { menuEl.remove(); menuEl = null; }
+  }
+  function showMenu(x, y, items) {
+    closeMenu();
+    const m = el('div', 'ui-menu');
+    m.setAttribute('role', 'menu');
+    for (const it of items) {
+      if (it.sep) { m.appendChild(el('div', 'ui-menu-sep')); continue; }
+      const b = el('button', 'ui-menu-item' + (it.danger ? ' danger' : ''), it.label);
+      b.type = 'button';
+      b.setAttribute('role', 'menuitem');
+      b.disabled = !!it.disabled;
+      b.addEventListener('click', () => { closeMenu(); if (it.onClick) it.onClick(); });
+      m.appendChild(b);
+    }
+    document.body.appendChild(m);
+    const r = m.getBoundingClientRect();
+    // visualViewport учитывает клавиатуру iOS; window.innerHeight — нет.
+    const vv = window.visualViewport;
+    const vLeft = vv ? vv.offsetLeft : 0;
+    const vTop = vv ? vv.offsetTop : 0;
+    const vw = vv ? vv.width : window.innerWidth;
+    const vh = vv ? vv.height : window.innerHeight;
+    m.style.left = Math.max(vLeft + 8, Math.min(x, vLeft + vw - r.width - 8)) + 'px';
+    m.style.top = Math.max(vTop + 8, Math.min(y, vTop + vh - r.height - 8)) + 'px';
+    menuEl = m;
+  }
+  function showMessageMenu(x, y, idx) {
+    const s = currentSession();
+    const m = s && (messages[s.id] || [])[idx];
+    if (!m) return;
+    const isBot = m.role !== 'user';
+    const g = m.gen || {};
+    const stat = [g.tps ? Number(g.tps).toFixed(1) + ' tok/s' : '',
+                  g.tokens ? g.tokens + ' ток' : '',
+                  g.elapsed ? Number(g.elapsed).toFixed(1) + ' с' : ''].filter(Boolean).join(' · ') ||
+                 '≈' + Math.max(1, Math.round(String(m.text || '').length / 3.6)) + ' ток';
+    showMenu(x, y, [
+      { label: 'Копировать', disabled: !m.text, onClick: () => copyText(m.text || '') },
+      { label: 'Другой ответ', disabled: !isBot || busy, onClick: () => regenerate(idx) },
+      { label: speakingBtn && isBot ? 'Остановить озвучивание' : 'Озвучить',
+        disabled: (!speakingBtn || !isBot) && (!isBot || !m.text || !('speechSynthesis' in window)),
+        onClick: () => { if (speakingBtn) stopSpeech(); else toggleSpeak(m.text, null); } },
+      { sep: true },
+      { label: 'Метрики: ' + stat, disabled: true },
+    ]);
+  }
+  function showBlankMenu(x, y) {
+    showMenu(x, y, [
+      { label: 'Новый чат', onClick: () => createChat() },
+      { label: 'Чат в память', disabled: !currentId || !(messages[currentId] || []).length,
+        onClick: () => saveChatMemory(currentId, { command: true }) },
+      { sep: true },
+      { label: 'Память: факты', onClick: () => openDrawer('facts') },
+      { label: 'Настройки', onClick: () => { if (els.settingsDialog.showModal) els.settingsDialog.showModal(); } },
+    ]);
+  }
+  function showChatMenu(x, y, id) {
+    const s = sessions.find((v) => v.id === id);
+    if (!s) return;
+    const current = id === currentId;
+    const n = (messages[id] || []).length;
+    showMenu(x, y, [
+      { label: current ? 'Текущий чат' : 'Открыть чат', disabled: current,
+        onClick: () => selectSession(id) },
+      { label: 'Выгрузить в .md', disabled: !n, onClick: () => exportChat(id) },
+      { label: 'В память (факты + дедупликация)', disabled: !n,
+        onClick: () => saveChatMemory(id) },
+      { sep: true },
+      { label: 'Переименовать', disabled: !current, onClick: () => startRename() },
+      { label: 'Очистить историю', disabled: !n || busy, onClick: () => clearChat(id) },
+      { label: 'Удалить чат', danger: true, disabled: busy, onClick: () => deleteChat(id) },
+    ]);
+  }
+
+  function showFactMenu(x, y, fid, text) {
+    showMenu(x, y, [
+      { label: 'Копировать факт', disabled: !text, onClick: () => copyText(String(text || '')) },
+      { label: 'Найти связанное', disabled: !text,
+        onClick: () => { openDrawer('search'); els.searchQuery.value = String(text || ''); runSearch(); } },
+      { sep: true },
+      { label: 'Верно', onClick: () => memoryAction('/api/memory/confirm', { fact_id: fid, yes: true }, 'Факт подтверждён') },
+      { label: 'Неверно', onClick: () => memoryAction('/api/memory/confirm', { fact_id: fid, yes: false }, 'Уверенность снижена') },
+      { label: 'Пересобрать', onClick: () => distillFact(fid) },
+      { label: 'Отозвать', danger: true, onClick: async () => {
+        if (!(await ask('Отозвать факт?', 'Факт перестанет участвовать в ответах.', 'Отозвать'))) return;
+        memoryAction('/api/memory/retract', { fact_id: fid }, 'Факт отозван');
+      } },
+    ]);
+  }
+
+  // Универсальное «меню по правой кнопке / долгому нажатию»: работает на сообщениях,
+  // чатах, фактах — везде, где есть осмысленные действия над объектом.
+  function isMenuExempt(target, root) {
+    return target !== root && !!target.closest &&
+      !!target.closest('button, a, input, textarea, select, [contenteditable="true"], [role="menuitem"]');
+  }
+  function attachMenu(root, open, skipSelector) {
+    if (!root) return;
+    const skipped = (target) => !!skipSelector && !!target.closest && !!target.closest(skipSelector);
+    root.addEventListener('contextmenu', (e) => {
+      // На iOS long-press в поле ввода порождает contextmenu — отдаём его
+      // системе (выделение, вставка, «Искать»), иначе меню перекрывает клавиатуру.
+      if (isMenuExempt(e.target, root) || skipped(e.target)) return;
+      e.preventDefault();
+      open(e.clientX, e.clientY);
+    });
+    let timer = null, swallow = false;
+    const clear = () => { clearTimeout(timer); timer = null; root.classList.remove('menu-press'); };
+    root.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1 || isMenuExempt(e.target, root) || skipped(e.target)) { clear(); return; }
+      const t = e.touches[0], x = t.clientX, y = t.clientY;
+      clear();
+      root.classList.add('menu-press');
+      timer = setTimeout(() => {
+        timer = null;
+        root.classList.remove('menu-press');
+        swallow = true;
+        setTimeout(() => { swallow = false; }, 600);
+        open(x, y);
+        if (navigator.vibrate) navigator.vibrate(12);
+      }, 500);
+    }, { passive: true });
+    root.addEventListener('touchmove', clear, { passive: true });
+    root.addEventListener('touchend', clear);
+    root.addEventListener('touchcancel', clear);
+    root.addEventListener('click', (e) => {
+      if (!swallow) return;
+      swallow = false;
+      e.preventDefault();
+      e.stopPropagation();
+    }, true);
+  }
+  function attachMessageMenu(root, idx) {
+    attachMenu(root, (x, y) => showMessageMenu(x, y, idx));
+  }
+  document.addEventListener('pointerdown', (e) => {
+    if (menuEl && !menuEl.contains(e.target)) closeMenu();
+  }, true);
+  // Фокус поля = пользователь печатает: любое меню должно исчезнуть, иначе на iOS
+  // оно остаётся «под» клавиатурой и мешает вводу.
+  document.addEventListener('focusin', (e) => {
+    if (e.target && e.target.closest && e.target.closest('input, textarea, select, [contenteditable="true"]')) closeMenu();
+  }, true);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); });
+  window.addEventListener('scroll', closeMenu, true);
+  window.addEventListener('resize', closeMenu);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', closeMenu);
+    window.visualViewport.addEventListener('scroll', closeMenu);
   }
 
   // ---------- команды ----------
@@ -785,8 +1446,11 @@
   // ---------- модели ----------
 
   async function loadModels() {
-    const select = els.setModel;
-    els.modelHint.textContent = 'загрузка списка…';
+    const select = els.modelSelect;
+    if (!select) return;
+    const setHint = (text) => { select.title = text; };
+    select.innerHTML = '<option value="">загрузка моделей…</option>';
+    setHint('загрузка списка…');
     try {
       const data = await api('GET', '/api/models');
       const models = Array.isArray(data.models) ? data.models : [];
@@ -802,12 +1466,19 @@
         opt.textContent = id;
         select.appendChild(opt);
       }
+      if (!models.length && !settings.model) {
+        const none = document.createElement('option');
+        none.value = '';
+        none.textContent = 'моделей нет';
+        select.appendChild(none);
+      }
       select.value = settings.model || '';
-      els.modelHint.textContent = models.length
-        ? 'Модель сохраняется и применяется к следующему ответу. Эмбеддинги в список не входят и не перезагружаются.'
-        : 'Моделей нет: загрузите модель в LM Studio или проверьте LLM_BACKEND.';
+      setHint(models.length
+        ? 'Модель применяется к следующему ответу. Эмбеддинги в список не входят.'
+        : 'Моделей нет: загрузите модель в LM Studio или проверьте LLM_BACKEND.');
     } catch (err) {
-      els.modelHint.textContent = 'Список недоступен: ' + (err.message || err);
+      select.innerHTML = '<option value="">список недоступен</option>';
+      setHint('Список недоступен: ' + (err.message || err));
     }
   }
 
@@ -882,7 +1553,6 @@
       els.modelChip.title = 'Бэкенд: ' + (s.backend || '—') + (s.model ? ' · модель: ' + s.model : '');
       els.chatSub.textContent = (s.backend || 'backend') + (s.model ? ' · ' + s.model : '') +
         ' · фактов: ' + (m.facts_active ?? 0);
-      els.memCount.textContent = m.facts_active ?? 0;
       els.sbStat.textContent = 'фактов: ' + (m.facts_active ?? 0) + ' · документов: ' + (m.docs ?? 0) +
         ' · очередь: ' + (s.index_pending ?? 0);
       renderStatus(s);
@@ -901,7 +1571,7 @@
 
   const graph = {
     nodes: [], edges: [], byId: {}, W: 0, H: 0, dpr: 1, temp: 0, frames: 0, raf: 0,
-    hover: null, selected: null, busy: false, typeColors: {},
+    hover: null, selected: null, busy: false, typeColors: {}, relColors: {}, pulses: [],
     view: { scale: 1, ox: 0, oy: 0 }, drag: null, press: null, fullscreen: false,
     sessionStart: Date.now(),
   };
@@ -914,6 +1584,15 @@
       graph.typeColors[key] = PALETTE[Object.keys(graph.typeColors).length % PALETTE.length];
     }
     return graph.typeColors[key];
+  }
+  // Цвет связи по отношению — как в MCPIISys: по цвету видно, какие именно
+  // синапсы связывают выбранный нейрон с соседями.
+  function relColor(label) {
+    const key = String(label || 'связь');
+    if (!graph.relColors[key]) {
+      graph.relColors[key] = PALETTE[(Object.keys(graph.relColors).length + 3) % PALETTE.length];
+    }
+    return graph.relColors[key];
   }
   function shorten(text, n) {
     const s = String(text || '');
@@ -939,8 +1618,16 @@
     kick();
   }
 
+  function spawnPulse(edge, delay) {
+    if (!edge) return;
+    const start = performance.now() + (delay || 0);
+    graph.pulses.push({ edge, t0: start, until: start + 900 });
+    if (graph.pulses.length > 24) graph.pulses.shift();
+  }
+
   function buildGraph(data) {
     const prev = graph.byId;
+    const prevEdges = new Set(graph.edges.map((e) => e.source + '->' + e.target + ':' + (e.label || '')));
     const W = graph.W || 300;
     const H = graph.H || 340;
     const nodes = (data.nodes || []).map((n) => {
@@ -961,7 +1648,7 @@
     for (const e of data.edges || []) {
       const a = byId[e.source];
       const b = byId[e.target];
-      if (a && b) edges.push({ ...e, a, b, created: parseIso(e.recorded_at) });
+      if (a && b) edges.push({ ...e, a, b, created: parseIso(e.recorded_at), color: relColor(e.label) });
     }
     const changed = nodes.length !== Object.keys(prev).length || nodes.some((n) => !prev[n.id]);
     graph.nodes = nodes;
@@ -970,6 +1657,14 @@
     if (changed) {
       graph.temp = W / 8;
       graph.frames = 0;
+    }
+    // Те связи, которых не было раньше, «просыпаются» бегущим импульсом.
+    if (changed && graphVisible()) {
+      let n = 0;
+      for (const e of edges) {
+        const key = e.source + '->' + e.target + ':' + (e.label || '');
+        if (!prevEdges.has(key)) spawnPulse(e, n++ * 90);
+      }
     }
     renderGraphMeta(data, nodes, edges);
     const sel = graph.selected && byId[graph.selected.id];
@@ -1022,7 +1717,7 @@
       graph.frames++;
     }
     draw();
-    if (laying || ((graph.selected || graph.hover) && graphVisible())) kick();
+    if (laying || graph.pulses.length || ((graph.selected || graph.hover) && graphVisible())) kick();
   }
 
   function layoutStep() {
@@ -1096,11 +1791,12 @@
 
     for (const e of graph.edges) {
       const focus = hi && (e.a === hi || e.b === hi);
+      const pulse = graph.pulses.find((p) => p.edge === e);
       const conf = Math.max(0, Math.min(1, e.confidence || 0));
-      ctx.strokeStyle = focus ? 'rgba(236,238,241,.85)'
-        : 'rgba(154,163,178,' + (0.14 + 0.45 * conf).toFixed(2) + ')';
+      ctx.strokeStyle = focus ? withAlpha(e.color || '#eceef1', 0.9)
+        : withAlpha(e.color || '#9aa3b2', 0.14 + 0.45 * conf);
       ctx.lineWidth = focus ? 1.8 * inv : (0.6 + conf) * inv;
-      if (focus) {
+      if (focus || pulse) {
         ctx.setLineDash([7 * inv, 8 * inv]);
         ctx.lineDashOffset = -(now / 40) * inv;   // бегущий импульс по связи
       } else {
@@ -1112,6 +1808,23 @@
       ctx.stroke();
     }
     ctx.setLineDash([]);
+
+    // Волна активации: импульс бежит по синапсу от нейрона к нейрону.
+    graph.pulses = graph.pulses.filter((p) => p.until > now);
+    for (const p of graph.pulses) {
+      const t = Math.max(0, Math.min(1, (now - p.t0) / (p.until - p.t0)));
+      const x = p.edge.a.x + (p.edge.b.x - p.edge.a.x) * t;
+      const y = p.edge.a.y + (p.edge.b.y - p.edge.a.y) * t;
+      const color = p.edge.color || '#eceef1';
+      ctx.beginPath();
+      ctx.arc(x, y, 3.2 * inv, 0, Math.PI * 2);
+      ctx.fillStyle = withAlpha(color, 1 - t * 0.4);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(x, y, 8 * inv, 0, Math.PI * 2);
+      ctx.fillStyle = withAlpha(color, (1 - t) * 0.22);
+      ctx.fill();
+    }
 
     for (const n of graph.nodes) {
       const related = hi && (n === hi || isNeighbor(n, hi));
@@ -1225,7 +1938,9 @@
       card.appendChild(el('div', 'fact-text', e.a.label + ' — ' + e.label + ' → ' + e.b.label));
       const when = e.created ? ' · ' + new Date(e.created).toLocaleString('ru-RU') : '';
       card.appendChild(el('div', 'fact-meta', 'уверенность ' + e.confidence + when));
-      factActions(e.id || e.fact_id, card);
+      const factId = e.id || e.fact_id;
+      factActions(factId, card);
+      attachMenu(card, (x, y) => showFactMenu(x, y, factId, e.a.label + ' — ' + e.label + ' → ' + e.b.label));
       box.appendChild(card);
     }
   }
@@ -1318,6 +2033,7 @@
         const src = f.source && f.source.doc_id ? ' · ' + f.source.doc_id : '';
         card.appendChild(el('div', 'fact-meta', 'уверенность ' + f.confidence + ' · обращений ' + f.access_count + src));
         factActions(f.fact_id, card);
+        attachMenu(card, (x, y) => showFactMenu(x, y, f.fact_id, f.text));
         els.factsList.appendChild(card);
       }
     } catch (err) {
@@ -1451,10 +2167,10 @@
 
   // ---------- export / delete ----------
 
-  function exportCurrent() {
-    const s = currentSession();
-    const list = s ? (messages[s.id] || []) : [];
-    if (!list.length) return;
+  function chatDocument(id) {
+    const s = sessions.find((v) => v.id === id);
+    const list = id ? (messages[id] || []) : [];
+    if (!s || !list.length) return '';
     const lines = ['# ' + (s.title || 'Чат'), ''];
     for (const m of list) {
       lines.push(m.role === 'user' ? '## Вы' : '## Ассистент');
@@ -1468,46 +2184,84 @@
       }
       lines.push('');
     }
-    download(safeName(s.title) + '.md', lines.join('\n'), 'text/markdown;charset=utf-8');
+    return lines.join('\n');
   }
 
-  async function clearCurrent() {
+  function exportChat(id) {
+    const s = sessions.find((v) => v.id === id);
+    const doc = chatDocument(id);
+    if (!s || !doc) return;
+    download(safeName(s.title) + '.md', doc, 'text/markdown;charset=utf-8');
+  }
+  function exportCurrent() { if (currentId) exportChat(currentId); }
+
+  // Один чат = один документ в памяти. Повтор той же history не создаёт дубли:
+  // сервер выводит recorded_at из времени последнего сообщения, а doc_id хеширует текст.
+  async function saveChatMemory(id, opts) {
+    const s = sessions.find((v) => v.id === id);
+    if (!s) { toast('Чат не найден'); return; }
+    const list = messages[id] || [];
+    if (!list.length) { toast('В чате нет сообщений'); return; }
+    try {
+      const body = { chat_id: chatKey(s), messages: list };
+      if (settings.model) body.model = settings.model;
+      const out = await api('POST', '/api/chat/save-memory', body);
+      const facts = Array.isArray(out.facts) ? out.facts : [];
+      const ok = facts.filter((f) => f && f.status === 'ok').length;
+      const conflicts = facts.filter((f) => f && f.status === 'conflict').length;
+      toast('В память: ' + (out.messages || list.length) + ' сообщений · ' + ok + ' фактов' +
+            (conflicts ? ' · ' + conflicts + ' конфликт(ов)' : ''));
+      if (!factsBusy) loadFacts();
+      if (opts && opts.command && drawerTab === 'facts') loadFacts();
+    } catch (err) {
+      toast('Ошибка: ' + (err.message || err));
+    }
+  }
+
+  async function clearChat(id) {
     if (busy) { toast('Сначала остановите ответ'); return; }
-    const s = currentSession();
+    const s = sessions.find((v) => v.id === id);
     if (!s) return;
     if (!(await ask('Очистить историю?', 'Сообщения исчезнут из интерфейса, а контекст модели начнётся заново.', 'Очистить'))) return;
-    messages[s.id] = [];
+    const oldChatId = chatKey(s);
+    messages[id] = [];
     s.chatId = newId();
     s.updated = Date.now();
-    saveMessages(s.id);
+    try { await api('DELETE', '/api/chats?chat_id=' + encodeURIComponent(oldChatId)); } catch (_) { /* ignore */ }
+    saveMessages(id);
     saveSessions();
-    renderMessages({ force: true });
+    renderSessions();
     updateTitle();
+    if (id === currentId) renderMessages({ force: true });
     toast('История очищена');
   }
+  function clearCurrent() { if (currentId) return clearChat(currentId); }
 
-  async function deleteCurrent() {
+  async function deleteChat(id) {
     if (busy) { toast('Сначала остановите ответ'); return; }
-    const s = currentSession();
+    const s = sessions.find((v) => v.id === id);
     if (!s) return;
-    if (!(await ask('Удалить чат?', '«' + (s.title || 'Новый чат') + '» будет удалён вместе с сообщениями.', 'Удалить'))) return;
-    try { localStorage.removeItem(LS.msgs + s.id); } catch { /* ignore */ }
-    delete messages[s.id];
-    sessions = sessions.filter((x) => x.id !== s.id);
+    const wasCurrent = id === currentId;
+    if (!(await ask('Удалить чат?', '«' + (s.title || 'Новый чат') + '» будет удалён вместе с сообщениями на всех устройствах.', 'Удалить'))) return;
+    try { await api('DELETE', '/api/chats?chat_id=' + encodeURIComponent(chatKey(s))); } catch (_) { /* ignore */ }
+    try { localStorage.removeItem(LS.msgs + id); } catch { /* ignore */ }
+    delete messages[id];
+    sessions = sessions.filter((x) => x.id !== id);
     if (!sessions.length) {
       const fresh = newSession();
       sessions = [fresh];
       messages[fresh.id] = [];
       currentId = fresh.id;
-    } else {
+    } else if (wasCurrent) {
       currentId = sessions[0].id;
     }
     saveSessions();
     renderSessions();
     updateTitle();
-    renderMessages({ force: true });
+    if (wasCurrent || !messages[currentId]) renderMessages({ force: true });
     toast('Чат удалён');
   }
+  function deleteCurrent() { if (currentId) return deleteChat(currentId); }
 
   function exportAll() {
     const data = { exported: new Date().toISOString(), sessions, messages };
@@ -1516,7 +2270,8 @@
 
   async function wipeAll() {
     if (busy) { toast('Сначала остановите ответ'); return; }
-    if (!(await ask('Удалить все чаты?', 'Все чаты и сообщения в этом браузере будут удалены. Настройки останутся.', 'Удалить всё'))) return;
+    if (!(await ask('Удалить все чаты?', 'Все чаты и сообщения вашего аккаунта будут удалены на всех устройствах. Настройки останутся.', 'Удалить всё'))) return;
+    try { await api('DELETE', '/api/chats'); } catch (_) { /* ignore */ }
     for (const s of sessions) {
       try { localStorage.removeItem(LS.msgs + s.id); } catch { /* ignore */ }
     }
@@ -1535,6 +2290,10 @@
 
   // ---------- events ----------
 
+  // Контекстное меню на «пустой» области чата. Композер намеренно НЕ тронут:
+  // на iOS его поле должно получать системное меню выделения/вставки без помех.
+  attachMenu(els.messages, (x, y) => showBlankMenu(x, y), '.msg');
+
   els.newChatBtn.addEventListener('click', createChat);
   els.menuBtn.addEventListener('click', openNav);
   els.scrim.addEventListener('click', closeNav);
@@ -1545,6 +2304,7 @@
 
   els.renameBtn.addEventListener('click', startRename);
   els.chatTitle.addEventListener('click', () => { if (currentSession()) startRename(); });
+  attachMenu(els.chatTitle, (x, y) => { if (currentId) showChatMenu(x, y, currentId); });
   els.chatTitle.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); finishRename(true); els.chatTitle.blur(); }
     if (e.key === 'Escape') { e.preventDefault(); finishRename(false); els.chatTitle.blur(); }
@@ -1556,8 +2316,6 @@
   els.deleteBtn.addEventListener('click', deleteCurrent);
   els.modelChip.addEventListener('click', () => openDrawer('status'));
   els.drawerBtn.addEventListener('click', () => openDrawer('facts'));
-  els.memoryBtn.addEventListener('click', () => openDrawer('facts'));
-  els.memoryTool.addEventListener('click', () => openDrawer('facts'));
   els.drawerClose.addEventListener('click', closeDrawer);
   els.drawerScrim.addEventListener('click', closeDrawer);
 
@@ -1671,7 +2429,86 @@
     if (graphVisible() && els.graphLive.checked && !busy) loadGraph();
   }, 4000);
 
-  els.sendBtn.addEventListener('click', () => { if (busy) stopGeneration(); else send(); });
+  // ---------- голосовой ввод: долгое нажатие на кнопку отправки ----------
+  const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let voiceRec = null, voiceTimer = null, voiceStarted = false, suppressSend = false;
+
+  function voiceCleanup() {
+    clearTimeout(voiceTimer);
+    voiceTimer = null;
+    if (els.composer) els.composer.classList.remove('recording');
+    els.sendBtn.classList.remove('recording');
+    els.input.placeholder = 'Напишите сообщение…';
+    updateComposer();
+  }
+  function stopVoice() {
+    if (voiceRec) {
+      const r = voiceRec;
+      voiceRec = null;
+      r.onresult = null;
+      r.onerror = null;
+      try { r.stop(); } catch (_) { /* уже остановлено */ }
+    }
+    voiceCleanup();
+    els.input.focus();
+  }
+  function startVoice() {
+    if (!SpeechRec || busy || voiceRec) return;
+    const base = els.input.value ? els.input.value.replace(/\s*$/, ' ') : '';
+    let finalText = '';
+    voiceRec = new SpeechRec();
+    voiceRec.lang = 'ru-RU';
+    voiceRec.continuous = true;
+    voiceRec.interimResults = true;
+    voiceRec.onresult = (ev) => {
+      let interim = '';
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const r = ev.results[i];
+        if (r.isFinal) finalText += r[0].transcript;
+        else interim += r[0].transcript;
+      }
+      els.input.value = base + finalText + interim;
+      autoSize();
+      updateCounter();
+    };
+    voiceRec.onerror = (ev) => {
+      if (ev.error === 'aborted' || ev.error === 'no-speech') return;
+      const old = els.input.placeholder;
+      els.input.placeholder = 'Микрофон недоступен (' + ev.error + ')';
+      setTimeout(() => { if (!voiceRec) els.input.placeholder = old; }, 2500);
+    };
+    voiceRec.onend = () => { voiceRec = null; voiceCleanup(); };
+    els.sendBtn.classList.add('recording');
+    if (els.composer) els.composer.classList.add('recording');
+    els.input.placeholder = 'Говорите…';
+    els.sendBtn.innerHTML = ICON_MIC;
+    try { voiceRec.start(); } catch (_) { voiceRec = null; voiceCleanup(); }
+  }
+
+  els.sendBtn.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    if (!SpeechRec || busy || voiceRec) return;
+    voiceStarted = false;
+    clearTimeout(voiceTimer);
+    voiceTimer = setTimeout(() => {
+      voiceTimer = null;
+      voiceStarted = true;
+      suppressSend = true;
+      startVoice();
+      if (navigator.vibrate) navigator.vibrate(15);
+    }, 450);
+  });
+  for (const type of ['pointerup', 'pointercancel', 'pointerleave']) {
+    els.sendBtn.addEventListener(type, () => {
+      clearTimeout(voiceTimer);
+      voiceTimer = null;
+      if (voiceStarted) { voiceStarted = false; stopVoice(); }
+    });
+  }
+  els.sendBtn.addEventListener('click', (e) => {
+    if (suppressSend) { suppressSend = false; e.preventDefault(); e.stopPropagation(); return; }
+    if (busy) stopGeneration(); else send();
+  });
   els.input.addEventListener('input', () => {
     autoSize();
     updateCounter();
@@ -1715,10 +2552,9 @@
   els.settingsBtn.addEventListener('click', () => {
     applySettings();
     els.settingsDialog.showModal();
-    loadModels();
   });
-  els.setModel.addEventListener('change', () => {
-    settings.model = els.setModel.value;
+  els.modelSelect.addEventListener('change', () => {
+    settings.model = els.modelSelect.value;
     saveSettings();
     toast(settings.model ? 'Модель: ' + settings.model : 'Модель по умолчанию');
   });
@@ -1761,8 +2597,15 @@
     }
   });
 
+  // Кнопки синхронизации и MCP-токена в настройках.
+  if (els.syncNow) els.syncNow.addEventListener('click', () => { syncPull().then(requestWatch); });
+  if (els.mcpTokenRotate) els.mcpTokenRotate.addEventListener('click', rotateMcpToken);
+  if (els.mcpTokenRevoke) els.mcpTokenRevoke.addEventListener('click', revokeMcpToken);
+  if (els.settingsBtn) els.settingsBtn.addEventListener('click', loadMcpToken);
+
   // ---------- start ----------
 
+  (async function start() {
   // Старый интерфейс регистрировал /sw.js: снимаем регистрацию и чистим кэш.
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.getRegistrations()
@@ -1775,15 +2618,29 @@
       .catch(() => {});
   }
 
+  // PWA standalone: отделяем от обычной вкладки браузера (стиль и жесты).
+  if (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches || navigator.standalone) {
+    document.body.classList.add('standalone');
+  }
+  await checkAuth();   // дождёмся uid: от него зависят ключи localStorage и email в сайдбаре
   loadSettings();
   loadState();
+  SYNC.ready = true;   // только теперь локальные изменения уходят на сервер
   applySettings();
   updateComposer();
   updateCounter();
+  renderMetrics();
+  loadModels();
   renderSessions();
   updateTitle();
   renderMessages({ force: true });
   refreshStatus();
   setInterval(refreshStatus, 10000);
+  // Подтягиваем чаты с сервера и подписываемся на изменения других устройств.
+  await syncPull();
+  startStateEvents();
+  await watchRemote();
+  setInterval(() => { syncPull().then(requestWatch); }, 20000);
   els.input.focus();
+  })();
 })();

@@ -107,8 +107,13 @@ def train(dataset_path: str, base_dir: str, out_dir: str, steps: int = 200) -> s
     except ImportError as exc:
         raise SleepUnavailable(f"нет зависимостей для обучения: {exc}. Установите torch, transformers, peft") from exc
 
-    tok = AutoTokenizer.from_pretrained(base_dir)
-    model = AutoModelForCausalLM.from_pretrained(base_dir, torch_dtype=torch.bfloat16)
+    try:
+        tok = AutoTokenizer.from_pretrained(base_dir)
+        model = AutoModelForCausalLM.from_pretrained(base_dir, torch_dtype=torch.bfloat16)
+    except (OSError, ValueError, EnvironmentError) as exc:
+        # Новая версия transformers кидает ValueError «Unrecognized model» вместо OSError,
+        # если в base_dir нет валидной HF-модели. Для пользователя это тот же «нет стека».
+        raise SleepUnavailable(f"не удалось загрузить базовую модель из {base_dir}: {exc}") from exc
     cfg = LoraConfig(r=LORA["r"], lora_alpha=LORA["alpha"], lora_dropout=0.0, task_type="CAUSAL_LM")
     model = get_peft_model(model, cfg)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LORA["lr"])

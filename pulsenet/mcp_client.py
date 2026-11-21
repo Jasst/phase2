@@ -108,9 +108,12 @@ class RemoteMemory:
 
     def ingest(self, text: str, session_id: str = "", role: str = "user",
                recorded_at: Optional[str] = None, model: str = "") -> dict:
-        # recorded_at на сервере выставляет сам сервер: внешнее время для чата не нужно.
+        # Обычные сообщения сохраняются с серверным временем. А «чат → память»
+        # передаёт стабильное recorded_at: иначе каждый повтор создавал бы новый doc_id.
         # model — модель текущего ответа: факты извлекаются ею же, а не TRIPLEX_LLM_MODEL из .env.
         args = {"text": text, "session_id": session_id, "role": role}
+        if recorded_at:
+            args["recorded_at"] = recorded_at
         if model:
             args["model"] = model
         return self.client.call("triplex_ingest", args)

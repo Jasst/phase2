@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """CLI:
   python -m pulsenet.unified_mcp serve               запуск (PULSENET_UNIFIED_HOST/PORT, по умолчанию 127.0.0.1:8010)
-  python -m pulsenet.unified_mcp issue-token <user>  выпустить токен пользователю (показывается один раз)
-  python -m pulsenet.unified_mcp rotate <user>       отозвать старые токены и выпустить новый (показывается один раз)
+  python -m pulsenet.unified_mcp issue-token <user>  выпустить токен пользователю
+  python -m pulsenet.unified_mcp rotate <user>       отозвать старые токены и выпустить новый
   python -m pulsenet.unified_mcp revoke <user>       отозвать все токены пользователя
   python -m pulsenet.unified_mcp list-tokens         список токенов: кто, когда, активен ли (значения не показываются)
 """
@@ -31,7 +31,11 @@ def main(argv=None) -> int:
         uvicorn.run(app, host=host, port=port, log_level="info")
         return 0
     os.makedirs(cfg.data_dir, exist_ok=True)
-    store = TokenStore(os.path.join(cfg.data_dir, "tokens.sqlite"), cfg.owner_token, cfg.owner_id)
+    store = TokenStore(
+        os.path.join(cfg.data_dir, "tokens.sqlite"), cfg.owner_token, cfg.owner_id,
+        secret=cfg.env.get("MCP_TOKEN_SECRET", ""),
+        key_path=cfg.env.get("MCP_TOKEN_KEY_PATH")
+        or os.path.join(cfg.data_dir, "mcp_token.key"))
     if cmd == "list-tokens":
         for t in store.list_tokens():
             state = "активен" if t["active"] else "отозван"

@@ -151,6 +151,8 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
                        role: str = Field("user", description="user | assistant | system"),
                        model: str = Field("", description="Модель экстракции; пусто — TRIPLEX_LLM_MODEL. "
                                                           "Веб-чат передаёт модель текущего ответа"),
+                       recorded_at: str = Field("", description="Стабильная ISO-метка для идемпотентной "
+                                                                "загрузки чата; пусто — время сервера"),
                        ctx: Context = None) -> Dict[str, Any]:
         """Сохранить документ в память и извлечь из него факты. Документ сохраняется даже при сбое
         извлечения. Возвращает doc_id: его нужно указать как source при triplex_assert.
@@ -168,7 +170,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
                 if extractor is None:              # TRIPLEX_EXTRACT=0 — экстракция отключена
                     extractor = _NO_EXTRACT
             return mem.ingest(text, session_id=session_id, role=role, agent=uid,
-                              extractor=extractor)
+                              recorded_at=(recorded_at or None), extractor=extractor)
         except ValueError as exc:
             return _err(str(exc))
 
@@ -510,7 +512,11 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
 
 def create_app(cfg: Settings) -> Starlette:
     os.makedirs(cfg.data_dir, exist_ok=True)
-    tokens = TokenStore(os.path.join(cfg.data_dir, "tokens.sqlite"), cfg.owner_token, cfg.owner_id)
+    tokens = TokenStore(
+        os.path.join(cfg.data_dir, "tokens.sqlite"), cfg.owner_token, cfg.owner_id,
+        secret=cfg.env.get("MCP_TOKEN_SECRET", ""),
+        key_path=cfg.env.get("MCP_TOKEN_KEY_PATH")
+        or os.path.join(cfg.data_dir, "mcp_token.key"))
     from ..memory_service import build_encoder, build_extractor
 
     def _log(where, exc):

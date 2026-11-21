@@ -94,7 +94,7 @@ def stack(tmp_path, monkeypatch):
     env = {"LLM_BACKEND": "lmstudio",
            "LMSTUDIO_URL": f"http://127.0.0.1:{llm.server_address[1]}/v1",
            "LMSTUDIO_MODEL": "fake-model",
-           "TRIPLEX_EXTRACT": "0", "TRIPLEX_MEMORY": "1"}
+           "TRIPLEX_EXTRACT": "0", "TRIPLEX_MEMORY": "1", "AUTH_DISABLED": "1"}
     app = App(env, data_dir=str(tmp_path))
     from pulsenet.unified_mcp import web
     web.clear_cache()

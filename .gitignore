@@ -6,3 +6,6 @@ data/
 *.pyc
 *.xml
 /data_unified
+*.key
+chats.sqlite*
+tokens.sqlite*

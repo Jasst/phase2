@@ -66,7 +66,7 @@ def running(tmp_path, monkeypatch):
     threading.Thread(target=llm.serve_forever, daemon=True).start()
     env = {"LLM_BACKEND": "lmstudio", "LMSTUDIO_URL": f"http://127.0.0.1:{llm.server_address[1]}/v1",
            "LMSTUDIO_MODEL": "fake-model", "PULSENET_MCP_TOKEN": TOKEN, "PULSENET_MCP_HOSTS": "localhost",
-           "TRIPLEX_EMBED_URL": ""}
+           "TRIPLEX_EMBED_URL": "", "AUTH_DISABLED": "1"}
     app = App(env, data_dir=str(tmp_path / "data"))
     srv = make_server(app, "127.0.0.1", 0, web_dir=WEB_DIR)
     threading.Thread(target=srv.serve_forever, daemon=True).start()

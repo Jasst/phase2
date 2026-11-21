@@ -31,6 +31,8 @@ COMMANDS: Dict[str, dict] = {
                "hint": "поиск по памяти", "local": False},
     "remember": {"usage": "/remember текст — сохранить в память",
                  "hint": "сохранить в память", "local": False},
+    "chatmem": {"usage": "/chatmem — загрузить текущий чат в память как документ и извлечь факты",
+                "hint": "чат → память (с дедупликацией)", "local": True},
     "graph": {"usage": "/graph — открыть карту нейронов памяти",
               "hint": "карта нейронов", "local": True},
     "new": {"usage": "/new — новый чат", "hint": "новый чат", "local": True},
