@@ -441,4 +441,18 @@ def serve_forever(app, host, port, web_dir=WEB_DIR_DEFAULT):
     except KeyboardInterrupt:
         pass
     finally:
+        # Ctrl+C должен гасить не только HTTP-сокет: генерация, локальный llama-server
+        # и отдельный процесс эмбеддингов иначе остаются живыми после выхода.
+        app.stop()
+        stop_backend = getattr(app.backend, "stop", None)
+        if callable(stop_backend):
+            try:
+                stop_backend()
+            except Exception:                      # noqa: BLE001 — уборка не должна ломать выход
+                pass
+        if getattr(app, "embed_server", None):
+            try:
+                app.embed_server.stop()
+            except Exception:                      # noqa: BLE001
+                pass
         srv.server_close()

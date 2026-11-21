@@ -165,6 +165,14 @@ def _app(tmp_path, monkeypatch, scripts):
     return app
 
 
+def test_model_choice_follows_loaded_and_active_model(tmp_path, monkeypatch):
+    app = _app(tmp_path, monkeypatch, [["ok"]])
+    app.backend.refresh_loaded = lambda: "loaded-in-lmstudio"
+    assert app.default_rel() == "loaded-in-lmstudio"   # не дёргаем модель из .env
+    app.active_model = "explicit/model"
+    assert app.model_id() == "explicit/model"          # экстракция идёт моделью чата
+
+
 def _run(app, message, web=False, chat_id="c1"):
     events, tokens = [], []
 

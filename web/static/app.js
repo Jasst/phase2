@@ -802,7 +802,7 @@
       }
       select.value = settings.model || '';
       els.modelHint.textContent = models.length
-        ? 'Модель применяется к следующему ответу. Эмбеддинги в список не входят.'
+        ? 'Модель сохраняется и применяется к следующему ответу. Эмбеддинги в список не входят и не перезагружаются.'
         : 'Моделей нет: загрузите модель в LM Studio или проверьте LLM_BACKEND.';
     } catch (err) {
       els.modelHint.textContent = 'Список недоступен: ' + (err.message || err);
@@ -842,7 +842,8 @@
     if (s.embedder) {
       const e = el('div', 'stat wide');
       e.appendChild(el('b', '', s.embedder.name || m.encoder || '—'));
-      e.appendChild(el('span', '', 'эмбеддер' + (s.embedder.model ? ' · ' + s.embedder.model : '')));
+      const where = s.embedder.location === 'mcp' ? ' · в MCP' : '';
+      e.appendChild(el('span', '', 'эмбеддер' + where + (s.embedder.model ? ' · ' + s.embedder.model : '')));
       els.statusGrid.appendChild(e);
     }
     els.errorsBox.innerHTML = '';

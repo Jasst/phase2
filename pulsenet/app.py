@@ -44,6 +44,7 @@ class App:
         self.memory_enabled = self.env.get("TRIPLEX_MEMORY", "1") != "0"
         self.embed_server = None
         self.embed_model = ""
+        self.active_model = ""       # модель последнего ответа: экстракция идёт ею же, без второй загрузки
         # local — свой журнал в data_dir (как раньше); mcp — память у MCP-сервера pulsenet-unified,
         # общая для всех ваших агентов. Значение по умолчанию local: без .env поведение прежнее.
         self.memory_backend = (self.env.get("PULSENET_MEMORY") or "local").strip().lower()
@@ -66,12 +67,23 @@ class App:
     def default_rel(self) -> str:
         if self.backend.name == "llamacpp":
             return self.env.get("LLAMACPP_DEFAULT_MODEL", "").strip()
+        # LM Studio: если пользователь выбрал модель в интерфейсе LM Studio, не дёргаем
+        # модель из .env — лишняя загрузка вытесняет из памяти эмбеддинги.
+        refresh = getattr(self.backend, "refresh_loaded", None)
+        if callable(refresh):
+            try:
+                loaded = refresh()
+                if loaded:
+                    return loaded
+            except Exception:                # noqa: BLE001 — LM Studio может быть недоступен
+                pass
         return self.env.get("LMSTUDIO_MODEL", "").strip()
 
     def model_id(self) -> str:
         """Идентификатор модели для запроса. Запускает бэкенд при необходимости."""
         with self.backend_lock:
-            return self.backend.ensure(self.default_rel()) or self.default_rel() or "local"
+            target = (self.active_model or "").strip() or self.default_rel()
+            return self.backend.ensure(target) or target or "local"
 
     def _make_encoder(self, data_dir: str):
         """Эмбеддер — см. memory_service.build_encoder (общий с MCP-сервером)."""
@@ -253,6 +265,7 @@ class App:
         target = (model or "").strip() or self.default_rel()
         with self.backend_lock:
             rel = self.backend.ensure(target) or target or "local"
+            self.active_model = rel      # экстрактор/индексация используют ту же модель, не грузят вторую
 
         # 3) агентный цикл: модель → (вызовы инструментов → результаты) → модель ...
         steps = 0
@@ -309,6 +322,22 @@ class App:
     def stop(self) -> None:
         self.stop_flag = True
 
+    def _embedder_status(self, mstats: dict) -> dict:
+        """В MCP-режиме эмбеддер живёт в сервере памяти — врать про «не загружен» не нужно."""
+        if self.memory_backend == "mcp":
+            return {"name": mstats.get("encoder"),
+                    "server_running": None,          # отдельный процесс не ours, управляется MCP
+                    "server_starts": 0,
+                    "model": mstats.get("embed_model"),
+                    "dim": mstats.get("embed_dim"),
+                    "location": "mcp"}
+        return {"name": mstats.get("encoder"),
+                "server_running": bool(self.embed_server and self.embed_server.is_running()),
+                "server_starts": self.embed_server.starts if self.embed_server else 0,
+                "model": self.embed_model or None,
+                "dim": getattr(self.memory, "dim", None),
+                "location": "local"}
+
     def status(self) -> dict:
         mstats, online = {}, True
         if self.memory_enabled:
@@ -324,10 +353,7 @@ class App:
             "memory_online": online,
             "index_pending": self.index_pending(),
             "memory": mstats,
-            "embedder": {"name": mstats.get("encoder"),
-                         "server_running": bool(self.embed_server and self.embed_server.is_running()),
-                         "server_starts": self.embed_server.starts if self.embed_server else 0,
-                         "model": self.embed_model or None},
+            "embedder": self._embedder_status(mstats),
             "errors": self.recent_errors(),
         }
 

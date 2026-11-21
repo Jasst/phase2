@@ -85,5 +85,14 @@ start /b "" python -m pulsenet.unified_mcp serve
 
 rem ---- чат / веб-API на переднем плане ----
 echo [app] Starting web/API server (http://127.0.0.1:8000/)...
+echo [app] Ctrl+C: если cmd спросит "Terminate batch job (Y/N)?" - ответьте N,
+echo [app] иначе уборка не выполнится; для полной остановки: run_server.bat stop
 python -m pulsenet serve
+
+rem ---- веб вышел (в т.ч. по Ctrl+C): гасим MCP и docker ----
+echo [app] Web/API stopped, cleaning up MCP, ports and docker...
+call :stop_python
+call :stop_docker
+echo [ok] Services stopped.
 pause
+exit /b 0

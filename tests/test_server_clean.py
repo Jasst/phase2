@@ -94,6 +94,36 @@ def _json(port, method, path, body=None):
     return status, json.loads(raw or b"{}")
 
 
+def test_serve_forever_cleans_up_on_ctrl_c(monkeypatch, tmp_path):
+    from pulsenet import server as srvmod
+
+    class FakeServer:
+        closed = False
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            self.closed = True
+
+    fake = FakeServer()
+    monkeypatch.setattr(srvmod, "make_server", lambda *a, **kw: fake)
+    app = App({"LLM_BACKEND": "lmstudio", "TRIPLEX_EXTRACT": "0", "TRIPLEX_EMBED_URL": ""},
+              data_dir=str(tmp_path / "data"))
+    stopped = []
+    app.backend.stop = lambda: stopped.append("backend")
+
+    class FakeEmbed:
+        def stop(self):
+            stopped.append("embed")
+
+    app.embed_server = FakeEmbed()
+    srvmod.serve_forever(app, "127.0.0.1", 0, web_dir=WEB_DIR)
+    assert app.stop_flag is True
+    assert stopped == ["backend", "embed"]
+    assert fake.closed is True
+
+
 def test_health_and_index_page(running):
     app, port = running
     assert _json(port, "GET", "/health")[1]["ok"] is True

@@ -539,6 +539,8 @@ class TriplexMemory:
                 "facts_records": len(self.journal.facts),
                 "facts_active": len(self.journal.query()),
                 "encoder": self.encoder.name,
+                "embed_model": getattr(self.encoder, "model", None),
+                "embed_dim": getattr(self.encoder, "dim", None),
                 "extractor": self.extractor is not None,
             }
 
