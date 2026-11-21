@@ -140,8 +140,11 @@ def test_health_and_index_page(running):
     for path in ("/", "/ai", "/ai.html"):
         status, raw = _req(port, "GET", path)
         assert status == 200 and "ТРИПЛЕКСИЯ".encode("utf-8") in raw
+        assert b"apple-mobile-web-app-capable" in raw       # PWA открывается standalone, а не закладкой
+        assert b'setUIScale' in raw                          # масштаб интерфейса доступен в настройках
     status, raw = _req(port, "GET", "/static/app.css")
     assert status == 200 and b"--bg-primary" in raw
+    assert b"body.standalone" in raw
     status, raw = _req(port, "GET", "/sw.js")
     assert status == 200 and b"unregister" in raw
     status, _ = _req(port, "GET", "/static/../../pulsenet/server.py")
