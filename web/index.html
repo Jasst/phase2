@@ -170,6 +170,13 @@
       <div class="graph-stats" id="graphStats"></div>
       <div class="graph-stage" id="graphStage">
         <canvas id="graphCanvas" aria-label="Карта нейронов памяти" role="img"></canvas>
+        <div class="graph-controls" aria-label="Управление картой">
+          <button class="icon-btn" id="graphZoomIn" type="button" title="Приблизить">+</button>
+          <button class="icon-btn" id="graphZoomOut" type="button" title="Отдалить">−</button>
+          <button class="icon-btn" id="graphZoomReset" type="button" title="Сбросить масштаб">⌖</button>
+          <button class="icon-btn" id="graphFullscreen" type="button" title="На весь экран">⛶</button>
+        </div>
+        <div class="graph-hint">клик — выбрать · долгое нажатие / правый клик — выбор · колесо — масштаб · тянуть — движение</div>
         <div class="graph-empty" id="graphEmpty" hidden>Нейронов пока нет. Они появятся, когда в памяти появятся факты.</div>
       </div>
       <div class="graph-legend" id="graphLegend"></div>

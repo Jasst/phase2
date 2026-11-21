@@ -7,12 +7,14 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
 import time
 import uuid
 from collections import deque
+from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
 from . import llm
@@ -28,6 +30,22 @@ CONTEXT_TURNS = 8
 ERROR_LOG_SIZE = 50
 MEMORY_RETRIES = 12          # индексация ждёт недоступный MCP: 12 попыток
 MEMORY_RETRY_SECONDS = 5.0
+
+
+def _parse_json_loose(raw: str) -> dict:
+    """Достать JSON-объект из ответа модели: модели любят оборачивать его в ```json."""
+    text = str(raw or "").strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            data = json.loads(text[start:end + 1])
+            if isinstance(data, dict):
+                return data
+        except ValueError:
+            pass
+    return {}
 
 
 class App:
@@ -356,6 +374,74 @@ class App:
             "embedder": self._embedder_status(mstats),
             "errors": self.recent_errors(),
         }
+
+    def distill_fact(self, fact_id: str) -> dict:
+        """Темпоральная дистилляция: LLM пересобирает факт по актуальным данным журнала.
+
+        verdict=update создаёт новый факт через supersede: старый остаётся в аудите,
+        а обоснование модели становится документом-источником (I1).
+        """
+        fid = str(fact_id or "").strip()
+        if not fid:
+            raise ValueError("не указан fact_id")
+        facts = self.memory.list_facts(500)
+        target = next((f for f in facts if f.get("fact_id") == fid), None)
+        if target is None:
+            raise ValueError("факт не найден или уже не действует")
+        query = " ".join(str(target.get(k, "")) for k in ("s", "r", "o", "text"))
+        try:
+            recall = self.memory.recall(query, k_facts=6)
+        except Exception:                          # noqa: BLE001 — память может быть недоступна
+            recall = {}
+        nearby = [f for f in facts if f.get("fact_id") != fid and
+                  (f.get("s") == target.get("s") or f.get("o") == target.get("o"))][:8]
+        evidence = {
+            "fact": target,
+            "related_facts": [{"text": f.get("text"), "valid_from": f.get("valid_from"),
+                               "confidence": f.get("confidence")} for f in nearby],
+            "chunks": [{"text": c.get("text")} for c in (recall.get("chunks") or [])[:6]],
+        }
+        prompt = (
+            "Ты — редактор базы знаний. Пересобери один факт по актуальным данным.\n"
+            "Верни ТОЛЬКО JSON: {\"verdict\":\"keep|update|retract\",\"s\":\"...\",\"r\":\"...\","
+            "\"o\":\"...\",\"confidence\":0.0,\"reason\":\"кратко почему\"}.\n"
+            "update — если формулировка или объект устарели; s/r/o — новая триада.\n"
+            "retract — если данные опровергают факт; keep — если всё верно.\n"
+            "Не выдумывай данные: опирайся только на факты и фрагменты ниже.\n\n"
+            + json.dumps(evidence, ensure_ascii=False)[:6000]
+        )
+        llm_call = openai_chat_caller(self.backend.base_url, self.model_id(), max_tokens=512)
+        payload = _parse_json_loose(llm_call(prompt))
+        verdict = str(payload.get("verdict") or "keep").strip().lower()
+        if verdict not in ("keep", "update", "retract"):
+            verdict = "keep"
+        reason = str(payload.get("reason") or "").strip()[:1000]
+        try:
+            conf = float(payload.get("confidence", target.get("confidence", 0.8)))
+        except (TypeError, ValueError):
+            conf = float(target.get("confidence") or 0.8)
+        conf = max(0.0, min(1.0, conf))
+
+        if verdict == "retract":
+            self.memory.retract(fid)
+            return {"status": "ok", "verdict": "retract", "fact_id": fid, "reason": reason}
+        if verdict == "update":
+            s = str(payload.get("s") or "").strip()
+            r = str(payload.get("r") or "").strip()
+            o = str(payload.get("o") or "").strip()
+            if s and r and o:
+                doc = self.memory.ingest(reason or f"Пересборка факта {fid}",
+                                         session_id="temporal-distill", role="assistant")
+                doc_id = doc.get("doc_id") or (doc.get("result") or {}).get("doc_id") or "manual-distill"
+                source = {"doc_id": doc_id, "span": [0, max(1, len(reason))]}
+                out = self.memory.supersede(
+                    fid, s, r, o,
+                    valid_from=datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                    source=source, confidence=conf)
+                return {"status": "ok", "verdict": "update", "fact_id": fid,
+                        "old_fact_id": fid, "reason": reason, "result": out}
+        self.memory.confirm(fid, True)
+        return {"status": "ok", "verdict": "keep", "fact_id": fid, "reason": reason}
 
     # ---------- обслуживание ----------
 

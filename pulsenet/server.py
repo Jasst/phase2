@@ -23,6 +23,7 @@
   POST /api/memory/link        привязать написание к сущности
   POST /api/memory/supersede   явно вытеснить факт
   POST /api/memory/consolidate «Сон», сухой прогон: датасет без обучения
+  POST /api/memory/distill     темпоральная дистилляция факта через LLM (пересборка по свежим данным)
 """
 from __future__ import annotations
 
@@ -402,6 +403,10 @@ def _consolidate(h, _b, _q):
     h.send_json(h.app.consolidate_dry_run())
 
 
+def _distill(h, b, _q):
+    h.send_json(h.app.distill_fact(str(b.get("fact_id", ""))))
+
+
 ROUTES = {
     ("GET", "/api/status"): _status,
     ("GET", "/api/models"): _models,
@@ -418,6 +423,7 @@ ROUTES = {
     ("POST", "/api/memory/link"): _link,
     ("POST", "/api/memory/supersede"): _supersede,
     ("POST", "/api/memory/consolidate"): _consolidate,
+    ("POST", "/api/memory/distill"): _distill,
 }
 
 

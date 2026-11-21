@@ -133,6 +133,7 @@ class CachedEncoder:
         self.tag = tag
         self.dim = inner.dim
         self.name = inner.name + "+cache"
+        self.model = getattr(inner, "model", None)   # имя модели видно в /api/status даже через кэш
         self._mem: Dict[str, np.ndarray] = {}
         self._lock = threading.Lock()
         self.hits = 0

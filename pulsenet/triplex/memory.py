@@ -524,7 +524,9 @@ class TriplexMemory:
             out = []
             for f in self.journal.query()[:max(1, min(int(limit), 500))]:
                 out.append({"fact_id": f.fact_id, "text": self._fact_text(f),
-                            "confidence": round(f.confidence, 3), "valid_from": f.valid_from,
+                            "s": self._ename(f.s), "r": f.r, "o": self._ename(f.o),
+                            "valid_from": f.valid_from,
+                            "confidence": round(f.confidence, 3), "valid_to": f.valid_to,
                             "source": f.source, "access_count": f.access_count, "agent": self.agent_of(f)})
             return out
 

@@ -53,6 +53,8 @@
     ingestText: $('ingestText'), ingestBtn: $('ingestBtn'), ingestOut: $('ingestOut'),
     graphReload: $('graphReload'), graphLive: $('graphLive'), graphStats: $('graphStats'),
     graphStage: $('graphStage'), graphCanvas: $('graphCanvas'), graphEmpty: $('graphEmpty'),
+    graphZoomIn: $('graphZoomIn'), graphZoomOut: $('graphZoomOut'), graphZoomReset: $('graphZoomReset'),
+    graphFullscreen: $('graphFullscreen'),
     graphLegend: $('graphLegend'), graphGrowth: $('graphGrowth'), graphDetail: $('graphDetail'),
     statusReload: $('statusReload'), consolidateBtn: $('consolidateBtn'), statusGrid: $('statusGrid'),
     errorsBox: $('errorsBox'), sleepOut: $('sleepOut'),
@@ -894,9 +896,11 @@
   const graph = {
     nodes: [], edges: [], byId: {}, W: 0, H: 0, dpr: 1, temp: 0, frames: 0, raf: 0,
     hover: null, selected: null, busy: false, typeColors: {},
+    view: { scale: 1, ox: 0, oy: 0 }, drag: null, press: null, fullscreen: false,
     sessionStart: Date.now(),
   };
   const LAYOUT_FRAMES = 300;
+  const LONG_PRESS_MS = 450;
 
   function typeColor(type) {
     const key = type || 'без типа';
@@ -1012,7 +1016,7 @@
       graph.frames++;
     }
     draw();
-    if (laying) kick();
+    if (laying || ((graph.selected || graph.hover) && graphVisible())) kick();
   }
 
   function layoutStep() {
@@ -1064,29 +1068,59 @@
     return graph.edges.some((e) => (e.a === hi && e.b === n) || (e.b === hi && e.a === n));
   }
 
+  function withAlpha(hex, alpha) {
+    let h = String(hex || '#8ea2ff').replace('#', '');
+    if (h.length === 3) h = h.split('').map((x) => x + x).join('');
+    const v = parseInt(h, 16) || 0x8ea2ff;
+    return 'rgba(' + ((v >> 16) & 255) + ',' + ((v >> 8) & 255) + ',' + (v & 255) + ',' + alpha + ')';
+  }
+
   function draw() {
     const c = els.graphCanvas;
     const ctx = c.getContext ? c.getContext('2d') : null;
     if (!ctx) return;
-    const { W, H, dpr } = graph;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, W, H);
+    const { dpr, view } = graph;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, c.width, c.height);
+    ctx.setTransform(dpr * view.scale, 0, 0, dpr * view.scale, dpr * view.ox, dpr * view.oy);
     const hi = graph.selected || graph.hover;
+    const now = performance.now();
+    const phase = (now % 1600) / 1600;
+    const inv = 1 / view.scale;
 
     for (const e of graph.edges) {
       const focus = hi && (e.a === hi || e.b === hi);
       const conf = Math.max(0, Math.min(1, e.confidence || 0));
-      ctx.strokeStyle = focus ? 'rgba(236,238,241,.8)' : 'rgba(154,163,178,' + (0.14 + 0.45 * conf).toFixed(2) + ')';
-      ctx.lineWidth = focus ? 1.6 : 0.6 + conf;
+      ctx.strokeStyle = focus ? 'rgba(236,238,241,.85)'
+        : 'rgba(154,163,178,' + (0.14 + 0.45 * conf).toFixed(2) + ')';
+      ctx.lineWidth = focus ? 1.8 * inv : (0.6 + conf) * inv;
+      if (focus) {
+        ctx.setLineDash([7 * inv, 8 * inv]);
+        ctx.lineDashOffset = -(now / 40) * inv;   // бегущий импульс по связи
+      } else {
+        ctx.setLineDash([]);
+      }
       ctx.beginPath();
       ctx.moveTo(e.a.x, e.a.y);
       ctx.lineTo(e.b.x, e.b.y);
       ctx.stroke();
     }
+    ctx.setLineDash([]);
 
     for (const n of graph.nodes) {
-      const dim = hi && n !== hi && !isNeighbor(n, hi);
-      ctx.globalAlpha = dim ? 0.3 : 0.95;
+      const related = hi && (n === hi || isNeighbor(n, hi));
+      const dim = hi && !related;
+      ctx.globalAlpha = dim ? 0.25 : 0.95;
+      if (related) {
+        for (let ring = 0; ring < 2; ring++) {
+          const p = (phase + ring * 0.5) % 1;
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, n.r + 4 + p * 22, 0, Math.PI * 2);
+          ctx.strokeStyle = withAlpha(n.color, (1 - p) * 0.55);
+          ctx.lineWidth = 1.4 * inv;
+          ctx.stroke();
+        }
+      }
       ctx.beginPath();
       ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
       ctx.fillStyle = n.color;
@@ -1096,21 +1130,29 @@
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r + 3.5, 0, Math.PI * 2);
         ctx.strokeStyle = '#4cc38a';
-        ctx.lineWidth = 1.5;
+        ctx.lineWidth = 1.5 * inv;
         ctx.stroke();
       }
       if (n === graph.selected) {
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r + 6, 0, Math.PI * 2);
         ctx.strokeStyle = '#eceef1';
-        ctx.lineWidth = 1.5;
+        ctx.lineWidth = 1.5 * inv;
+        ctx.stroke();
+      }
+      if (graph.press && graph.press.node === n && !graph.press.longFired) {
+        const p = Math.min(1, (now - graph.press.t0) / LONG_PRESS_MS);
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.r + 9, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2);
+        ctx.strokeStyle = '#eceef1';
+        ctx.lineWidth = 2 * inv;
         ctx.stroke();
       }
     }
 
     const labelled = new Set([...graph.nodes].sort((a, b) => b.degree - a.degree).slice(0, 14));
     if (hi) labelled.add(hi);
-    ctx.font = '12px system-ui, -apple-system, Segoe UI, sans-serif';
+    ctx.font = Math.round(12 * inv) + 'px system-ui, -apple-system, Segoe UI, sans-serif';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = '#eceef1';
     for (const n of labelled) {
@@ -1121,15 +1163,37 @@
   function nodeAt(x, y) {
     let best = null;
     let bestD = Infinity;
+    const slack = 6 / graph.view.scale;
     for (const n of graph.nodes) {
       const d = Math.hypot(n.x - x, n.y - y);
-      if (d <= n.r + 6 && d < bestD) { best = n; bestD = d; }
+      if (d <= n.r + slack && d < bestD) { best = n; bestD = d; }
     }
     return best;
   }
   function canvasPoint(ev) {
     const r = els.graphCanvas.getBoundingClientRect();
+    const v = graph.view;
+    return { x: (ev.clientX - r.left - v.ox) / v.scale,
+             y: (ev.clientY - r.top - v.oy) / v.scale };
+  }
+  function screenPoint(ev) {
+    const r = els.graphCanvas.getBoundingClientRect();
     return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  }
+  function zoomAt(sx, sy, factor) {
+    const v = graph.view;
+    const scale = Math.max(0.35, Math.min(4, v.scale * factor));
+    if (scale === v.scale) return;
+    const wx = (sx - v.ox) / v.scale;
+    const wy = (sy - v.oy) / v.scale;
+    v.scale = scale;
+    v.ox = sx - wx * scale;
+    v.oy = sy - wy * scale;
+    kick();
+  }
+  function resetView() {
+    graph.view = { scale: 1, ox: 0, oy: 0 };
+    kick();
   }
 
   function selectNode(n) {
@@ -1155,8 +1219,32 @@
       card.appendChild(el('div', 'fact-text', e.a.label + ' — ' + e.label + ' → ' + e.b.label));
       const when = e.created ? ' · ' + new Date(e.created).toLocaleString('ru-RU') : '';
       card.appendChild(el('div', 'fact-meta', 'уверенность ' + e.confidence + when));
+      factActions(e.id || e.fact_id, card);
       box.appendChild(card);
     }
+  }
+
+  function factActions(fid, card) {
+    if (!fid) return;
+    const row = el('div', 'card-row');
+    const yes = el('button', 'btn-ghost', 'Верно');
+    yes.type = 'button';
+    yes.addEventListener('click', () => memoryAction('/api/memory/confirm', { fact_id: fid, yes: true }, 'Факт подтверждён'));
+    const no = el('button', 'btn-ghost', 'Неверно');
+    no.type = 'button';
+    no.addEventListener('click', () => memoryAction('/api/memory/confirm', { fact_id: fid, yes: false }, 'Уверенность снижена'));
+    const distill = el('button', 'btn-ghost', 'Пересобрать');
+    distill.type = 'button';
+    distill.title = 'Темпоральная дистилляция: LLM обновит факт по свежим данным';
+    distill.addEventListener('click', () => distillFact(fid));
+    const rm = el('button', 'btn-danger', 'Отозвать');
+    rm.type = 'button';
+    rm.addEventListener('click', async () => {
+      if (!(await ask('Отозвать факт?', 'Факт перестанет участвовать в ответах.', 'Отозвать'))) return;
+      memoryAction('/api/memory/retract', { fact_id: fid }, 'Факт отозван');
+    });
+    row.append(yes, no, distill, rm);
+    card.appendChild(row);
   }
 
   async function loadGraph() {
@@ -1197,6 +1285,7 @@
     selectTab(tab || 'facts');
   }
   function closeDrawer() {
+    setFullscreen(false);
     els.drawer.classList.remove('open');
     els.drawerScrim.classList.remove('open');
     els.drawer.setAttribute('aria-hidden', 'true');
@@ -1222,21 +1311,7 @@
         card.appendChild(el('div', 'fact-text', f.text || ''));
         const src = f.source && f.source.doc_id ? ' · ' + f.source.doc_id : '';
         card.appendChild(el('div', 'fact-meta', 'уверенность ' + f.confidence + ' · обращений ' + f.access_count + src));
-        const row = el('div', 'card-row');
-        const yes = el('button', 'btn-ghost', 'Верно');
-        yes.type = 'button';
-        yes.addEventListener('click', () => memoryAction('/api/memory/confirm', { fact_id: f.fact_id, yes: true }, 'Факт подтверждён'));
-        const no = el('button', 'btn-ghost', 'Неверно');
-        no.type = 'button';
-        no.addEventListener('click', () => memoryAction('/api/memory/confirm', { fact_id: f.fact_id, yes: false }, 'Уверенность снижена'));
-        const rm = el('button', 'btn-danger', 'Отозвать');
-        rm.type = 'button';
-        rm.addEventListener('click', async () => {
-          if (!(await ask('Отозвать факт?', 'Факт перестанет участвовать в ответах.', 'Отозвать'))) return;
-          memoryAction('/api/memory/retract', { fact_id: f.fact_id }, 'Факт отозван');
-        });
-        row.append(yes, no, rm);
-        card.appendChild(row);
+        factActions(f.fact_id, card);
         els.factsList.appendChild(card);
       }
     } catch (err) {
@@ -1252,9 +1327,25 @@
       await api('POST', path, body);
       toast(okText);
       await loadFacts();
+      if (graphVisible()) await loadGraph();
       refreshStatus();
     } catch (err) {
       toast('Ошибка: ' + (err.message || err));
+    }
+  }
+
+  async function distillFact(fid) {
+    try {
+      toast('Пересобираем факт по актуальным данным…');
+      const out = await api('POST', '/api/memory/distill', { fact_id: fid });
+      const label = out.verdict === 'update' ? 'Факт пересобран'
+        : out.verdict === 'retract' ? 'Факт отозван моделью' : 'Факт подтверждён моделью';
+      toast(label + (out.reason ? ': ' + shorten(out.reason, 80) : ''));
+      await loadFacts();
+      if (graphVisible()) await loadGraph();
+      refreshStatus();
+    } catch (err) {
+      toast('Ошибка дистилляции: ' + (err.message || err));
     }
   }
 
@@ -1473,21 +1564,99 @@
   els.consolidateBtn.addEventListener('click', consolidate);
 
   els.graphReload.addEventListener('click', loadGraph);
+  els.graphZoomIn.addEventListener('click', () => zoomAt(graph.W / 2, graph.H / 2, 1.2));
+  els.graphZoomOut.addEventListener('click', () => zoomAt(graph.W / 2, graph.H / 2, 1 / 1.2));
+  els.graphZoomReset.addEventListener('click', resetView);
+  function setFullscreen(on) {
+    if (on === graph.fullscreen) return;
+    graph.fullscreen = on;
+    if (on) {
+      graph.stageHome = { parent: els.graphStage.parentNode, next: els.graphStage.nextSibling };
+      document.body.appendChild(els.graphStage);   // вне drawer: backdrop-filter ломает position:fixed
+    } else if (graph.stageHome) {
+      const { parent, next } = graph.stageHome;
+      if (next && next.parentNode === parent) parent.insertBefore(els.graphStage, next);
+      else parent.appendChild(els.graphStage);
+      graph.stageHome = null;
+    }
+    els.graphStage.classList.toggle('fullscreen', on);
+    els.graphFullscreen.textContent = on ? '↙' : '⛶';
+    els.graphFullscreen.title = on ? 'Выйти из полноэкранного режима' : 'На весь экран';
+    resizeGraph();
+  }
+  els.graphFullscreen.addEventListener('click', () => setFullscreen(!graph.fullscreen));
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && graph.fullscreen) {
+      ev.preventDefault();
+      ev.stopImmediatePropagation();   // не закрываем панель вместе с полноэкранным режимом
+      setFullscreen(false);
+    }
+  });
+
+  els.graphCanvas.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0) return;
+    const s = screenPoint(ev);
+    const p = canvasPoint(ev);
+    const node = nodeAt(p.x, p.y);
+    if (node) {
+      graph.press = { node, sx: s.x, sy: s.y, t0: performance.now(), moved: false, longFired: false };
+      graph.press.timer = setTimeout(() => {
+        if (!graph.press || graph.press.moved) return;
+        graph.press.longFired = true;
+        selectNode(graph.press.node);
+        toast('Нейрон выбран: ' + shorten(graph.press.node.label, 30));
+      }, LONG_PRESS_MS);
+    } else {
+      graph.drag = { sx: s.x, sy: s.y, ox: graph.view.ox, oy: graph.view.oy };
+      els.graphCanvas.style.cursor = 'grabbing';
+    }
+  });
   els.graphCanvas.addEventListener('pointermove', (ev) => {
+    const s = screenPoint(ev);
+    if (graph.drag) {
+      graph.view.ox = graph.drag.ox + (s.x - graph.drag.sx);
+      graph.view.oy = graph.drag.oy + (s.y - graph.drag.sy);
+      kick();
+      return;
+    }
     const p = canvasPoint(ev);
     const n = nodeAt(p.x, p.y);
+    if (graph.press && !graph.press.moved &&
+        Math.hypot(s.x - graph.press.sx, s.y - graph.press.sy) > 6) {
+      graph.press.moved = true;
+      clearTimeout(graph.press.timer);
+    }
     if (n !== graph.hover) {
       graph.hover = n;
       els.graphCanvas.style.cursor = n ? 'pointer' : 'default';
       draw();
     }
   });
+  function endPointer() {
+    const press = graph.press;
+    if (press) {
+      clearTimeout(press.timer);
+      if (!press.moved && !press.longFired) selectNode(graph.selected === press.node ? null : press.node);
+    }
+    graph.press = null;
+    graph.drag = null;
+    els.graphCanvas.style.cursor = graph.hover ? 'pointer' : 'default';
+    draw();
+  }
+  els.graphCanvas.addEventListener('pointerup', endPointer);
+  els.graphCanvas.addEventListener('pointercancel', endPointer);
   els.graphCanvas.addEventListener('pointerleave', () => { graph.hover = null; draw(); });
-  els.graphCanvas.addEventListener('click', (ev) => {
+  els.graphCanvas.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault();
     const p = canvasPoint(ev);
     const n = nodeAt(p.x, p.y);
-    selectNode(n === graph.selected ? null : n);
+    if (n) selectNode(n);
   });
+  els.graphCanvas.addEventListener('wheel', (ev) => {
+    ev.preventDefault();
+    const s = screenPoint(ev);
+    zoomAt(s.x, s.y, ev.deltaY < 0 ? 1.12 : 1 / 1.12);
+  }, { passive: false });
   window.addEventListener('resize', () => { if (graphVisible()) resizeGraph(); });
   // Факты появляются фоном (очередь индексации) — карта обновляется сама, пока открыта.
   setInterval(() => {

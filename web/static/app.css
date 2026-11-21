@@ -503,7 +503,22 @@ body.compact .bubble { padding: 8px 12px; }
   position: relative; height: 340px; border: 1px solid var(--border-color); border-radius: 14px; overflow: hidden;
   background: radial-gradient(circle at 50% 40%, rgba(142, 162, 255, .07), transparent 70%), var(--bg-primary);
 }
-.graph-stage canvas { display: block; touch-action: none; }
+.graph-stage canvas { display: block; touch-action: none; width: 100%; height: 100%; }
+.graph-controls { position: absolute; top: 8px; right: 8px; display: flex; gap: 6px; z-index: 2; }
+.graph-controls .icon-btn {
+  width: 30px; height: 30px; padding: 0; border-radius: 9px; font-size: 16px; line-height: 1;
+  background: rgba(24, 27, 34, .72); backdrop-filter: blur(6px);
+}
+.graph-hint {
+  position: absolute; left: 10px; bottom: 7px; z-index: 2; pointer-events: none;
+  font-size: 10.5px; color: var(--text-muted); opacity: .85;
+}
+.graph-stage.fullscreen {
+  position: fixed; inset: 0; z-index: 90; height: auto; border: 0; border-radius: 0;
+  background: radial-gradient(circle at 50% 45%, rgba(142, 162, 255, .11), transparent 65%), #080a0e;
+}
+.graph-stage.fullscreen .graph-controls .icon-btn { background: rgba(12, 14, 20, .85); }
+.graph-pulse-legend { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
 .graph-empty {
   position: absolute; inset: 0; display: grid; place-items: center; padding: 20px; text-align: center;
   color: var(--text-muted); font-size: 13px;

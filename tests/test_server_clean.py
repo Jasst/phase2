@@ -94,11 +94,20 @@ def _json(port, method, path, body=None):
     return status, json.loads(raw or b"{}")
 
 
+def test_distill_endpoint(running, monkeypatch):
+    app, port = running
+    monkeypatch.setattr(app, "distill_fact",
+                        lambda fid: {"status": "ok", "verdict": "keep", "fact_id": fid})
+    status, body = _json(port, "POST", "/api/memory/distill", {"fact_id": "f1"})
+    assert status == 200 and body["verdict"] == "keep" and body["fact_id"] == "f1"
+
+
 def test_serve_forever_cleans_up_on_ctrl_c(monkeypatch, tmp_path):
     from pulsenet import server as srvmod
 
     class FakeServer:
         closed = False
+        server_address = ("127.0.0.1", 0)
 
         def serve_forever(self):
             raise KeyboardInterrupt

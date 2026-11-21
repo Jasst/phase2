@@ -165,6 +165,25 @@ def _app(tmp_path, monkeypatch, scripts):
     return app
 
 
+def test_distill_fact_rewrites_through_supersede(tmp_path, monkeypatch):
+    import pulsenet.app as appmod
+
+    app = _app(tmp_path, monkeypatch, [["ok"]])
+    doc = app.memory.ingest("Нел живёт в Амстердаме", session_id="s", role="user")
+    f = app.memory.journal.assert_fact("Нел", "живёт в", "Амстердаме",
+                                       source={"doc_id": doc["doc_id"], "span": [0, 5]})
+    monkeypatch.setattr(app, "model_id", lambda: "fake")
+    monkeypatch.setattr(appmod, "openai_chat_caller",
+                        lambda *a, **kw: lambda prompt:
+                        '{"verdict":"update","s":"Нел","r":"живёт в","o":"Роттердаме",'
+                        '"confidence":0.9,"reason":"переехала"}')
+    out = app.distill_fact(f.fact_id)
+    assert out["verdict"] == "update"
+    current = app.memory.list_facts(10)
+    assert any(x["o"] == "Роттердаме" for x in current)
+    assert all(x["fact_id"] != f.fact_id for x in current)  # старый факт закрыт supersede
+
+
 def test_model_choice_follows_loaded_and_active_model(tmp_path, monkeypatch):
     app = _app(tmp_path, monkeypatch, [["ok"]])
     app.backend.refresh_loaded = lambda: "loaded-in-lmstudio"

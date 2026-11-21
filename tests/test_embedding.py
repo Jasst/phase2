@@ -191,6 +191,7 @@ def test_app_detects_model_and_dim_without_manual_settings(stub_env, tmp_path):
         assert app.memory.encoder.name == "openai+cache"
         assert app.memory.encoder.dim == 16
         assert app.embed_model == "text-embedding-bge-m3"
+        assert app.memory.stats()["embed_model"] == "text-embedding-bge-m3"
         assert app.status()["embedder"]["model"] == "text-embedding-bge-m3"
         assert app.recent_errors() == []
     finally:
