@@ -52,7 +52,7 @@ def main(argv=None):
         app = App(os.environ, data_dir=args.data)
         for path in args.files:
             with open(path, encoding="utf-8-sig") as f:
-                out = app.memory.ingest(f.read(), session_id=os.path.basename(path), role="user")
+                out = app.ingest(f.read(), session_id=os.path.basename(path), role="user")
             print(f"{path}: {out['status']}, фактов: {sum(1 for x in out['facts'] if x.get('status') == 'ok')}")
     elif args.cmd == "consolidate":
         from .app import App

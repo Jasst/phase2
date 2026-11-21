@@ -1,13 +1,7 @@
 # -*- coding: utf-8 -*-
-"""MCP-слой ТРИПЛЕКСИИ: протокол JSON-RPC, инструменты и HTTP-маршрут /mcp с авторизацией."""
-import http.client
-import json
-import threading
-
+"""MCP-слой ТРИПЛЕКСИИ: протокол JSON-RPC и инструменты (HTTP-маршрут живёт в unified MCP-сервере)."""
 import pytest
 
-from pulsenet.app import App
-from pulsenet.server import make_server
 from pulsenet.triplex import FactJournal, TriplexMCP
 
 TOKEN = "test-token-123"
@@ -143,95 +137,3 @@ def test_persistence_survives_restart(tmp_path):
     structured(m1.handle(call("triplex_assert", s="кот", r="любит", o="рыба", source=SRC, valid_from=T0)))
     m2 = TriplexMCP(FactJournal(p))
     assert structured(m2.handle(call("triplex_stats")))["total"] == 1
-
-
-# ---------- HTTP-маршрут /mcp ----------
-
-@pytest.fixture()
-def server(tmp_path, monkeypatch):
-    monkeypatch.setenv("PULSENET_MCP_TOKEN", TOKEN)
-    monkeypatch.setenv("PULSENET_MCP_HOSTS", "blockcoin.ru")
-    env = {"LLM_BACKEND": "lmstudio", "LMSTUDIO_URL": "http://127.0.0.1:9/v1",
-           "PULSENET_MCP_TOKEN": TOKEN, "PULSENET_MCP_HOSTS": "blockcoin.ru"}
-    app = App(env, data_dir=str(tmp_path / "data"))
-    srv = make_server(app, "127.0.0.1", 0, web_dir=str(tmp_path))
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    yield srv.server_address[1]
-    srv.shutdown()
-    srv.server_close()
-
-
-def _request(port, method, body, headers=None, path="/mcp"):
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    h = {"Content-Type": "application/json", "Host": "localhost",
-         "Authorization": f"Bearer {TOKEN}"}
-    h.update(headers or {})
-    data = None
-    if body is not None:
-        data = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
-    conn.request(method, path, body=data, headers=h)
-    resp = conn.getresponse()
-    raw = resp.read()
-    hdrs = dict(resp.getheaders())
-    conn.close()
-    return resp.status, hdrs, raw
-
-
-def test_http_requires_bearer_token(server):
-    status, hdrs, _ = _request(server, "POST", rpc("ping"), headers={"Authorization": "Bearer wrong"})
-    assert status == 401 and "Bearer" in hdrs.get("WWW-Authenticate", "")
-    status, _, _ = _request(server, "POST", rpc("ping"), headers={"Authorization": ""})
-    assert status == 401
-
-
-def test_http_ping_and_tool_call(server):
-    status, _, raw = _request(server, "POST", rpc("ping"))
-    assert status == 200 and json.loads(raw)["result"] == {}
-    status, _, raw = _request(server, "POST", call("triplex_stats"))
-    assert status == 200 and json.loads(raw)["result"]["isError"] is False
-
-
-def test_http_notification_is_202_without_body(server):
-    status, _, raw = _request(server, "POST", rpc("notifications/initialized", id_=None))
-    assert status == 202 and raw == b""
-
-
-def test_http_accepts_trailing_slash_as_nginx_rewrites(server):
-    status, _, raw = _request(server, "POST", rpc("ping"), path="/mcp/")
-    assert status == 200 and json.loads(raw)["id"] == 1
-
-
-def test_http_parse_error_is_400_with_jsonrpc_error(server):
-    status, _, raw = _request(server, "POST", b"{not json")
-    assert status == 400 and json.loads(raw)["error"]["code"] == -32700
-
-
-def test_http_host_and_origin_are_checked(server):
-    status, _, _ = _request(server, "POST", rpc("ping"), headers={"Host": "evil.example"})
-    assert status == 403
-    status, _, _ = _request(server, "POST", rpc("ping"), headers={"Origin": "https://evil.example"})
-    assert status == 403
-    status, _, _ = _request(server, "POST", rpc("ping"),
-                            headers={"Host": "blockcoin.ru", "Origin": "https://blockcoin.ru"})
-    assert status == 200
-
-
-def test_http_get_is_405_and_delete_is_200(server):
-    status, hdrs, _ = _request(server, "GET", None)
-    assert status == 405 and "POST" in hdrs.get("Allow", "")
-    status, _, _ = _request(server, "DELETE", None)
-    assert status == 200
-
-
-def test_http_disabled_without_token(tmp_path, monkeypatch):
-    monkeypatch.delenv("PULSENET_MCP_TOKEN", raising=False)
-    app = App({"LLM_BACKEND": "lmstudio", "LMSTUDIO_URL": "http://127.0.0.1:9/v1"},
-              data_dir=str(tmp_path / "data"))
-    srv = make_server(app, "127.0.0.1", 0, web_dir=str(tmp_path))
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
-        status, _, _ = _request(srv.server_address[1], "POST", rpc("ping"))
-        assert status == 503
-    finally:
-        srv.shutdown()
-        srv.server_close()

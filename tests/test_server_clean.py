@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Тесты сервера и приложения: API чата и памяти, SSE, журнал ошибок, MCP поверх HTTP, «Сон»."""
+"""Тесты сервера и приложения: API чата и памяти, SSE, журнал ошибок, «Сон»."""
 import http.client
 import json
 import threading
@@ -94,14 +94,57 @@ def _json(port, method, path, body=None):
     return status, json.loads(raw or b"{}")
 
 
+def test_distill_endpoint(running, monkeypatch):
+    app, port = running
+    monkeypatch.setattr(app, "distill_fact",
+                        lambda fid, model="": {"status": "ok", "verdict": "keep",
+                                               "fact_id": fid, "model": model})
+    status, body = _json(port, "POST", "/api/memory/distill", {"fact_id": "f1"})
+    assert status == 200 and body["verdict"] == "keep" and body["fact_id"] == "f1"
+
+
+def test_serve_forever_cleans_up_on_ctrl_c(monkeypatch, tmp_path):
+    from pulsenet import server as srvmod
+
+    class FakeServer:
+        closed = False
+        server_address = ("127.0.0.1", 0)
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            self.closed = True
+
+    fake = FakeServer()
+    monkeypatch.setattr(srvmod, "make_server", lambda *a, **kw: fake)
+    app = App({"LLM_BACKEND": "lmstudio", "TRIPLEX_EXTRACT": "0", "TRIPLEX_EMBED_URL": ""},
+              data_dir=str(tmp_path / "data"))
+    stopped = []
+    app.backend.stop = lambda: stopped.append("backend")
+
+    class FakeEmbed:
+        def stop(self):
+            stopped.append("embed")
+
+    app.embed_server = FakeEmbed()
+    srvmod.serve_forever(app, "127.0.0.1", 0, web_dir=WEB_DIR)
+    assert app.stop_flag is True
+    assert stopped == ["backend", "embed"]
+    assert fake.closed is True
+
+
 def test_health_and_index_page(running):
     app, port = running
     assert _json(port, "GET", "/health")[1]["ok"] is True
     for path in ("/", "/ai", "/ai.html"):
         status, raw = _req(port, "GET", path)
         assert status == 200 and "ТРИПЛЕКСИЯ".encode("utf-8") in raw
+        assert b"apple-mobile-web-app-capable" in raw       # PWA открывается standalone, а не закладкой
+        assert b'setUIScale' in raw                          # масштаб интерфейса доступен в настройках
     status, raw = _req(port, "GET", "/static/app.css")
     assert status == 200 and b"--bg-primary" in raw
+    assert b"body.standalone" in raw
     status, raw = _req(port, "GET", "/sw.js")
     assert status == 200 and b"unregister" in raw
     status, _ = _req(port, "GET", "/static/../../pulsenet/server.py")
@@ -180,17 +223,6 @@ def test_bad_json_and_unknown_fact_return_proper_codes(running):
     assert status == 400
 
 
-def test_mcp_over_http_requires_token(running):
-    app, port = running
-    status, _ = _req(port, "POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "ping"},
-                     headers={"Host": "localhost", "Authorization": "Bearer nope"})
-    assert status == 401
-    status, raw = _req(port, "POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                                              "params": {"name": "triplex_whoami", "arguments": {}}},
-                       headers={"Host": "localhost", "Authorization": f"Bearer {TOKEN}"})
-    assert status == 200 and json.loads(raw)["result"]["isError"] is False
-
-
 def test_consolidate_dry_run_writes_nothing_without_eligible(running):
     app, port = running
     _, body = _json(port, "POST", "/api/memory/consolidate")
@@ -242,27 +274,40 @@ def test_adapter_gate_rejects_forgetting_and_ppl_rise():
 
 
 def test_client_disconnect_is_not_an_error():
+    """Обрыв клиента при записи в SSE — не ошибка: ответ продолжается в фоне, исключения нет."""
     from pulsenet import server
 
-    stopped = []
-
     class FakeApp:
-        def stop(self):
-            stopped.append(True)
+        def chat(self, message, chat_id, on_delta, cancelled=None, web=False):
+            on_delta("token", "привет")
+            return "привет"
 
-        def chat(self, *_args, **_kwargs):
+        def index_pending(self):
+            return 0
+
+        def log_error(self, *_args):
+            pass
+
+    class BrokenWriter:
+        def write(self, _data):
             raise ConnectionAbortedError(10053, "client aborted")
+
+        def flush(self):
+            pass
 
     class FakeHandler:
         app = FakeApp()
-        wfile = None
+        jobs = server.ChatJobs(FakeApp())
+        wfile = BrokenWriter()
+        sse = server.Handler.sse
+        stream_job = server.Handler.stream_job
+        _chat = None
 
         def send_response(self, *_args): pass
         def send_header(self, *_args): pass
         def end_headers(self): pass
 
-    server._chat(FakeHandler(), {"message": "привет"}, None)
-    assert stopped == [True]
+    server._chat(FakeHandler(), {"message": "привет", "chat_id": "disc"}, None)
 
     handler = object.__new__(server.Handler)
 

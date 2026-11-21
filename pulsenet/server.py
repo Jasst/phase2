@@ -8,10 +8,14 @@
   GET  /health                 проверка работоспособности
   GET  /api/status             бэкенд, память, журнал ошибок
   GET  /api/models             модели бэкенда
-  POST /api/chat               чат, поток SSE: token | reasoning | done | error
+  POST /api/chat               чат, поток SSE: token | reasoning | tool | sources | done | error
+                               тело: {message, chat_id, web, model} — web разрешает веб-инструменты,
+                               model выбирает модель для ответа (пусто — по умолчанию)
   GET  /api/chat/stream        продолжить поток ответа после перезагрузки
   POST /api/chat/stop          остановить текущую генерацию
+  GET  /api/tools              инструменты чата и команды (каталог)
   GET  /api/memory/facts       действующие факты
+  GET  /api/memory/graph       карта нейронов: узлы, связи, рост по дням
   POST /api/memory/ingest      сохранить текст (синхронно, с экстракцией)
   POST /api/memory/search      поиск (recall)
   POST /api/memory/confirm     подтвердить / опровергнуть факт
@@ -19,14 +23,10 @@
   POST /api/memory/link        привязать написание к сущности
   POST /api/memory/supersede   явно вытеснить факт
   POST /api/memory/consolidate «Сон», сухой прогон: датасет без обучения
-  POST /mcp                    MCP (Bearer PULSENET_MCP_TOKEN)
-
-Безопасность: /mcp требует токен и проверяет Host/Origin. Маршруты /api/* без входа:
-при открытии в интернет ограничьте их на уровне nginx (см. README).
+  POST /api/memory/distill     темпоральная дистилляция факта через LLM (пересборка по свежим данным)
 """
 from __future__ import annotations
 
-import hmac
 import json
 import mimetypes
 import os
@@ -34,8 +34,6 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-
-from .triplex import parse_body
 
 WEB_DIR_DEFAULT = "web"
 MAX_BODY = 20 * 1024 * 1024
@@ -47,42 +45,32 @@ mimetypes.add_type("image/svg+xml", ".svg")
 mimetypes.add_type("font/woff2", ".woff2")
 
 
-def _hostname(value: str) -> str:
-    value = (value or "").strip()
-    if "://" in value:
-        value = value.split("://", 1)[1].split("/", 1)[0]
-    if value.startswith("["):
-        return value[1:value.find("]")].lower() if "]" in value else value.lower()
-    return value.split(":", 1)[0].lower()
-
-
-def mcp_settings(env) -> dict:
-    token = (env.get("PULSENET_MCP_TOKEN") or "").strip()
-    extra = {_hostname(h) for h in (env.get("PULSENET_MCP_HOSTS") or "").split(",") if h.strip()}
-    return {"token": token, "hosts": {"localhost", "127.0.0.1"} | extra}
-
-
 class ChatJob:
     """Ответ ассистента, который продолжается даже без подключённого клиента."""
 
-    def __init__(self, chat_id: str, message: str):
+    def __init__(self, chat_id: str, message: str, web: bool = False, model: str = ""):
         self.chat_id = chat_id
         self.message = message
+        self.web = web
+        self.model = model
         self.text = ""
         self.reasoning = ""
         self.answer = ""
         self.error = ""
         self.status = "running"          # running | done | stopped | error
         self.index_pending = 0
+        self.events = []                 # tool / sources, с позицией в тексте (at)
         self.cancelled = threading.Event()
         self._lock = threading.Lock()
 
-    def add_delta(self, kind, text):
+    def add_delta(self, kind, payload):
         with self._lock:
             if kind == "reasoning":
-                self.reasoning += text
+                self.reasoning += payload
+            elif kind in ("tool", "sources"):
+                self.events.append({"kind": kind, "data": payload, "at": len(self.text)})
             else:
-                self.text += text
+                self.text += payload
 
     def complete(self, answer, index_pending, status):
         with self._lock:
@@ -101,6 +89,7 @@ class ChatJob:
             return {
                 "text": self.text,
                 "reasoning": self.reasoning,
+                "events": list(self.events),
                 "answer": self.answer,
                 "error": self.error,
                 "status": self.status,
@@ -116,12 +105,12 @@ class ChatJobs:
         self._lock = threading.Lock()
         self._jobs = {}
 
-    def start(self, chat_id: str, message: str):
+    def start(self, chat_id: str, message: str, web: bool = False, model: str = ""):
         with self._lock:
             current = self._jobs.get(chat_id)
             if current is not None and current.snapshot()["status"] == "running":
                 return current, False
-            job = ChatJob(chat_id, message)
+            job = ChatJob(chat_id, message, web=web, model=model)
             self._jobs[chat_id] = job
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
         return job, True
@@ -129,7 +118,7 @@ class ChatJobs:
     def _run(self, job):
         try:
             answer = self.app.chat(job.message, job.chat_id, job.add_delta,
-                                   cancelled=job.cancelled.is_set)
+                                   cancelled=job.cancelled.is_set, web=job.web, model=job.model)
             job.complete(answer, self.app.index_pending(),
                          "stopped" if job.cancelled.is_set() else "done")
         except Exception as exc:                  # noqa: BLE001
@@ -218,7 +207,10 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_file(path)
 
     def stream_job(self, job):
-        """Отдаёт накопленный ответ и следит за ним, пока он не завершится."""
+        """Отдаёт накопленный ответ и следит за ним, пока он не завершится.
+
+        Токены и события (tool, sources) идут в порядке появления: событие показывается там,
+        где в тексте оно произошло (поле at)."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -226,11 +218,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         text_pos = 0
         reasoning_pos = 0
+        event_pos = 0
         try:
             while True:
                 snap = job.snapshot()
                 text = snap["text"]
                 reasoning = snap["reasoning"]
+                for ev in snap["events"][event_pos:]:
+                    if ev["at"] > text_pos:
+                        self.sse({"token": text[text_pos:ev["at"]]})
+                        text_pos = ev["at"]
+                    self.sse({ev["kind"]: ev["data"]})
+                    event_pos += 1
                 if len(text) > text_pos:
                     self.sse({"token": text[text_pos:]})
                     text_pos = len(text)
@@ -258,8 +257,6 @@ class Handler(BaseHTTPRequestHandler):
     def dispatch(self, method):
         url = urlparse(self.path)
         path, query = url.path, parse_qs(url.query)
-        if path.rstrip("/") == "/mcp":
-            return self.mcp_endpoint(method)
         if method == "GET" and path in ("/", "/ai", "/ai.html"):
             return self.send_file(os.path.join(self.web_dir, "index.html"))
         if method == "GET" and path == "/sw.js":
@@ -302,48 +299,6 @@ class Handler(BaseHTTPRequestHandler):
         except ConnectionError:
             pass
 
-    # ----- MCP -----
-
-    def mcp_endpoint(self, method):
-        cfg = mcp_settings(self.app.env)
-        if not cfg["token"]:
-            return self.send_json({"error": "mcp отключён: задайте PULSENET_MCP_TOKEN"}, 503)
-        if _hostname(self.headers.get("Host", "")) not in cfg["hosts"]:
-            return self.send_json({"error": "host not allowed"}, 403)
-        origin = self.headers.get("Origin")
-        if origin and _hostname(origin) not in cfg["hosts"]:
-            return self.send_json({"error": "origin not allowed"}, 403)
-        auth = self.headers.get("Authorization", "")
-        given = auth[7:] if auth.startswith("Bearer ") else ""
-        if not hmac.compare_digest(given.encode("utf-8"), cfg["token"].encode("utf-8")):
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Bearer realm="pulsenet-mcp"')
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        if method == "DELETE":
-            self.send_response(200)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        if method != "POST":
-            self.send_response(405)
-            self.send_header("Allow", "POST, DELETE")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        payload, err = parse_body(self.read_raw())
-        if err is not None:
-            return self.send_json(err, 400)
-        reply = self.app.mcp.handle(payload)
-        if reply is None:
-            self.send_response(202)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        self.send_json(reply, 200)
-
-
 # ----- обработчики API -----
 
 def _status(h, _b, _q):
@@ -368,7 +323,8 @@ def _chat(h, b, _q):
     if not message:
         raise ValueError("пустое сообщение")
     chat_id = str(b.get("chat_id") or "default")
-    job, created = h.jobs.start(chat_id, message)
+    job, created = h.jobs.start(chat_id, message, web=bool(b.get("web")),
+                                model=str(b.get("model") or "").strip())
     if not created and job.message != message:
         return h.send_json({"error": "в этом чате ещё генерируется ответ"}, 409)
     h.stream_job(job)
@@ -394,10 +350,7 @@ def _stop(h, b, _q):
 
 def _facts(h, _b, q):
     limit = int((q.get("limit") or ["50"])[0])
-    facts = h.app.memory.journal.query()[:max(1, min(limit, 500))]
-    h.send_json({"facts": [{"fact_id": f.fact_id, "text": h.app.memory._fact_text(f),
-                            "confidence": round(f.confidence, 3), "valid_from": f.valid_from,
-                            "source": f.source, "access_count": f.access_count} for f in facts]})
+    h.send_json({"facts": h.app.memory.list_facts(max(1, min(limit, 500)))})
 
 
 def _ingest(h, b, _q):
@@ -405,7 +358,17 @@ def _ingest(h, b, _q):
     if not text:
         raise ValueError("пустой текст")
     h.send_json(h.app.ingest(text, session_id=str(b.get("session_id") or "web"),
-                             role=str(b.get("role") or "user"), recorded_at=b.get("recorded_at")))
+                             role=str(b.get("role") or "user"), recorded_at=b.get("recorded_at"),
+                             model=str(b.get("model") or "")))
+
+
+def _graph(h, _b, q):
+    limit = int((q.get("limit") or ["200"])[0])
+    h.send_json(h.app.graph(max_edges=max(10, min(limit, 1000))))
+
+
+def _tools(h, _b, _q):
+    h.send_json(h.app.describe_tools())
 
 
 def _search(h, b, _q):
@@ -420,8 +383,9 @@ def _confirm(h, b, _q):
 
 
 def _retract(h, b, _q):
-    f = h.app.memory.retract(str(b.get("fact_id", "")))
-    h.send_json({"status": "ok", "retracted": f.fact_id})
+    fact_id = str(b.get("fact_id", ""))
+    h.app.memory.retract(fact_id)                 # локально возвращает Fact, по MCP — dict: нужен только факт
+    h.send_json({"status": "ok", "retracted": fact_id})
 
 
 def _link(h, b, _q):
@@ -440,10 +404,16 @@ def _consolidate(h, _b, _q):
     h.send_json(h.app.consolidate_dry_run())
 
 
+def _distill(h, b, _q):
+    h.send_json(h.app.distill_fact(str(b.get("fact_id", "")), model=str(b.get("model") or "")))
+
+
 ROUTES = {
     ("GET", "/api/status"): _status,
     ("GET", "/api/models"): _models,
+    ("GET", "/api/tools"): _tools,
     ("GET", "/api/memory/facts"): _facts,
+    ("GET", "/api/memory/graph"): _graph,
     ("POST", "/api/chat"): _chat,
     ("GET", "/api/chat/stream"): _chat_stream,
     ("POST", "/api/chat/stop"): _stop,
@@ -454,6 +424,7 @@ ROUTES = {
     ("POST", "/api/memory/link"): _link,
     ("POST", "/api/memory/supersede"): _supersede,
     ("POST", "/api/memory/consolidate"): _consolidate,
+    ("POST", "/api/memory/distill"): _distill,
 }
 
 
@@ -477,4 +448,18 @@ def serve_forever(app, host, port, web_dir=WEB_DIR_DEFAULT):
     except KeyboardInterrupt:
         pass
     finally:
+        # Ctrl+C должен гасить не только HTTP-сокет: генерация, локальный llama-server
+        # и отдельный процесс эмбеддингов иначе остаются живыми после выхода.
+        app.stop()
+        stop_backend = getattr(app.backend, "stop", None)
+        if callable(stop_backend):
+            try:
+                stop_backend()
+            except Exception:                      # noqa: BLE001 — уборка не должна ломать выход
+                pass
+        if getattr(app, "embed_server", None):
+            try:
+                app.embed_server.stop()
+            except Exception:                      # noqa: BLE001
+                pass
         srv.server_close()

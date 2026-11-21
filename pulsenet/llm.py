@@ -154,6 +154,7 @@ class LMStudioBackend(OpenAICompat):
         self.base_url = url if url.endswith("/v1") else url + "/v1"
         self.default_model = env.get("LMSTUDIO_MODEL", "").strip()
         self.loaded = None
+        self._loaded_at = 0.0
 
     def _root_url(self):
         return self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
@@ -175,14 +176,19 @@ class LMStudioBackend(OpenAICompat):
             ids.append(m["id"])
         return ids
 
-    def refresh_loaded(self):
+    def refresh_loaded(self, force: bool = False):
         """Обновить `loaded` по фактическому состоянию LM Studio.
 
         Не полагаемся на сохранённый выбор модели: он мог остаться от другого
         бэкенда (например, путь .gguf), и запрос к LM Studio загрузил бы
-        совсем не ту модель, что уже находится в памяти.
+        совсем не ту модель, что уже находится в памяти. Опрос API кэшируется
+        на 15 с: статус и экстракция не должны дёргать LM Studio на каждом шаге.
         """
+        now = time.time()
+        if not force and self._loaded_at and now - self._loaded_at < 15:
+            return self.loaded
         ids = self._loaded_ids()
+        self._loaded_at = now
         if ids is None:      # старые версии: state есть только в /v1/models
             try:
                 data = http_json(self.base_url + "/models", timeout=5)
@@ -196,13 +202,23 @@ class LMStudioBackend(OpenAICompat):
         self.loaded = ids[0] if ids else None
         return self.loaded
 
+    def _embedding_ids(self):
+        """Модели эмбеддингов — в выбор чата не попадают (нужны только памяти)."""
+        try:
+            data = http_json(self._root_url() + "/api/v0/models", timeout=5)
+        except (OSError, ValueError):
+            return set()
+        return {m["id"] for m in data.get("data", [])
+                if isinstance(m, dict) and m.get("id") and m.get("type") == "embeddings"}
+
     def list_models(self):
         try:
             data = http_json(self.base_url + "/models", timeout=5)
         except (OSError, ValueError) as exc:
             raise BackendError(f"LM Studio недоступен по адресу {self.base_url}: {exc}") from exc
         self.refresh_loaded()
-        return [m["id"] for m in data.get("data", []) if "id" in m]
+        skip = self._embedding_ids()
+        return [m["id"] for m in data.get("data", []) if "id" in m and m["id"] not in skip]
 
     def _known_ids(self):
         """Все id, которые LM Studio принимает в запросе (включая ещё не загруженные)."""

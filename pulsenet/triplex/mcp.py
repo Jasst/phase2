@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
-"""MCP-сервер ТРИПЛЕКСИИ: JSON-RPC 2.0 поверх транспорта Streamable HTTP (stdlib, без SSE).
+"""MCP-сервер ТРИПЛЕКСИИ: JSON-RPC 2.0 поверх Streamable HTTP (stdlib, без SSE).
 
 Сервер отвечает одним JSON-ответом на каждый POST. Серверных уведомлений нет,
 поэтому GET /mcp возвращает 405 (это разрешено спецификацией).
 
-Инструменты M0 (журнал фактов):
-  triplex_assert, triplex_query, triplex_retract, triplex_stats, triplex_check
-
-Retrieval (triplex_search), decay и консолидация появятся в следующих вехах.
+Инструменты (см. docs/MCP_TRIPLEX.md): ingest, search, assert, supersede, retract,
+confirm, query, link_entity, define_relation, stats, check, consolidate (сухой прогон), whoami.
 Аутентификация и проверка Host/Origin — в pulsenet/server.py, здесь только протокол.
 """
 from __future__ import annotations

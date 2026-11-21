@@ -49,7 +49,18 @@ def _dt(value: str) -> datetime:
 
 
 def _tokens(text: str) -> List[str]:
-    return _TOKEN.findall(text.lower())
+    """Токены для лексического сравнения. Слова обрезаются до 5 символов (грубый стемминг:
+    «проект» и «проекте» совпадают, «использует» и «использовать» тоже), короткие служебные
+    слова (в, на, и) отбрасываются. Числа и версии (3.12 → 3, 12) не трогаются."""
+    out: List[str] = []
+    for tok in _TOKEN.findall(text.lower()):
+        if tok.isalpha():
+            if len(tok) <= 2:
+                continue
+            out.append(tok[:5])
+        else:
+            out.append(tok)
+    return out
 
 
 def _entity_id(canonical: str, etype: str) -> str:
@@ -279,9 +290,12 @@ class TriplexMemory:
     # ---------- write path ----------
 
     def ingest(self, text: str, session_id: str = "", role: str = "user",
-               recorded_at: Optional[str] = None) -> dict:
+               recorded_at: Optional[str] = None, agent: str = "",
+               extractor: Optional[Callable[[str], Dict[str, List[dict]]]] = None) -> dict:
+        """extractor — разовый экстрактор для этого документа (например, под выбранную в чате модель).
+        Без него используется экстрактор памяти по умолчанию."""
         with self._lock:
-            doc = self.docs.add(text, session_id=session_id, role=role, recorded_at=recorded_at)
+            doc = self.docs.add(text, session_id=session_id, role=role, recorded_at=recorded_at, agent=agent)
             if doc.chunks and not all(c.chunk_id in self.chunk_index.pos for c in doc.chunks):
                 vecs = self.encoder.embed([c.text for c in doc.chunks])
                 for c, v in zip(doc.chunks, vecs):
@@ -289,11 +303,12 @@ class TriplexMemory:
                     self.chunk_lsh.add(c.chunk_id, v)
             out = {"doc_id": doc.doc_id, "status": "ok", "facts": [],
                    "needs_confirmation": [], "relations_proposed": []}
-            if self.extractor is None:
+            use_extractor = extractor or self.extractor
+            if use_extractor is None:
                 out["status"] = "no_extractor"
                 return out
             try:
-                extracted = self.extractor(doc.text)
+                extracted = use_extractor(doc.text)
             except Exception as exc:                          # I8: документ сохранён, фактов нет
                 out["status"] = "extraction_failed"
                 out["error"] = str(exc)
@@ -500,6 +515,25 @@ class TriplexMemory:
         with self._lock:
             return self.journal.retract(fact_id, at=at)     # KeyError для неизвестного факта
 
+    def agent_of(self, f: Fact) -> str:
+        """Агент-автор факта: из source.agent, иначе из документа-источника."""
+        if f.source.get("agent"):
+            return str(f.source["agent"])
+        doc = self.docs.docs.get(f.source.get("doc_id"))
+        return doc.agent if doc is not None else ""
+
+    def list_facts(self, limit: int = 50) -> List[dict]:
+        """Действующие факты с провенансом — для списка в интерфейсе и для других клиентов."""
+        with self._lock:
+            out = []
+            for f in self.journal.query()[:max(1, min(int(limit), 500))]:
+                out.append({"fact_id": f.fact_id, "text": self._fact_text(f),
+                            "s": self._ename(f.s), "r": f.r, "o": self._ename(f.o),
+                            "valid_from": f.valid_from,
+                            "confidence": round(f.confidence, 3), "valid_to": f.valid_to,
+                            "source": f.source, "access_count": f.access_count, "agent": self.agent_of(f)})
+            return out
+
     def stats(self) -> dict:
         with self._lock:
             return {
@@ -511,5 +545,63 @@ class TriplexMemory:
                 "facts_records": len(self.journal.facts),
                 "facts_active": len(self.journal.query()),
                 "encoder": self.encoder.name,
+                "embed_model": getattr(self.encoder, "model", None),
+                "embed_dim": getattr(self.encoder, "dim", None),
                 "extractor": self.extractor is not None,
+            }
+
+    def graph(self, max_edges: int = 400) -> dict:
+        """Срез памяти для визуализации: сущности — узлы («нейроны»), действующие факты — связи.
+
+        Узел появляется, когда на него ссылается хотя бы один действующий факт; created — момент
+        первого факта. growth — накопительное число фактов по дням (как память росла).
+        Архивные (затухшие) факты в срез не входят. Если фактов больше max_edges — берутся свежие.
+        """
+        with self._lock:
+            now = _now()
+            t = _dt(now)
+            active = self.journal.query(as_of=now)
+            alive = [f for f in active if not self.is_archived(f, t)]
+            alive.sort(key=lambda f: f.recorded_at, reverse=True)
+            shown = alive[:max_edges]
+
+            nodes: Dict[str, dict] = {}
+
+            def node(key: str) -> dict:
+                if key not in nodes:
+                    ent = self.entities.get(key)
+                    nodes[key] = {"id": key, "label": ent["canonical"] if ent else key,
+                                  "type": ent["type"] if ent else None, "degree": 0,
+                                  "created": None, "linked": ent is not None}
+                return nodes[key]
+
+            edges = []
+            for f in shown:
+                a, b = node(f.s), node(f.o)
+                for n in (a, b):
+                    n["degree"] += 1
+                    if n["created"] is None or f.recorded_at < n["created"]:
+                        n["created"] = f.recorded_at
+                edges.append({"id": f.fact_id, "source": f.s, "target": f.o, "label": f.r,
+                              "confidence": round(f.confidence, 3), "recorded_at": f.recorded_at,
+                              "access_count": f.access_count})
+
+            per_day: Dict[str, int] = {}
+            for f in active:
+                day = f.recorded_at[:10]
+                per_day[day] = per_day.get(day, 0) + 1
+            total = 0
+            growth = []
+            for day in sorted(per_day):
+                total += per_day[day]
+                growth.append({"day": day, "facts": total})
+
+            return {
+                "as_of": now,
+                "nodes": list(nodes.values()),
+                "edges": edges,
+                "truncated": len(alive) > len(shown),
+                "totals": {"entities": len(self.entities), "facts": len(active),
+                           "alive": len(alive), "relations": len(self.relations)},
+                "growth": growth,
             }
