@@ -19,6 +19,41 @@ class MemoryUnavailable(RuntimeError):
     """MCP-сервер памяти не отвечает или не принимает токен."""
 
 
+def _http_detail(exc: BaseException) -> str:
+    """Достать HTTP-причину из ExceptionGroup, который поднимает MCP-клиент.
+
+    streamablehttp_client оборачивает ошибки запроса в anyio.TaskGroup, поэтому
+    наружу видно только «unhandled errors in a TaskGroup». Без распаковки
+    пользователь не отличит 401 (плохой токен) от обычного недоступного сервера.
+    """
+    try:
+        from httpx import HTTPStatusError
+    except ImportError:  # httpx — зависимость mcp, но клиент не должен падать без неё
+        return ""
+    seen: set[int] = set()
+    stack = [exc]
+    while stack:
+        cur = stack.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if isinstance(cur, HTTPStatusError):
+            code = cur.response.status_code
+            if code in (401, 403):
+                hint = "неверный или отозванный токен (PULSENET_CHAT_MCP_TOKEN)"
+            elif code == 503:
+                hint = "сервер памяти не настроен (нет PULSENET_MCP_TOKEN)"
+            else:
+                hint = f"HTTP {code}"
+            return f"HTTP {code}: {hint}"
+        stack.extend(getattr(cur, "exceptions", ()) or ())
+        if cur.__cause__ is not None:
+            stack.append(cur.__cause__)
+        if cur.__context__ is not None:
+            stack.append(cur.__context__)
+    return ""
+
+
 class MCPClient:
     def __init__(self, url: str, token: str, timeout: float = 30.0):
         self.url = url
@@ -42,7 +77,8 @@ class MCPClient:
             # Новый поток asyncio в каждом вызове: вызовы приходят из рабочих потоков чата.
             res = asyncio.run(asyncio.wait_for(run(), self.timeout))
         except Exception as exc:                  # noqa: BLE001
-            raise MemoryUnavailable(f"MCP-сервер памяти недоступен ({self.url}): {exc}") from exc
+            detail = _http_detail(exc) or str(exc)
+            raise MemoryUnavailable(f"MCP-сервер памяти недоступен ({self.url}): {detail}") from exc
         text = res.content[0].text if res.content else "{}"
         if getattr(res, "isError", False):
             raise MemoryUnavailable(text[:300])

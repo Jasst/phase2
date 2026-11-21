@@ -14,7 +14,7 @@ pytest.importorskip("mcp.server.fastmcp")
 
 from pulsenet import migrate_memory  # noqa: E402
 from pulsenet.app import App  # noqa: E402
-from pulsenet.mcp_client import MCPClient, MemoryUnavailable  # noqa: E402
+from pulsenet.mcp_client import MCPClient, MemoryUnavailable, _http_detail  # noqa: E402
 from pulsenet.triplex import TriplexMemory  # noqa: E402
 from pulsenet.triplex.encoder import HashEncoder  # noqa: E402
 from pulsenet.unified_mcp.server import Settings, create_app  # noqa: E402
@@ -161,3 +161,14 @@ def test_client_without_token_is_unavailable():
     client = MCPClient("http://127.0.0.1:9/mcp", "")
     with pytest.raises(MemoryUnavailable):
         client.call("triplex_stats")
+
+
+def test_http_error_is_unwrapped_from_taskgroup():
+    import httpx
+
+    request = httpx.Request("POST", "http://127.0.0.1:8010/mcp")
+    response = httpx.Response(401, request=request)
+    err = httpx.HTTPStatusError("401 Unauthorized", request=request, response=response)
+    group = ExceptionGroup("unhandled errors in a TaskGroup", [err])
+    detail = _http_detail(group)
+    assert "401" in detail and "токен" in detail
