@@ -4,7 +4,9 @@
 Сеть не нужна: MCP-клиент и генератор подменяются простыми объектами.
 """
 import json
+import urllib.error
 
+import pulsenet.llm as llm
 from pulsenet.app import ASSISTANT_PERSONA, App
 from pulsenet.mcp_client import MCPClient, _content_text
 from pulsenet.server import ChatJob
@@ -237,8 +239,9 @@ def test_chat_multistep_chain_runs_to_answer(tmp_path):
 
 
 def test_chat_stops_at_round_limit_with_text_answer(tmp_path):
-    call = '<tool_call>{"name": "memory_search", "arguments": {"query": "x"}}</tool_call>'
-    app = _app(tmp_path, [[call] for _ in range(9)])
+    scripts = [[f'<tool_call>{{"name": "memory_search", "arguments": {{"query": "x{i}"}}}}</tool_call>']
+               for i in range(9)]
+    app = _app(tmp_path, scripts)
     answer = app.chat("вопрос", "limit", lambda k, p: None)
     assert len(app.backend.seen) == app.limits["max_rounds"] + 1
     assert "лимит" in answer.lower()                  # пользователь не видит пустой ответ
@@ -252,6 +255,99 @@ def test_chat_reflection_on_tool_error(tmp_path):
     assert answer.endswith("без инструмента.")
     assert any("ошибку" in m["content"] for m in app.backend.seen[1]
                if m["role"] == "system")
+
+
+# ---------- нативный function calling (опция) ----------
+
+class NativeBackend(ScriptedBackend):
+    """Отдаёт tool_calls через on_delta и проверяет, что схемы переданы в запросе."""
+
+    def __init__(self, calls):
+        super().__init__([])
+        self.native_calls = calls
+        self.tools_seen = []
+        self.round = 0
+
+    def stream(self, model, messages, on_delta, cancelled, tools=None):
+        self.seen.append([dict(m) for m in messages])
+        self.tools_seen.append(tools)
+        if self.round == 0:
+            self.round += 1
+            on_delta("token", "Здесь проверю.")
+            on_delta("native_tool_calls", self.native_calls)
+        else:
+            on_delta("token", " Готово.")
+
+
+def test_native_tools_are_executed_and_returned_as_tool_messages(tmp_path):
+    app = _app(tmp_path, [], env={"TOOL_NATIVE": "1"})
+    app.backend = NativeBackend([{"id": "call_1", "name": "memory_search",
+                                  "arguments": {"query": "факт"}}])
+    events = []
+    answer = app.chat("вопрос", "native", lambda k, p: events.append((k, p)))
+    assert answer == "Здесь проверю. Готово."
+    assert app.backend.tools_seen[0] and app.backend.tools_seen[0][0]["type"] == "function"
+    assert any(t["function"]["name"] == "memory_search" for t in app.backend.tools_seen[0])
+    second = app.backend.seen[1]
+    assert any(m.get("role") == "tool" and m.get("tool_call_id") == "call_1" for m in second)
+    assert any(m.get("tool_calls") for m in second)          # ассистент объявил вызов
+    assert any(k == "tool" and p["status"] == "done" for k, p in events)
+
+
+def test_llm_retries_without_tools_on_http_400(monkeypatch):
+    bodies = []
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return iter([b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n', b"data: [DONE]\n\n"])
+
+    def fake_urlopen(req, timeout):
+        body = json.loads(req.data)
+        bodies.append(body)
+        if "tools" in body:
+            raise urllib.error.HTTPError(req.full_url, 400, "unsupported", {}, None)
+        return Resp()
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", fake_urlopen)
+    tokens = []
+    backend = llm.OpenAICompat()
+    backend.base_url = "http://fake/v1"
+    backend.stream("m", [], lambda kind, text: tokens.append(text), lambda: False,
+                   tools=[{"type": "function", "function": {"name": "x"}}])
+    assert len(bodies) == 2 and "tools" in bodies[0] and "tools" not in bodies[1]
+    assert tokens == ["ok"]
+
+
+def test_llm_parses_streamed_tool_calls(monkeypatch):
+    calls = []
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            chunk = (b'data: {"choices":[{"delta":{"tool_calls":['
+                     b'{"index":0,"id":"c1","function":{"name":"image_generate",'
+                     b'"arguments":"{\\"prompt\\":\\"a cat\\"}"}}]}}]}\n\n')
+            return iter([chunk, b"data: [DONE]\n\n"])
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", lambda req, timeout: Resp())
+    backend = llm.OpenAICompat()
+    backend.base_url = "http://fake/v1"
+    backend.stream("m", [], lambda kind, payload: calls.append((kind, payload)), lambda: False,
+                   tools=[{"type": "function", "function": {"name": "image_generate"}}])
+    native = [p for k, p in calls if k == "native_tool_calls"]
+    assert len(native) == 1 and native[0][0]["name"] == "image_generate"
+    assert native[0][0]["arguments"] == {"prompt": "a cat"}
 
 
 # ---------- SSE ----------
@@ -270,6 +366,7 @@ def test_job_streams_image_event_with_position():
 # ---------- память не сломана добавлением моста ----------
 
 def test_local_memory_still_works_without_mcp_bridge(tmp_path):
-    mem = TriplexMemory(str(tmp_path), encoder=HashEncoder(32))
+    mem = TriplexMemory(str(tmp_path), encoder=HashEncoder(32),
+                        extractor=lambda text: {"entities": [], "facts": []})
     doc = mem.ingest("тест", session_id="s", role="user")
     assert doc["status"] == "ok"

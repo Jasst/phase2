@@ -394,26 +394,45 @@ class App:
         seen_calls: Dict[str, str] = {}
         trace: List[str] = []
         stop_reason = "model_done"
+        # Нативный function calling — опция (TOOL_NATIVE=1). По умолчанию текстовый протокол:
+        # локальные 26B-модели часто не умеют tool_calls, а llm.py при HTTP 400 откатывается.
+        native_tools = None
+        if self.env.get("TOOL_NATIVE", "0") == "1" and names:
+            native_tools = [{"type": "function", "function": {
+                "name": n,
+                "description": (specs.get(n) or {}).get("description", ""),
+                "parameters": (specs.get(n) or {}).get("parameters") or {"type": "object", "properties": {}},
+            }} for n in names[:lim["native_max"]]]
 
         while True:
             flt = ToolCallFilter()
             step: List[str] = []
+            native: List[dict] = []
 
-            def delta(kind, text, flt=flt, step=step):
+            def delta(kind, text, flt=flt, step=step, native=native):
                 if kind == "token":
                     visible = flt.feed(text)
                     if visible:
                         step.append(visible)
                         emit_text(visible)
+                elif kind == "native_tool_calls":
+                    native.extend(text)
                 else:
                     on_delta(kind, text)
 
-            self.backend.stream(rel, messages, delta, cancelled=is_cancelled)
+            if native_tools:
+                self.backend.stream(rel, messages, delta, cancelled=is_cancelled, tools=native_tools)
+            else:
+                self.backend.stream(rel, messages, delta, cancelled=is_cancelled)
             tail = flt.finish()
             if tail:
                 step.append(tail)
                 emit_text(tail)
+            native_mode = bool(native and not flt.calls_raw)
             raw_calls = flt.calls_raw[:MAX_CALLS_PER_STEP]
+            if native_mode:
+                raw_calls = [json.dumps({"name": c["name"], "arguments": c["arguments"]},
+                                        ensure_ascii=False) for c in native[:MAX_CALLS_PER_STEP]]
 
             if is_cancelled():
                 stop_reason = "cancelled"
@@ -431,11 +450,20 @@ class App:
                 break
 
             rounds += 1
-            messages.append({"role": "assistant",
-                             "content": "".join(step) + "".join(f"<tool_call>{r}</tool_call>" for r in raw_calls)})
+            assistant = {"role": "assistant",
+                         "content": "".join(step) + "".join(f"<tool_call>{r}</tool_call>" for r in raw_calls)}
+            if native_mode:
+                assistant["tool_calls"] = []
+                for i, c in enumerate(native[:MAX_CALLS_PER_STEP]):
+                    tid = c.get("id") or ("call_" + uuid.uuid4().hex[:8])
+                    c["id"] = tid
+                    assistant["tool_calls"].append({"id": tid, "type": "function", "function": {
+                        "name": c["name"], "arguments": json.dumps(c["arguments"], ensure_ascii=False)}})
+            messages.append(assistant)
             blocks: List[str] = []
+            native_msgs: List[dict] = []
             had_error = False
-            for call in parse_calls(raw_calls):
+            for idx, call in enumerate(parse_calls(raw_calls)):
                 if calls_used >= max_calls:
                     break
                 name = call.get("name") or "?"
@@ -466,16 +494,25 @@ class App:
                     had_error = True
                 trace.append(f"{name}{'✓' if out.ok else '✕'}")
                 blocks.append(tool_result_block(name, out.text, lim["result_chars"]))
+                if native_mode and idx < len(native):
+                    native_msgs.append({"role": "tool", "tool_call_id": native[idx].get("id") or "",
+                                        "content": out.text[:lim["result_chars"]]})
 
             if had_error and reflection > 0:
                 reflection -= 1
                 messages.append({"role": "system", "content": (
                     "Инструмент вернул ошибку. Измени аргументы, выбери другой инструмент "
                     "или ответь по уже собранным данным — не выдумывай результат.")})
-            last = "\n".join(blocks)
-            if rounds >= max_rounds or calls_used >= max_calls:
-                last += "\n\nЭто последний раунд вызовов: дай итоговый ответ по собранным результатам."
-            messages.append({"role": "user", "content": last})
+            final_hint = "Это последний раунд вызовов: дай итоговый ответ по собранным результатам."
+            if native_mode:
+                messages.extend(native_msgs)
+                if rounds >= max_rounds or calls_used >= max_calls:
+                    messages.append({"role": "user", "content": final_hint})
+            else:
+                last = "\n".join(blocks)
+                if rounds >= max_rounds or calls_used >= max_calls:
+                    last += "\n\n" + final_hint
+                messages.append({"role": "user", "content": last})
 
             if failures >= 4:
                 stop_reason = "failures"
@@ -492,11 +529,12 @@ class App:
                 emit_text(fallback)
                 answer = "".join(parts).strip()
         if answer:
-            self._append_history(chat_id, "user", message)
+            # Компактный след кладём в реплику пользователя: следующий ход знает,
+            # что уже сделано, и в истории не появляется два ассистента подряд.
+            saved_user = message
             if trace:
-                # Компактный след в истории: следующий ход знает, что уже сделано.
-                self._append_history(chat_id, "assistant",
-                                     "[инструменты: " + ", ".join(trace[:12]) + f"] ({stop_reason})")
+                saved_user += (f"\n[инструменты: {', '.join(trace[:12])}] ({stop_reason})")
+            self._append_history(chat_id, "user", saved_user)
             self._append_history(chat_id, "assistant", answer)
         # Команда /remember уже поставила текст в очередь индексации; обычное сообщение — тоже в очередь.
         if cmd is None:

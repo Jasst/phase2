@@ -13,6 +13,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from typing import Dict
 
 LLAMACPP_PORT_DEFAULT = 8090
 LMSTUDIO_URL_DEFAULT = "http://localhost:1234/v1"
@@ -103,20 +104,32 @@ class OpenAICompat:
     base_url = ""
     name = ""
 
-    def stream(self, model, messages, on_delta, cancelled, temperature=0.7, max_tokens=1024):
-        """on_delta(kind, text): kind — 'token' (ответ) или 'reasoning' (рассуждения)."""
+    def stream(self, model, messages, on_delta, cancelled, temperature=0.7, max_tokens=1024,
+               tools=None):
+        """on_delta(kind, payload): 'token'/'reasoning' — текст, 'native_tool_calls' — список вызовов.
+
+        tools — схемы в формате OpenAI. Если сервер не поддерживает function calling (HTTP 400),
+        запрос повторяется без tools: чат continues на текстовом протоколе <tool_call>.
+        """
         body = {"model": model, "messages": messages, "stream": True,
                 "temperature": temperature, "max_tokens": max_tokens}
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
         req = urllib.request.Request(self.base_url + "/chat/completions",
                                      data=json.dumps(body).encode("utf-8"),
                                      headers={"Content-Type": "application/json"}, method="POST")
         try:
             resp = urllib.request.urlopen(req, timeout=600)
         except urllib.error.HTTPError as exc:        # сервер ответил, но с ошибкой
+            if exc.code == 400 and tools:
+                return self.stream(model, messages, on_delta, cancelled,
+                                   temperature, max_tokens, tools=None)
             raise BackendError(f"{self.name} ответил ошибкой {exc.code}: {_error_detail(exc)}") from exc
         except OSError as exc:                       # сервер не отвечает вовсе
             raise BackendError(f"нет связи с LLM ({self.name}): {exc}") from exc
         splitter = ThinkSplitter()
+        calls: Dict[int, dict] = {}
         with resp:
             for raw in resp:
                 if cancelled():
@@ -138,8 +151,29 @@ class OpenAICompat:
                 if delta.get("content"):
                     for kind, text in splitter.feed(delta["content"]):
                         on_delta(kind, text)
+                for tc in (delta.get("tool_calls") or []):
+                    i = int(tc.get("index") or 0)
+                    cur = calls.setdefault(i, {"id": "", "name": "", "arguments": ""})
+                    if tc.get("id"):
+                        cur["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        cur["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        cur["arguments"] += fn["arguments"]
         for kind, text in splitter.flush():
             on_delta(kind, text)
+        if calls:
+            parsed = []
+            for cur in calls.values():
+                try:
+                    args = json.loads(cur["arguments"] or "{}")
+                except ValueError:
+                    args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                parsed.append({"id": cur["id"] or "", "name": cur["name"], "arguments": args})
+            on_delta("native_tool_calls", parsed)
 
 
 class LMStudioBackend(OpenAICompat):
