@@ -6,6 +6,7 @@ data/
 *.pyc
 *.xml
 /data_unified
+/logs
 *.key
 chats.sqlite*
 tokens.sqlite*

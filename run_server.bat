@@ -27,6 +27,7 @@ if "%MODE%"=="stop" (
 rem ---- start: сначала полная остановка старых процессов, потом запуск ----
 call :stop_python
 call :start_docker
+call :start_image
 goto :run_python
 
 :stop_python
@@ -41,6 +42,15 @@ if errorlevel 1 (
     echo [docker] Warning: docker compose down failed or docker unavailable.
 ) else (
     echo [docker] Services stopped.
+)
+exit /b 0
+
+:start_image
+rem ---- локальный EasyDiffusion для MCP-инструмента image_generate ----
+echo [image] Starting EasyDiffusion (autostart from .env)...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_easydiffusion.ps1"
+if errorlevel 1 (
+    echo [image] Warning: EasyDiffusion not started. image_generate will use the fallback backend.
 )
 exit /b 0
 
