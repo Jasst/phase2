@@ -1,22 +1,28 @@
 # -*- coding: utf-8 -*-
-"""Инструменты чата: память и интернет. Те же операции, что у MCP-сервера pulsenet-unified
-(triplex_search, web_search, web_fetch), но исполняются внутри приложения.
+"""Инструменты чата: локальные (память, интернет) и MCP-инструменты pulsenet-unified
+(triplex_*, web_*, image_generate, activity_recent).
 
-Каждый инструмент описан JSON-схемой в SPECS. Модель вызывает их текстовым протоколом
+Каждый инструмент описан JSON-схемой. Модель вызывает их текстовым протоколом
 (см. toolcalls.py); результат для модели — короткий читаемый текст с номерами источников,
-а для интерфейса — подпись и список источников.
+а для интерфейса — подпись, источники и (для image_generate) вложение с картинкой.
+
+Раньше здесь было только 4 захардкоженных имени — из-за этого модель не знала про
+image_generate и отвечала «я текстовая нейросеть». Теперь каталог собирается динамически:
+локальные инструменты + инструменты, обнаруженные через MCP list_tools().
 """
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
-from .toolcalls import COMMANDS
+from .toolcalls import COMMANDS, agent_limits
 
 MEMORY_TOOLS = ("memory_search", "memory_remember")
 WEB_TOOLS = ("web_search", "web_fetch")
+IMAGE_TOOL = "image_generate"
 
 SPECS: Dict[str, dict] = {
     "memory_search": {
@@ -44,6 +50,21 @@ SPECS: Dict[str, dict] = {
         "parameters": {"type": "object", "properties": {"url": {"type": "string"}},
                        "required": ["url"]},
     },
+    IMAGE_TOOL: {
+        "description": "Создать изображение по текстовому описанию. Локальный EasyDiffusion, "
+                       "при недоступности — онлайн-бэкенд. Картинка сразу приходит в чат вложением; "
+                       "промпт формулируй сам(а), улучшаторы не нужны.",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "prompt": {"type": "string", "description": "Описание изображения"},
+                           "width": {"type": "integer", "minimum": 64, "maximum": 1536},
+                           "height": {"type": "integer", "minimum": 64, "maximum": 1536},
+                           "steps": {"type": "integer", "minimum": 1, "maximum": 60},
+                           "seed": {"type": "integer"},
+                           "negative_prompt": {"type": "string"},
+                       },
+                       "required": ["prompt"]},
+    },
 }
 
 
@@ -54,6 +75,7 @@ class Outcome:
     label: str                     # короткая подпись для интерфейса
     detail: str = ""
     sources: List[dict] = field(default_factory=list)
+    image: Optional[dict] = None   # вложение для SSE-события image (только image_generate)
 
 
 def _clip(value: Any, n: int) -> str:
@@ -85,12 +107,23 @@ class ChatTools:
     """Набор инструментов на один ход чата. Нумерация источников сквозная внутри хода."""
 
     def __init__(self, recall: Callable[[str, int], dict], remember: Callable[[str], dict],
-                 web: Any = None):
+                 web: Any = None, mcp_call: Optional[Callable] = None,
+                 mcp_specs: Optional[Dict[str, dict]] = None):
         self._recall = recall
         self._remember = remember
         # web: None — взять модуль веб-поиска автоматически; False — веб выключен (тесты, без сети)
         self._web = _web_module() if web is None else (web or None)
         self._src_n = 0
+        # mcp_call(name, args, timeout) — мост к pulsenet-unified. mcp_specs — имена и схемы,
+        # полученные через list_tools(); если их нет, всё равно предлагаем image_generate.
+        self._mcp_call = mcp_call
+        self._mcp_specs: Dict[str, dict] = dict(mcp_specs or {})
+        # image_generate — ядро: предлагаем его даже если discovery не вернул схемы.
+        if mcp_call is not None and IMAGE_TOOL not in self._mcp_specs:
+            self._mcp_specs[IMAGE_TOOL] = {"mcp_name": IMAGE_TOOL,
+                                            "description": SPECS[IMAGE_TOOL]["description"],
+                                            "parameters": SPECS[IMAGE_TOOL]["parameters"],
+                                            "timeout": agent_limits()["image_timeout"]}
 
     # ---------- каталог ----------
 
@@ -98,10 +131,26 @@ class ChatTools:
         names: List[str] = list(MEMORY_TOOLS) if memory else []
         if web and self._web is not None:
             names += list(WEB_TOOLS)
+        if self._mcp_call is not None:
+            names += [n for n in self._mcp_specs if n not in names]
         return names
+
+    def specs(self, names: List[str]) -> Dict[str, dict]:
+        """Схемы для выбранных имён: локальные из SPECS, MCP-инструменты — из list_tools()."""
+        out = {}
+        for n in names:
+            spec = self._mcp_specs.get(n)
+            if spec is not None:
+                out[n] = {"description": spec.get("description", ""),
+                          "parameters": spec.get("parameters") or {"type": "object", "properties": {}}}
+            elif n in SPECS:
+                out[n] = {"description": SPECS[n]["description"], "parameters": SPECS[n]["parameters"]}
+        return out
 
     def describe(self, name: str, args: dict) -> str:
         """Подпись до выполнения — показывается в интерфейсе, пока инструмент работает."""
+        if name == IMAGE_TOOL:
+            return f"Рисую: «{_clip(args.get('prompt'), 50)}»"
         if name == "memory_search":
             return f"Память: «{_clip(args.get('query'), 50)}»"
         if name == "memory_remember":
@@ -112,6 +161,8 @@ class ChatTools:
             return f"Веб-поиск: «{_clip(first, 50)}»"
         if name == "web_fetch":
             return f"Открываю: {_clip(urlparse(_str(args.get('url'))).netloc or args.get('url'), 60)}"
+        if name in self._mcp_specs:
+            return f"{name}: {_clip(json.dumps(args, ensure_ascii=False), 60)}"
         return name
 
     # ---------- исполнение ----------
@@ -128,10 +179,54 @@ class ChatTools:
                 return self._web_search(args)
             if name == "web_fetch":
                 return self._web_fetch(args)
+            if name in self._mcp_specs and self._mcp_call is not None:
+                return self._run_mcp(name, args)
             return Outcome(False, f"Неизвестный инструмент: {name}", label="Инструмент", detail=name)
         except Exception as exc:                         # noqa: BLE001
             return Outcome(False, f"Ошибка инструмента {name}: {exc}", label="Ошибка инструмента",
                            detail=_clip(exc, 120))
+
+    # ---------- MCP-инструменты ----------
+
+    def _run_mcp(self, name: str, args: dict) -> Outcome:
+        spec = self._mcp_specs[name]
+        mcp_name = spec.get("mcp_name") or name
+        timeout = spec.get("timeout")
+        if name == IMAGE_TOOL and timeout is None:
+            timeout = agent_limits()["image_timeout"]
+        if name == IMAGE_TOOL:
+            prompt = _str(args.get("prompt"))
+            if not prompt:
+                return Outcome(False, "Пустой prompt.", label="Изображение", detail="пустой prompt")
+            call_args = {k: v for k, v in args.items() if k in SPECS[IMAGE_TOOL]["parameters"]["properties"]}
+            call_args["prompt"] = prompt
+            # Картинку доставляем отдельным SSE-событием: двойная отправка (image block + JSON)
+            # и 500 КБ base64 в контексте модели ни к чему.
+            call_args["return_image"] = False
+            data = self._mcp_call(mcp_name, call_args, timeout)
+            if not isinstance(data, dict) or data.get("status") != "ok":
+                msg = (data or {}).get("message", "неизвестная ошибка") if isinstance(data, dict) else str(data)
+                return Outcome(False, f"Не удалось создать изображение: {_clip(msg, 300)}",
+                               label="Изображение", detail=_clip(msg, 120))
+            image = {
+                "url": _str(data.get("url")),
+                "mime": "image/png",
+                "seed": data.get("seed"),
+                "backend": _str(data.get("backend")),
+                "width": data.get("width"), "height": data.get("height"),
+                "prompt": _str(data.get("prompt")), "bytes": data.get("bytes"),
+            }
+            # Модели отдаём короткий факт, а не URL: иначе она выведет ссылку текстом,
+            # и картинка нарисуется дважды.
+            text = (f"Изображение создано и уже показано пользователю выше. "
+                    f"Размер {image['width']}×{image['height']}, backend {image['backend']}, "
+                    f"seed {image['seed']}. Кратко опиши результат; не выводи URL и не советуй "
+                    f"другие сервисы генерации.")
+            return Outcome(True, text, label=f"Изображение: «{_clip(prompt, 40)}»",
+                           detail=f"{image['backend']}, {image['bytes']} байт", image=image)
+        data = self._mcp_call(mcp_name, args, timeout)
+        text = json.dumps(data, ensure_ascii=False) if not isinstance(data, str) else data
+        return Outcome(True, text, label=name, detail=_clip(text, 120))
 
     def _memory_search(self, args: dict) -> Outcome:
         query = _str(args.get("query"))
@@ -209,23 +304,27 @@ class ChatTools:
                        detail=f"символов: {len(res.get('text', ''))}", sources=[source])
 
 
-def instructions(names: List[str]) -> str:
+def instructions(names: List[str], specs: Optional[Dict[str, dict]] = None) -> str:
     """Системная инструкция по протоколу вызова. Пустая строка, если инструментов нет."""
     if not names:
         return ""
+    specs = specs or SPECS
     lines = [
         "Инструменты. Чтобы вызвать инструмент, напиши ровно один блок вида:",
         '<tool_call>{"name": "имя", "arguments": {...}}</tool_call>',
         "и сразу остановись. Система выполнит вызов и пришлёт результат в теге <tool_result>. "
         "Вызывай инструмент, только если без него нельзя ответить точно или пользователь просит "
-        "поиск, страницу или память. Результаты инструментов не выдумывай. Отвечая по источникам, "
-        "ставь их номера [n] из результата.",
+        "поиск, страницу, память или изображение. Результаты инструментов не выдумывай. "
+        "Отвечая по источникам, ставь их номера [n] из результата. "
+        "Если инструмент вернул ошибку — измени аргументы или выбери другой инструмент, а не выдумывай ответ.",
         "Доступно:",
     ]
     for n in names:
-        spec = SPECS[n]
-        props = ", ".join(spec["parameters"]["properties"].keys())
-        lines.append(f"- {n}({props}) — {spec['description']}")
+        spec = specs.get(n) or SPECS.get(n)
+        if not spec:
+            continue
+        props = ", ".join((spec.get("parameters") or {}).get("properties", {}).keys())
+        lines.append(f"- {n}({props}) — {spec.get('description', '')}")
     return "\n".join(lines)
 
 

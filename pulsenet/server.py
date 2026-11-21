@@ -18,7 +18,7 @@
        /auth/reset/confirm     восстановление пароля по коду из письма
   GET  /api/status             бэкенд, память, журнал ошибок (требует входа)
   GET  /api/models             модели бэкенда
-  POST /api/chat               чат, поток SSE: token | reasoning | tool | sources | done | error
+  POST /api/chat               чат, поток SSE: token | reasoning | tool | sources | image | done | error
                                тело: {message, chat_id, web, model} — web разрешает веб-инструменты,
                                model выбирает модель для ответа (пусто — по умолчанию)
   GET  /api/chat/stream        продолжить поток после перезагрузки / с другого устройства
@@ -104,7 +104,7 @@ class ChatJob:
         with self._lock:
             if kind == "reasoning":
                 self.reasoning += payload
-            elif kind in ("tool", "sources"):
+            elif kind in ("tool", "sources", "image"):
                 self.events.append({"kind": kind, "data": payload, "at": len(self.text)})
             else:
                 self.text += payload
@@ -208,13 +208,15 @@ class ChatJobs:
         if job.assistant_msg_id:
             snap = job.snapshot()
             tools = [ev["data"] for ev in snap["events"] if ev["kind"] == "tool"]
-            sources = []
+            sources, images = [], []
             for ev in snap["events"]:
                 if ev["kind"] == "sources" and isinstance(ev["data"], list):
                     sources.extend(ev["data"])
+                elif ev["kind"] == "image" and isinstance(ev["data"], dict):
+                    images.append(ev["data"])
             msg = {"id": job.assistant_msg_id, "role": "assistant",
                    "text": snap["answer"] or snap["text"], "reasoning": snap["reasoning"],
-                   "time": time.time(), "tools": tools, "sources": sources,
+                   "time": time.time(), "tools": tools, "sources": sources, "images": images,
                    "indexPending": snap["index_pending"]}
             if snap["error"]:
                 msg["error"] = snap["error"]

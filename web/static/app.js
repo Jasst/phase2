@@ -552,7 +552,7 @@
       }
       if (!bot) {
         bot = { id: j.assistant_msg_id || newId(), role: 'assistant', text: '', reasoning: '',
-                time: Date.now(), pending: true, tools: [], sources: [] };
+                time: Date.now(), pending: true, tools: [], sources: [], images: [] };
         const userIdx = j.user_msg_id ? list.findIndex((m) => m && m.id === j.user_msg_id) : -1;
         if (userIdx >= 0) { list.splice(userIdx + 1, 0, bot); idx = userIdx + 1; }
         else { list.push(bot); idx = list.length - 1; }
@@ -568,6 +568,7 @@
         if (typeof ev.reasoning === 'string') { bot.reasoning += ev.reasoning; schedulePaint(bot, idx); }
         if (ev.tool) { upsertTool(bot, ev.tool); schedulePaint(bot, idx); }
         if (Array.isArray(ev.sources)) { addSources(bot, ev.sources); schedulePaint(bot, idx); }
+        if (ev.image) { addImage(bot, ev.image); schedulePaint(bot, idx); }
         if (ev.error) bot.error = String(ev.error);
         if (ev.done) {
           if (!bot.text && ev.done.answer) bot.text = ev.done.answer;
@@ -878,6 +879,28 @@
       bubble.appendChild(md);
       if (!live) decorate(md);
     }
+    if (isBot && Array.isArray(m.images) && m.images.length) {
+      const gallery = el('div', 'image-attachments');
+      for (const img of m.images) {
+        const fig = el('figure', 'image-attachment');
+        const a = el('a', 'image-link');
+        a.href = img.url;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        const pic = el('img', 'attachment');
+        pic.src = img.url;
+        pic.alt = (img.prompt || 'Сгенерированное изображение').slice(0, 160);
+        pic.loading = 'lazy';
+        a.appendChild(pic);
+        fig.appendChild(a);
+        if (img.seed !== undefined && img.seed !== null) {
+          fig.appendChild(el('figcaption', 'image-meta',
+            (img.backend ? img.backend + ' · ' : '') + 'seed ' + img.seed));
+        }
+        gallery.appendChild(fig);
+      }
+      bubble.appendChild(gallery);
+    }
     if (isBot && Array.isArray(m.sources) && m.sources.length) {
       const box = el('div', 'sources');
       box.appendChild(el('div', 'sources-title', 'Источники'));
@@ -995,6 +1018,12 @@
       if (!bot.sources.some((x) => x.url === s.url)) bot.sources.push({ ...s });
     }
   }
+  function addImage(bot, img) {
+    if (!img || typeof img.url !== 'string' || !img.url) return;
+    if (!Array.isArray(bot.images)) bot.images = [];
+    if (bot.images.some((x) => x.url === img.url)) return;
+    bot.images.push({ ...img });
+  }
 
   async function streamChat(body, onEvent, signal, path, method) {
     const url = path || '/api/chat';
@@ -1069,7 +1098,7 @@
       s.title = text.replace(/\s+/g, ' ').slice(0, 48);
     }
     const user = reuse ? reuse.user : { id: newId(), role: 'user', text, time: Date.now() };
-    const bot = reuse ? reuse.bot : { id: newId(), role: 'assistant', text: '', reasoning: '', time: Date.now(), pending: true, tools: [], sources: [] };
+    const bot = reuse ? reuse.bot : { id: newId(), role: 'assistant', text: '', reasoning: '', time: Date.now(), pending: true, tools: [], sources: [], images: [] };
     if (reuse) {
       // Перегенерация переиспользует id: сервер перезапишет прежний ответ,
       // а не сохранит его второй копией.
@@ -1111,6 +1140,7 @@
         if (typeof ev.reasoning === 'string') { bot.reasoning += ev.reasoning; schedulePaint(bot, botIdx); }
         if (ev.tool) { upsertTool(bot, ev.tool); schedulePaint(bot, botIdx); }
         if (Array.isArray(ev.sources)) { addSources(bot, ev.sources); schedulePaint(bot, botIdx); }
+        if (ev.image) { addImage(bot, ev.image); schedulePaint(bot, botIdx); }
         if (ev.error) { bot.error = String(ev.error); bot.pending = false; }
         if (ev.done) {
           if (!bot.text && ev.done.answer) bot.text = ev.done.answer;

@@ -22,14 +22,24 @@ from .mcp_client import MCPClient, MemoryUnavailable, RemoteMemory
 from .memory_service import build_encoder
 from .triplex import TriplexMemory, make_extractor, openai_chat_caller
 from .triplex import sleep
-from .toolcalls import (COMMANDS, MAX_CALLS_PER_STEP, MAX_STEPS, ToolCallFilter, parse_calls,
-                         parse_command, tool_result_block)
+from .toolcalls import (COMMANDS, MAX_CALLS_PER_STEP, ToolCallFilter, agent_limits,
+                         parse_calls, parse_command, tool_result_block)
 from .tools import ChatTools, Outcome, catalog, instructions
 
 CONTEXT_TURNS = 8
 ERROR_LOG_SIZE = 50
 MEMORY_RETRIES = 12          # индексация ждёт недоступный MCP: 12 попыток
 MEMORY_RETRY_SECONDS = 5.0
+
+# Персона явно сообщает модели про инструменты. Без неё локальная модель отвечает
+# «я текстовая нейросеть и не могу отправить картинку», хотя image_generate подключён.
+ASSISTANT_PERSONA = (
+    "Ты — ассистент ТРИПЛЕКСИИ. У тебя есть инструменты MCP-сервера pulsenet-unified, "
+    "включая image_generate. Если пользователь просит изображение, картинку, рисунок или иллюстрацию — "
+    "вызови image_generate и отправь результат. Не говори, что ты «текстовая нейросеть», не проси "
+    "вставить промпт в Midjourney/DALL·E и не советуй другие сервисы: ты можешь создать изображение сам(а). "
+    "Для поиска фактов и свежих данных используй доступные инструменты, а не догадки."
+)
 
 
 def _parse_json_loose(raw: str) -> dict:
@@ -63,6 +73,15 @@ class App:
         self.embed_server = None
         self.embed_model = ""
         self.active_model = ""       # модель последнего ответа: экстракция идёт ею же, без второй загрузки
+        self.limits = agent_limits(self.env)
+        # Один клиент на все MCP-вызовы: память, каталог инструментов и генерация картинок.
+        # Объект не подключается до первого вызова, поэтому его можно создавать всегда.
+        self._mcp = MCPClient(
+            (self.env.get("PULSENET_MCP_URL") or "http://127.0.0.1:8010/mcp").strip(),
+            (self.env.get("PULSENET_CHAT_MCP_TOKEN") or "").strip())
+        self.mcp_tools_enabled = (bool(self._mcp.token) and
+                                  self.env.get("PULSENET_CHAT_TOOLS", "1") != "0")
+        self._mcp_specs_cache: Optional[Dict[str, dict]] = None
         # local — свой журнал в data_dir (как раньше); mcp — память у MCP-сервера pulsenet-unified,
         # общая для всех ваших агентов. Значение по умолчанию local: без .env поведение прежнее.
         self.memory_backend = (self.env.get("PULSENET_MEMORY") or "local").strip().lower()
@@ -114,9 +133,61 @@ class App:
         return encoder
 
     def _make_remote_memory(self) -> RemoteMemory:
-        url = (self.env.get("PULSENET_MCP_URL") or "http://127.0.0.1:8010/mcp").strip()
-        token = (self.env.get("PULSENET_CHAT_MCP_TOKEN") or "").strip()
-        return RemoteMemory(MCPClient(url, token))
+        return RemoteMemory(self._mcp)
+
+    # ---------- MCP-инструменты (динамический каталог) ----------
+
+    def _mcp_tool_call(self, name: str, args: dict, timeout=None):
+        """Вызов MCP-инструмента. image_generate ждёт дольше обычного (рендер на GPU)."""
+        if timeout is None and name == "image_generate":
+            timeout = self.limits["image_timeout"]
+        return self._mcp.call(name, args, timeout=timeout)
+
+    def _mcp_tool_specs(self) -> Dict[str, dict]:
+        """Каталог MCP-инструментов для модели: image_generate + discovery через list_tools().
+
+        Ошибка discovery не отключает инструменты: базовая схема image_generate всё равно
+        остаётся в промпте. Кэш живёт до перезапуска процесса — list_tools не дёргаем каждый ход.
+        """
+        if not self.mcp_tools_enabled:
+            return {}
+        if self._mcp_specs_cache is not None:
+            return self._mcp_specs_cache
+        specs: Dict[str, dict] = {}
+        try:
+            discovered = self._mcp.list_tools()
+        except Exception as exc:                  # noqa: BLE001 — сервер может быть выключен
+            self.log_error("обнаружение MCP-инструментов", exc)
+            discovered = []
+        # image_generate — ядро: доступен даже если list_tools не удался.
+        from .tools import SPECS  # локальный импорт, чтобы не было цикла
+        specs["image_generate"] = {"mcp_name": "image_generate",
+                                   "description": SPECS["image_generate"]["description"],
+                                   "parameters": SPECS["image_generate"]["parameters"],
+                                   "timeout": self.limits["image_timeout"]}
+        priority = ("triplex_search", "triplex_facts", "triplex_graph", "activity_recent",
+                    "web_search", "web_fetch", "pulsenet_guide", "whoami")
+        local = {"memory_search", "memory_remember", "web_search", "web_fetch"}
+        ordered = []
+        by_name = {t["name"]: t for t in discovered}
+        for n in priority:
+            if n in by_name and n not in local and n not in ordered:
+                ordered.append(n)
+        for t in discovered:
+            n = t["name"]
+            if n not in local and n not in ordered and n != "image_generate":
+                ordered.append(n)
+        # Не вываливаем все 27 схем в локальную модель: ограничиваем топ лимитом.
+        room = max(0, self.limits["native_max"] - len(specs))
+        for n in ordered[:room]:
+            if n.startswith("code_"):       # доступ к коду — только по явному разрешению сервера
+                continue
+            t = by_name[n]
+            shown = "mcp__" + n if n in local else n
+            specs[shown] = {"mcp_name": n, "description": (t.get("description") or "")[:300],
+                            "parameters": t.get("inputSchema") or {"type": "object", "properties": {}}}
+        self._mcp_specs_cache = specs
+        return specs
 
     def _make_memory(self, data_dir: str) -> TriplexMemory:
         encoder = self._make_encoder(data_dir)
@@ -229,6 +300,9 @@ class App:
                           "label": out.label, "detail": out.detail})
         if out.sources:
             on_delta("sources", out.sources)
+        if out.image:
+            # Картинка уходит отдельным SSE-событием; в.tool_trace остаётся только подпись.
+            on_delta("image", out.image)
         return out
 
     def _run_command(self, name: str, arg: str, tools: ChatTools, on_delta, chat_id: str) -> dict:
@@ -268,9 +342,14 @@ class App:
         def is_cancelled() -> bool:
             return bool(cancelled and cancelled()) or self.stop_flag
 
+        # Инструменты: локальные + динамический каталог MCP (image_generate, triplex_*, ...).
+        mcp_specs = self._mcp_tool_specs()
         tools = ChatTools(recall=self._tool_recall,
-                          remember=lambda text: self._tool_remember(text, chat_id))
+                          remember=lambda text: self._tool_remember(text, chat_id),
+                          mcp_call=self._mcp_tool_call if self.mcp_tools_enabled else None,
+                          mcp_specs=mcp_specs)
         names = tools.available(web=web, memory=self.memory_enabled)
+        specs = tools.specs(names)
         parts: List[str] = []
 
         def emit_text(text: str) -> None:
@@ -287,13 +366,13 @@ class App:
                 return result["reply"]
             user_text, note = result["user"], result["note"]
 
-        # 2) контекст: память по вопросу + инструкция по инструментам
-        system = []
+        # 2) контекст: персона + память по вопросу + инструкция по инструментам
+        system = [ASSISTANT_PERSONA]
         mem = self.memory_context(user_text)
         if mem:
             system.append(mem)
         if names:
-            system.append(instructions(names))
+            system.append(instructions(names, specs))
         messages: List[dict] = [{"role": "system", "content": "\n\n".join(system)}] if system else []
         messages += self._history(chat_id)
         content = user_text + ("\n\n" + note if note else "")
@@ -304,8 +383,18 @@ class App:
             rel = self.backend.ensure(target) or target or "local"
             self.active_model = rel      # экстрактор/индексация используют ту же модель, не грузят вторую
 
-        # 3) агентный цикл: модель → (вызовы инструментов → результаты) → модель ...
-        steps = 0
+        # 3) агентный цикл: запрос → инструменты → реакт → инструменты → ... → ответ.
+        # Лимиты из env; один вызов инструмента не занимает больше result_chars контекста.
+        lim = self.limits
+        max_rounds = lim["max_rounds"]
+        hard_cap = lim["hard_cap"]
+        max_calls = lim["max_calls"]
+        reflection = lim["reflection_budget"]
+        rounds = calls_used = failures = stuck = 0
+        seen_calls: Dict[str, str] = {}
+        trace: List[str] = []
+        stop_reason = "model_done"
+
         while True:
             flt = ToolCallFilter()
             step: List[str] = []
@@ -325,15 +414,41 @@ class App:
                 step.append(tail)
                 emit_text(tail)
             raw_calls = flt.calls_raw[:MAX_CALLS_PER_STEP]
-            if not raw_calls or steps >= MAX_STEPS or is_cancelled():
+
+            if is_cancelled():
+                stop_reason = "cancelled"
                 break
-            steps += 1
+            if not raw_calls:
+                stop_reason = "model_done"
+                break
+            # Проверяем лимит ПОСЛЕ стриминга: модель уже успела дать видимый текст,
+            # поэтому на последнем раунде пользователь всё равно получит ответ.
+            if rounds >= min(max_rounds, hard_cap) or calls_used >= max_calls:
+                if stuck >= 2:
+                    stop_reason = "no_progress"
+                else:
+                    stop_reason = "round_limit" if rounds >= min(max_rounds, hard_cap) else "call_limit"
+                break
+
+            rounds += 1
             messages.append({"role": "assistant",
                              "content": "".join(step) + "".join(f"<tool_call>{r}</tool_call>" for r in raw_calls)})
-            blocks = []
+            blocks: List[str] = []
+            had_error = False
             for call in parse_calls(raw_calls):
+                if calls_used >= max_calls:
+                    break
                 name = call.get("name") or "?"
-                if call.get("error"):
+                args = call.get("arguments") or {}
+                signature = name + ":" + json.dumps(args, sort_keys=True, ensure_ascii=False)
+                if signature in seen_calls:
+                    # Повтор того же вывода: не перевызываем дорогой инструмент (особенно генерацию).
+                    stuck += 1
+                    out = Outcome(True, seen_calls[signature], label=tools.describe(name, args),
+                                  detail="результат из кэша")
+                    on_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "done",
+                                      "label": out.label, "detail": out.detail})
+                elif call.get("error"):
                     out = Outcome(False, call["error"], label="Инструмент", detail=call["error"])
                     on_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "error",
                                       "label": "Ошибка вызова", "detail": call["error"]})
@@ -343,13 +458,45 @@ class App:
                     on_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "error",
                                       "label": f"Нет инструмента: {name}", "detail": ""})
                 else:
-                    out = self._call_tool(tools, name, call.get("arguments") or {}, on_delta)
-                blocks.append(tool_result_block(name, out.text))
-            messages.append({"role": "user", "content": "\n".join(blocks)})
+                    out = self._call_tool(tools, name, args, on_delta)
+                    seen_calls[signature] = out.text
+                calls_used += 1
+                if not out.ok:
+                    failures += 1
+                    had_error = True
+                trace.append(f"{name}{'✓' if out.ok else '✕'}")
+                blocks.append(tool_result_block(name, out.text, lim["result_chars"]))
+
+            if had_error and reflection > 0:
+                reflection -= 1
+                messages.append({"role": "system", "content": (
+                    "Инструмент вернул ошибку. Измени аргументы, выбери другой инструмент "
+                    "или ответь по уже собранным данным — не выдумывай результат.")})
+            last = "\n".join(blocks)
+            if rounds >= max_rounds or calls_used >= max_calls:
+                last += "\n\nЭто последний раунд вызовов: дай итоговый ответ по собранным результатам."
+            messages.append({"role": "user", "content": last})
+
+            if failures >= 4:
+                stop_reason = "failures"
+                break
 
         answer = "".join(parts).strip()
+        if not answer:
+            fallback = {"round_limit": "Достигнут лимит шагов — отвечаю по собранным данным.",
+                        "call_limit": "Достигнут лимит вызовов инструментов — отвечаю по собранным данным.",
+                        "failures": "Инструменты не справились — отвечаю по собранным данным.",
+                        "no_progress": "Отвечаю по собранным данным.",
+                        "cancelled": "Ответ остановлен."}.get(stop_reason)
+            if fallback:
+                emit_text(fallback)
+                answer = "".join(parts).strip()
         if answer:
             self._append_history(chat_id, "user", message)
+            if trace:
+                # Компактный след в истории: следующий ход знает, что уже сделано.
+                self._append_history(chat_id, "assistant",
+                                     "[инструменты: " + ", ".join(trace[:12]) + f"] ({stop_reason})")
             self._append_history(chat_id, "assistant", answer)
         # Команда /remember уже поставила текст в очередь индексации; обычное сообщение — тоже в очередь.
         if cmd is None:

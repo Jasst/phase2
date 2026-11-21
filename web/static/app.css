@@ -702,6 +702,14 @@ body.compact .welcome { padding: 16px 8px; }
 .src { font-size: 13px; color: var(--accent-hover); overflow-wrap: anywhere; text-decoration: none; }
 .src:hover { text-decoration: underline; }
 
+/* Картинки от image_generate: приходят отдельным SSE-событием и сохраняются в чате */
+.image-attachments { display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0 4px; }
+.image-attachment { margin: 0; max-width: min(100%, 420px); }
+.image-link { display: block; line-height: 0; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-color); }
+.image-attachment .attachment { display: block; max-width: 100%; max-height: 480px; height: auto; object-fit: contain; }
+.image-link:hover { border-color: var(--border-focus); }
+.image-meta { margin-top: 4px; font-size: 11px; color: var(--text-muted); overflow-wrap: anywhere; }
+
 .tabs { overflow-x: auto; scrollbar-width: none; }
 .tab { flex: 0 0 auto; }
 
