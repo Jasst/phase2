@@ -10,3 +10,4 @@ data/
 *.key
 chats.sqlite*
 tokens.sqlite*
+*.zip
