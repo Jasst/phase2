@@ -1980,26 +1980,65 @@
     return out;
   }
 
+  function selectedFactIds(nodes) {
+    const ids = [];
+    for (const n of nodes || []) {
+      for (const fid of nodeFactIds(n)) if (!ids.includes(fid)) ids.push(fid);
+    }
+    return ids;
+  }
+
+  async function autoRecombineSelected(nodes) {
+    const sel = (nodes && nodes.length ? nodes : selectedNodes()).filter(Boolean);
+    if (sel.length < 2) { toast('Выберите минимум два нейрона (Ctrl+клик)'); return; }
+    const ids = selectedFactIds(sel);
+    if (ids.length < 2) { toast('У выбранных нейронов недостаточно фактов для слияния'); return; }
+    const label = sel.map((n) => shorten(n.label, 24)).join(', ');
+    if (!(await ask('Авто-рекомбинация нейронов?',
+      'LLM объединит факты выбранных нейронов (' + sel.length + '): ' + label, 'Объединить'))) return;
+    try {
+      toast('LLM объединяет нейроны…');
+      const out = await api('POST', '/api/memory/recombine', {
+        fact_ids: ids, model: settings.model || '', apply: true,
+      });
+      const p = out.preview || {};
+      toast('Нейроны объединены: ' + [p.s, p.r, p.o].filter(Boolean).join(' '));
+      clearSelection();
+      await refreshMemoryViews();
+    } catch (err) {
+      toast('Ошибка авто-рекомбинации: ' + (err.message || err));
+    }
+  }
+
   function showNodeMenu(x, y, n) {
+    if (n && !graph.selectedIds.has(n.id)) setSelectedNodes([n], n);
     const ids = nodeFactIds(n);
+    const sel = selectedNodes();
+    const multi = sel.length > 1;
+    const selIds = selectedFactIds(sel);
     showMenu(x, y, [
-      { label: 'Копировать название', onClick: () => copyText(n.label) },
-      { label: n.fixed ? 'Открепить позицию' : 'Закрепить позицию', onClick: () => {
+      { label: multi ? 'Выбрано: ' + sel.length + ' нейронов' : 'Копировать название', disabled: multi,
+        onClick: () => copyText(n.label) },
+      { label: n.fixed ? 'Открепить позицию' : 'Закрепить позицию', disabled: multi, onClick: () => {
           n.fixed = !n.fixed; toast(n.fixed ? 'Нейрон закреплён' : 'Позиция свободна'); draw();
         } },
       { sep: true },
-      { label: 'Править вручную', disabled: !ids.length, onClick: () => openEditDialog(n, ids) },
-      { label: 'Дистилляция LLM', disabled: !ids.length, onClick: () => openDistillDialog(n, ids) },
-      { label: 'Поиск дублей LLM', disabled: !ids.length, onClick: () => openDedupeDialog(ids) },
-      { label: 'Рекомбинация с нейроном…', disabled: !ids.length, onClick: () => openMergeDialog(n, ids) },
+      { label: 'Авто-рекомбинация выбранных (LLM)', disabled: sel.length < 2 || selIds.length < 2,
+        onClick: () => autoRecombineSelected(sel) },
+      { label: 'Снять выделение', disabled: !multi, onClick: clearSelection },
+      { sep: true },
+      { label: 'Править вручную', disabled: multi || !ids.length, onClick: () => openEditDialog(n, ids) },
+      { label: 'Дистилляция LLM', disabled: multi || !ids.length, onClick: () => openDistillDialog(n, ids) },
+      { label: 'Поиск дублей LLM', disabled: multi || !ids.length, onClick: () => openDedupeDialog(ids) },
+      { label: 'Рекомбинация с нейроном…', disabled: multi || !ids.length, onClick: () => openMergeDialog(n, ids) },
       { sep: true },
       { label: 'Раскладка заново', onClick: relayoutGraph },
-      { label: 'Удалить нейрон из памяти', danger: true, disabled: !ids.length, onClick: async () => {
+      { label: 'Удалить нейрон из памяти', danger: true, disabled: multi || !ids.length, onClick: async () => {
           const ok = await ask('Удалить нейрон?',
             'Все его факты будут отозваны. История изменений останется в журнале.', 'Удалить');
           if (!ok) return;
           await memoryAction('/api/memory/forget', { node_id: n.id }, 'Нейрон удалён из памяти');
-          if (graph.selected === n) selectNode(null);
+          if (graph.selected === n) clearSelection();
         } },
     ]);
   }
@@ -2244,12 +2283,12 @@
 
   const graph = {
     nodes: [], edges: [], byId: {}, W: 0, H: 0, dpr: 1, temp: 0, frames: 0, raf: 0,
-    hover: null, selected: null, busy: false, typeColors: {}, relColors: {}, pulses: [],
-    anim: [], nodeDrag: null,
+    hover: null, selected: null, selectedIds: new Set(), busy: false, typeColors: {}, relColors: {}, pulses: [],
+    anim: [], nodeDrag: null, pointers: new Map(), pinch: null,
     view: { scale: 1, ox: 0, oy: 0 }, drag: null, press: null, fullscreen: false,
     sessionStart: Date.now(),
   };
-  const LAYOUT_FRAMES = 300;
+  const LAYOUT_FRAMES = 420;
   const LONG_PRESS_MS = 450;
 
   function typeColor(type) {
@@ -2299,50 +2338,94 @@
     if (graph.pulses.length > 24) graph.pulses.shift();
   }
 
+  function edgeKey(e) {
+    return e.source + '->' + e.target + ':' + (e.label || '');
+  }
+
+  function nodeRadius(degree) {
+    return 6 + Math.min(12, Math.sqrt(Math.max(1, degree || 1)) * 2.8);
+  }
+
   function buildGraph(data) {
     const prev = graph.byId;
-    const prevEdges = new Set(graph.edges.map((e) => e.source + '->' + e.target + ':' + (e.label || '')));
-    const W = graph.W || 300;
-    const H = graph.H || 340;
-    const nodes = (data.nodes || []).map((n) => {
+    const prevEdges = new Set(graph.edges.map(edgeKey));
+    const W = graph.W || 600;
+    const H = graph.H || 420;
+    const rawNodes = data.nodes || [];
+    const rawEdges = data.edges || [];
+
+    // Предварительно считаем степень по входящим ребрам, чтобы новые узлы
+    // появлялись рядом с соседями, а не случайной "пылью" по углам.
+    const deg = {};
+    for (const e of rawEdges) {
+      deg[e.source] = (deg[e.source] || 0) + 1;
+      deg[e.target] = (deg[e.target] || 0) + 1;
+    }
+
+    const nodes = rawNodes.map((n, i) => {
       const old = prev[n.id];
       const created = parseIso(n.created);
+      const degree = n.degree || deg[n.id] || 0;
+      let x = old ? old.x : NaN;
+      let y = old ? old.y : NaN;
+      if (!old) {
+        // Ищем уже размещённого соседа для естественного появления.
+        const nb = rawEdges.find((e) => (e.source === n.id && prev[e.target]) || (e.target === n.id && prev[e.source]));
+        if (nb) {
+          const ref = prev[nb.source === n.id ? nb.target : nb.source];
+          const ang = (i / Math.max(1, rawNodes.length)) * Math.PI * 2;
+          x = ref.x + Math.cos(ang) * 56;
+          y = ref.y + Math.sin(ang) * 56;
+        } else {
+          const ang = (i / Math.max(1, rawNodes.length)) * Math.PI * 2;
+          const rad = Math.min(W, H) * 0.22 + (i % 5) * 18;
+          x = W / 2 + Math.cos(ang) * rad;
+          y = H / 2 + Math.sin(ang) * rad;
+        }
+      }
       return {
-        id: n.id, label: n.label || n.id, type: n.type || null, degree: n.degree || 0,
+        id: n.id, label: n.label || n.id, type: n.type || null, degree,
         created, isNew: created >= graph.sessionStart, linked: !!n.linked,
-        r: 4 + Math.min(10, Math.sqrt(n.degree || 1) * 2.6),
-        x: old ? old.x : W / 2 + (Math.random() - 0.5) * W * 0.6,
-        y: old ? old.y : H / 2 + (Math.random() - 0.5) * H * 0.6,
+        r: nodeRadius(degree),
+        x, y,
+        vx: old && Number.isFinite(old.vx) ? old.vx * 0.35 : 0,
+        vy: old && Number.isFinite(old.vy) ? old.vy * 0.35 : 0,
         dx: 0, dy: 0, color: typeColor(n.type), fixed: old ? !!old.fixed : false,
       };
     });
+
     const byId = {};
     for (const n of nodes) byId[n.id] = n;
     const edges = [];
-    for (const e of data.edges || []) {
+    for (const e of rawEdges) {
       const a = byId[e.source];
       const b = byId[e.target];
       if (a && b) edges.push({ ...e, a, b, created: parseIso(e.recorded_at), color: relColor(e.label) });
     }
-    const changed = nodes.length !== Object.keys(prev).length || nodes.some((n) => !prev[n.id]);
+
+    const changed = nodes.length !== Object.keys(prev).length || nodes.some((n) => !prev[n.id]) ||
+      edges.length !== graph.edges.length;
+    const hasNew = nodes.some((n) => !prev[n.id]);
     graph.nodes = nodes;
     graph.edges = edges;
     graph.byId = byId;
     if (changed) {
-      graph.temp = W / 8;
-      graph.frames = 0;
+      graph.temp = hasNew ? Math.max(graph.temp, 1.2) : Math.max(graph.temp, 0.45);
+      graph.frames = Math.min(graph.frames, LAYOUT_FRAMES - 120);
     }
-    // Те связи, которых не было раньше, «просыпаются» бегущим импульсом.
+
     if (changed && graphVisible()) {
       let n = 0;
       for (const e of edges) {
-        const key = e.source + '->' + e.target + ':' + (e.label || '');
-        if (!prevEdges.has(key)) spawnPulse(e, n++ * 90);
+        if (!prevEdges.has(edgeKey(e))) spawnPulse(e, n++ * 90);
       }
     }
     renderGraphMeta(data, nodes, edges);
+    const kept = [...graph.selectedIds].filter((id) => byId[id]);
+    graph.selectedIds = new Set(kept);
     const sel = graph.selected && byId[graph.selected.id];
-    selectNode(sel || null);
+    syncSelection(sel || null);
+    selectNode(graph.selected, { silent: true });
     kick();
   }
 
@@ -2383,7 +2466,7 @@
   function kick() {
     if (!graph.raf) graph.raf = requestAnimationFrame(frame);
   }
-  // Плавный переход узла в новую позицию (после слияния/перекладки/сброса).
+
   function animateTo(node, x, y, dur) {
     if (!node) return;
     graph.anim = graph.anim.filter((a) => a.node !== node);
@@ -2391,88 +2474,139 @@
                       t0: performance.now(), dur: dur || 620 });
     kick();
   }
+
   function stepAnims(now) {
     if (!graph.anim.length) return;
     graph.anim = graph.anim.filter((a) => {
       const p = Math.max(0, Math.min(1, (now - a.t0) / a.dur));
-      const e = 1 - Math.pow(1 - p, 3);   // ease-out
+      const e = 1 - Math.pow(1 - p, 3);
       a.node.x = a.fx + (a.tx - a.fx) * e;
       a.node.y = a.fy + (a.ty - a.fy) * e;
+      if (p >= 1) { a.node.vx = 0; a.node.vy = 0; }
       return p < 1;
     });
   }
+
   function relayoutGraph() {
-    const W = graph.W || 300;
-    const H = graph.H || 340;
-    for (const n of graph.nodes) {
+    const W = graph.W || 600;
+    const H = graph.H || 420;
+    const nodes = graph.nodes;
+    if (!nodes.length) return;
+    const cx = W / 2;
+    const cy = H / 2;
+    const radius = Math.max(60, Math.min(W, H) * 0.32);
+    nodes.forEach((n, i) => {
       n.fixed = false;
-      const ang = (Object.keys(graph.byId).indexOf(n.id) / Math.max(1, graph.nodes.length)) * Math.PI * 2;
-      const rad = Math.min(W, H) * 0.28;
-      animateTo(n, W / 2 + Math.cos(ang) * rad, H / 2 + Math.sin(ang) * rad, 700);
-    }
-    graph.temp = W / 8;
+      n.vx = 0;
+      n.vy = 0;
+      const ang = (i / nodes.length) * Math.PI * 2 - Math.PI / 2;
+      const jitter = (i % 3 - 1) * 10;
+      animateTo(n, cx + Math.cos(ang) * (radius + jitter), cy + Math.sin(ang) * (radius + jitter), 700);
+    });
+    graph.temp = 1.6;
     graph.frames = 0;
     toast('Раскладка нейронов обновлена');
   }
+
   function frame() {
     graph.raf = 0;
     const now = performance.now();
     stepAnims(now);
-    const laying = graph.frames < LAYOUT_FRAMES && graph.nodes.length > 0 && !graph.anim.length;
-    if (laying) {
-      layoutStep();
-      graph.frames++;
-    }
+    const hasMotion = layoutStep();
     draw();
-    if (laying || graph.anim.length || graph.pulses.length ||
-        ((graph.selected || graph.hover) && graphVisible())) kick();
+    const active = hasMotion || graph.anim.length || graph.pulses.length ||
+      graph.nodeDrag || graph.drag || graph.pinch ||
+      ((graph.selected || graph.hover) && graphVisible());
+    if (active) kick();
   }
 
   function layoutStep() {
     const { nodes, edges, W, H } = graph;
     const n = nodes.length;
-    const k = Math.sqrt((W * H) / n) * 0.9;
-    for (const a of nodes) { a.dx = 0; a.dy = 0; }
+    if (!n) return false;
+    if (n === 1) {
+      const only = nodes[0];
+      if (!only.fixed && !graph.anim.some((a) => a.node === only)) {
+        only.x += (W / 2 - only.x) * 0.08;
+        only.y += (H / 2 - only.y) * 0.08;
+        only.vx *= 0.7; only.vy *= 0.7;
+      }
+      return Math.abs(W / 2 - only.x) + Math.abs(H / 2 - only.y) > 0.5;
+    }
+
+    const area = Math.max(1, W * H);
+    const k = Math.sqrt(area / n) * 0.95;
+    const repel = k * k * 1.25;
+    const centerX = W / 2;
+    const centerY = H / 2;
+    const temp = Math.max(0, graph.temp || 0);
+    let motion = 0;
+
+    for (const a of nodes) { a.fx = 0; a.fy = 0; }
+
+    // Отталкивание: O(n^2), но граф памяти обычно небольшой.
     for (let i = 0; i < n; i++) {
       const a = nodes[i];
       for (let j = i + 1; j < n; j++) {
         const b = nodes[j];
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
-        const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
-        const f = (k * k) / d;
-        a.dx += (dx / d) * f;
-        a.dy += (dy / d) * f;
-        b.dx -= (dx / d) * f;
-        b.dy -= (dy / d) * f;
+        let dx = a.x - b.x;
+        let dy = a.y - b.y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 0.01) { dx = (i + 1) * 0.01; dy = (j + 1) * 0.01; d2 = dx * dx + dy * dy; }
+        const d = Math.sqrt(d2);
+        const minDist = a.r + b.r + 22;
+        let f = repel / d2;
+        if (d < minDist) f += (minDist - d) / d * 2.2;
+        const nx = (dx / d) * f;
+        const ny = (dy / d) * f;
+        a.fx += nx; a.fy += ny;
+        b.fx -= nx; b.fy -= ny;
       }
     }
+
+    // Пружины по фактам: более уверенные/сильные связи тянут ближе.
     for (const e of edges) {
-      const dx = e.a.x - e.b.x;
-      const dy = e.a.y - e.b.y;
-      const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
-      const f = (d * d) / k;
-      e.a.dx -= (dx / d) * f;
-      e.a.dy -= (dy / d) * f;
-      e.b.dx += (dx / d) * f;
-      e.b.dy += (dy / d) * f;
+      const a = e.a;
+      const b = e.b;
+      let dx = b.x - a.x;
+      let dy = b.y - a.y;
+      let d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const conf = Math.max(0.25, Math.min(1, e.confidence || 0.6));
+      const target = Math.max(a.r + b.r + 26, k * (1.35 - conf * 0.45));
+      const strength = (0.015 + conf * 0.02) * (1 + temp * 0.25);
+      const f = (d - target) * strength;
+      const nx = (dx / d) * f;
+      const ny = (dy / d) * f;
+      a.fx += nx; a.fy += ny;
+      b.fx -= nx; b.fy -= ny;
     }
-    const cx = W / 2;
-    const cy = H / 2;
-    const t = graph.temp;
+
     for (const a of nodes) {
-      if (a.fixed) continue;   // перетащенный пользователем узел не тянем обратно
-      a.dx += (cx - a.x) * 0.01;
-      a.dy += (cy - a.y) * 0.01;
-      const len = Math.sqrt(a.dx * a.dx + a.dy * a.dy) || 0.01;
-      // Плавное движение: ограничение скорости, чтобы узлы не «дёргались» между кадрами.
-      const lim = Math.min(len, t, 6);
-      a.x += (a.dx / len) * lim;
-      a.y += (a.dy / len) * lim;
-      a.x = Math.max(a.r + 4, Math.min(W - a.r - 4, a.x));
-      a.y = Math.max(a.r + 4, Math.min(H - a.r - 4, a.y));
+      if (a.fixed || graph.nodeDrag && graph.nodeDrag.node === a) {
+        a.vx = 0; a.vy = 0;
+        continue;
+      }
+      // Мягкое притяжение к центру, чтобы граф не расползался бесконечно, но без жёстких границ.
+      a.fx += (centerX - a.x) * (0.0022 + temp * 0.0008);
+      a.fy += (centerY - a.y) * (0.0022 + temp * 0.0008);
+
+      a.vx = (a.vx + a.fx) * 0.86;
+      a.vy = (a.vy + a.fy) * 0.86;
+      const speed = Math.sqrt(a.vx * a.vx + a.vy * a.vy);
+      const maxSpeed = 2.2 + temp * 3.2;
+      if (speed > maxSpeed) {
+        a.vx = (a.vx / speed) * maxSpeed;
+        a.vy = (a.vy / speed) * maxSpeed;
+      }
+      if (speed < 0.015 && temp < 0.08) { a.vx = 0; a.vy = 0; }
+      a.x += a.vx;
+      a.y += a.vy;
+      motion += Math.abs(a.vx) + Math.abs(a.vy);
     }
-    graph.temp = Math.max(0.5, t * 0.985);
+
+    if (graph.frames < LAYOUT_FRAMES) graph.frames++;
+    graph.temp = temp > 0.02 ? temp * 0.985 : 0;
+    return motion > 0.08 || temp > 0.03;
   }
 
   function isNeighbor(n, hi) {
@@ -2486,6 +2620,125 @@
     return 'rgba(' + ((v >> 16) & 255) + ',' + ((v >> 8) & 255) + ',' + (v & 255) + ',' + alpha + ')';
   }
 
+  function drawEdgeLabel(ctx, e, inv) {
+    const text = shorten(e.label || 'связь', 24);
+    const mx = (e.a.x + e.b.x) / 2;
+    const my = (e.a.y + e.b.y) / 2;
+    ctx.font = Math.round(10.5 * inv) + 'px system-ui, -apple-system, Segoe UI, sans-serif';
+    const padX = 5 * inv;
+    const h = 16 * inv;
+    const w = ctx.measureText(text).width + padX * 2;
+    const r = 5 * inv;
+    const x = mx - w / 2;
+    const y = my - h / 2;
+    ctx.fillStyle = 'rgba(10, 13, 19, 0.82)';
+    ctx.strokeStyle = withAlpha(e.color || '#a6bfe0', 0.45);
+    ctx.lineWidth = 1 * inv;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(x, y, w, h, r);
+    else {
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+    }
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = withAlpha('#eceef1', 0.92);
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, x + padX, my + 0.5 * inv);
+  }
+
+  function edgeCurve(e) {
+    const dx = e.b.x - e.a.x;
+    const dy = e.b.y - e.a.y;
+    const d = Math.sqrt(dx * dx + dy * dy) || 1;
+    const bend = Math.min(28, d * 0.08);
+    const nx = -dy / d;
+    const ny = dx / d;
+    // Deterministic bend direction so edges don't jitter between frames.
+    const sign = ((e.source || '').length + (e.target || '').length + (e.label || '').length) % 2 ? 1 : -1;
+    return { cx: (e.a.x + e.b.x) / 2 + nx * bend * sign, cy: (e.a.y + e.b.y) / 2 + ny * bend * sign };
+  }
+
+  function drawNeuronShape(ctx, n, inv, opts) {
+    const { dim, lifted, related, phase } = opts;
+    const r = n.r;
+    // Outer glow / membrane.
+    ctx.globalAlpha = dim ? 0.16 : 1;
+    const glow = ctx.createRadialGradient(n.x, n.y, r * 0.2, n.x, n.y, r * 4.6);
+    glow.addColorStop(0, withAlpha(n.color, lifted ? 0.28 : 0.16));
+    glow.addColorStop(1, withAlpha(n.color, 0));
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, r * 4.6, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Dendrite-like processes.
+    const seed = (n.id || n.label || '').split('').reduce((a, ch) => a + ch.charCodeAt(0), 0);
+    const count = 5 + (seed % 4);
+    ctx.save();
+    ctx.lineCap = 'round';
+    for (let i = 0; i < count; i++) {
+      const ang = (i / count) * Math.PI * 2 + (seed % 17) * 0.13;
+      const len = r * (1.8 + ((seed >> i) % 5) * 0.35) + (lifted ? 3 : 0);
+      const wob = Math.sin(phase * Math.PI * 2 + i + seed) * r * 0.18;
+      const x1 = n.x + Math.cos(ang) * r * 0.85;
+      const y1 = n.y + Math.sin(ang) * r * 0.85;
+      const x2 = n.x + Math.cos(ang + 0.18) * (r + len * 0.55) + Math.cos(ang + Math.PI / 2) * wob;
+      const y2 = n.y + Math.sin(ang + 0.18) * (r + len * 0.55) + Math.sin(ang + Math.PI / 2) * wob;
+      const x3 = n.x + Math.cos(ang) * (r + len);
+      const y3 = n.y + Math.sin(ang) * (r + len);
+      ctx.strokeStyle = withAlpha(n.color, dim ? 0.08 : (related ? 0.42 : 0.22));
+      ctx.lineWidth = (1.3 - i * 0.05) * inv;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.quadraticCurveTo(x2, y2, x3, y3);
+      ctx.stroke();
+      // synaptic tip
+      ctx.fillStyle = withAlpha(n.color, dim ? 0.08 : 0.28);
+      ctx.beginPath();
+      ctx.arc(x3, y3, 1.2 * inv, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // Soma body.
+    const body = ctx.createRadialGradient(n.x - r * 0.35, n.y - r * 0.4, r * 0.15, n.x, n.y, r * 1.3);
+    body.addColorStop(0, withAlpha('#ffffff', 0.92));
+    body.addColorStop(0.18, withAlpha(n.color, 1));
+    body.addColorStop(0.65, withAlpha(n.color, 0.95));
+    body.addColorStop(1, withAlpha(n.color, 0.38));
+    ctx.fillStyle = body;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Membrane ring.
+    ctx.strokeStyle = withAlpha('#ffffff', lifted ? 0.75 : 0.26);
+    ctx.lineWidth = (lifted ? 1.2 : 0.8) * inv;
+    ctx.stroke();
+
+    // Nucleus.
+    ctx.fillStyle = withAlpha('#fff', dim ? 0.08 : 0.16);
+    ctx.beginPath();
+    ctx.arc(n.x - r * 0.12, n.y - r * 0.12, r * 0.38, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (related) {
+      for (let ring = 0; ring < 2; ring++) {
+        const p = (phase + ring * 0.5) % 1;
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, r + 4 + p * 14, 0, Math.PI * 2);
+        ctx.strokeStyle = withAlpha(n.color, (1 - p) * 0.35);
+        ctx.lineWidth = 1.3 * inv;
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
   function draw() {
     const c = els.graphCanvas;
     const ctx = c.getContext ? c.getContext('2d') : null;
@@ -2494,37 +2747,62 @@
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, c.width, c.height);
     ctx.setTransform(dpr * view.scale, 0, 0, dpr * view.scale, dpr * view.ox, dpr * view.oy);
-    const hi = graph.selected || graph.hover;
+    const hi = graph.hover || graph.selected;
+    const selIds = graph.selectedIds || new Set();
     const now = performance.now();
     const phase = (now % 1600) / 1600;
     const inv = 1 / view.scale;
 
+    // Тонкая сетка помогает читать масштаб и движение.
+    const grid = 80;
+    const topLeftX = -view.ox / view.scale;
+    const topLeftY = -view.oy / view.scale;
+    const visW = c.width / (dpr * view.scale);
+    const visH = c.height / (dpr * view.scale);
+    const startX = Math.floor(topLeftX / grid) * grid;
+    const startY = Math.floor(topLeftY / grid) * grid;
+    ctx.strokeStyle = 'rgba(255,255,255,0.025)';
+    ctx.lineWidth = 1 * inv;
+    ctx.beginPath();
+    for (let x = startX; x < topLeftX + visW + grid; x += grid) { ctx.moveTo(x, topLeftY); ctx.lineTo(x, topLeftY + visH); }
+    for (let y = startY; y < topLeftY + visH + grid; y += grid) { ctx.moveTo(topLeftX, y); ctx.lineTo(topLeftX + visW, y); }
+    ctx.stroke();
+
+    const focusedEdges = [];
     for (const e of graph.edges) {
       const focus = hi && (e.a === hi || e.b === hi);
       const pulse = graph.pulses.find((p) => p.edge === e);
-      const conf = Math.max(0, Math.min(1, e.confidence || 0));
+      const conf = Math.max(0, Math.min(1, e.confidence || 0.55));
+      if (focus) focusedEdges.push(e);
+      const c1 = edgeCurve(e);
       ctx.strokeStyle = focus ? withAlpha(e.color || '#eceef1', 0.9)
-        : withAlpha(e.color || '#9aa3b2', 0.14 + 0.45 * conf);
-      ctx.lineWidth = focus ? 1.8 * inv : (0.6 + conf) * inv;
+        : withAlpha(e.color || '#9aa3b2', hi ? 0.04 : 0.1 + 0.2 * conf);
+      ctx.lineWidth = (focus ? 2.1 : (0.7 + conf * 0.7)) * inv;
       if (focus || pulse) {
         ctx.setLineDash([7 * inv, 8 * inv]);
-        ctx.lineDashOffset = -(now / 40) * inv;   // бегущий импульс по связи
+        ctx.lineDashOffset = -(now / 40) * inv;
       } else {
         ctx.setLineDash([]);
       }
       ctx.beginPath();
       ctx.moveTo(e.a.x, e.a.y);
-      ctx.lineTo(e.b.x, e.b.y);
+      ctx.quadraticCurveTo(c1.cx, c1.cy, e.b.x, e.b.y);
       ctx.stroke();
+      e._curve = c1;
     }
     ctx.setLineDash([]);
 
-    // Волна активации: импульс бежит по синапсу от нейрона к нейрону.
+    if (hi) {
+      for (const e of focusedEdges.slice(0, 18)) drawEdgeLabel(ctx, e, inv);
+    }
+
     graph.pulses = graph.pulses.filter((p) => p.until > now);
     for (const p of graph.pulses) {
       const t = Math.max(0, Math.min(1, (now - p.t0) / (p.until - p.t0)));
-      const x = p.edge.a.x + (p.edge.b.x - p.edge.a.x) * t;
-      const y = p.edge.a.y + (p.edge.b.y - p.edge.a.y) * t;
+      const c1 = p.edge._curve || edgeCurve(p.edge);
+      const mt = 1 - t;
+      const x = mt * mt * p.edge.a.x + 2 * mt * t * c1.cx + t * t * p.edge.b.x;
+      const y = mt * mt * p.edge.a.y + 2 * mt * t * c1.cy + t * t * p.edge.b.y;
       const color = p.edge.color || '#eceef1';
       ctx.beginPath();
       ctx.arc(x, y, 3.2 * inv, 0, Math.PI * 2);
@@ -2537,43 +2815,11 @@
     }
 
     for (const n of graph.nodes) {
-      const related = hi && (n === hi || isNeighbor(n, hi));
+      const related = hi && (n === hi || isNeighbor(n, hi) || selIds.has(n.id));
       const dim = hi && !related;
-      const lifted = n === graph.hover || n === graph.selected ||
-        (graph.nodeDrag && graph.nodeDrag.node === n);
-      ctx.globalAlpha = dim ? 0.28 : 0.96;
-      // Мягкое свечение нейрона — «живой» узел, а не плоская точка.
-      const halo = ctx.createRadialGradient(n.x, n.y, n.r * 0.4, n.x, n.y, n.r * (lifted ? 4.2 : 2.8));
-      halo.addColorStop(0, withAlpha(n.color, lifted ? 0.38 : 0.22));
-      halo.addColorStop(1, withAlpha(n.color, 0));
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, n.r * (lifted ? 4.2 : 2.8), 0, Math.PI * 2);
-      ctx.fillStyle = halo;
-      ctx.fill();
-      if (related) {
-        for (let ring = 0; ring < 2; ring++) {
-          const p = (phase + ring * 0.5) % 1;
-          ctx.beginPath();
-          ctx.arc(n.x, n.y, n.r + 4 + p * 22, 0, Math.PI * 2);
-          ctx.strokeStyle = withAlpha(n.color, (1 - p) * 0.55);
-          ctx.lineWidth = 1.4 * inv;
-          ctx.stroke();
-        }
-      }
-      // Объём: градиент от светлого верхнего полюса к насыщенному краю.
-      const body = ctx.createRadialGradient(n.x - n.r * 0.35, n.y - n.r * 0.4, n.r * 0.1,
-                                            n.x, n.y, n.r * 1.15);
-      body.addColorStop(0, withAlpha(n.color, 1));
-      body.addColorStop(0.55, n.color);
-      body.addColorStop(1, withAlpha(n.color, 0.55));
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
-      ctx.fillStyle = body;
-      ctx.fill();
-      ctx.strokeStyle = withAlpha('#ffffff', lifted ? 0.75 : 0.28);
-      ctx.lineWidth = (lifted ? 1.1 : 0.7) * inv;
-      ctx.stroke();
-      ctx.globalAlpha = 1;
+      const lifted = n === graph.hover || selIds.has(n.id) || (graph.nodeDrag && graph.nodeDrag.node === n);
+      drawNeuronShape(ctx, n, inv, { dim, lifted, related, phase });
+
       if (n.isNew) {
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r + 3.5, 0, Math.PI * 2);
@@ -2581,36 +2827,49 @@
         ctx.lineWidth = 1.5 * inv;
         ctx.stroke();
       }
-      if (n.fixed) {   // нейрон закреплён перетаскиванием
+      if (n.fixed) {
         ctx.beginPath();
-        ctx.arc(n.x + n.r * 0.8, n.y - n.r * 0.8, 2.2 * inv, 0, Math.PI * 2);
+        ctx.arc(n.x + n.r * 0.75, n.y - n.r * 0.75, 2.4 * inv, 0, Math.PI * 2);
         ctx.fillStyle = '#c3d7f7';
         ctx.fill();
       }
-      if (n === graph.selected) {
+      if (selIds.has(n.id)) {
         ctx.beginPath();
-        ctx.arc(n.x, n.y, n.r + 6, 0, Math.PI * 2);
-        ctx.strokeStyle = '#eceef1';
-        ctx.lineWidth = 1.5 * inv;
+        ctx.arc(n.x, n.y, n.r + 6.5, 0, Math.PI * 2);
+        ctx.strokeStyle = n === graph.selected ? '#eceef1' : 'rgba(236,238,241,0.65)';
+        ctx.lineWidth = (n === graph.selected ? 1.8 : 1.2) * inv;
         ctx.stroke();
       }
       if (graph.press && graph.press.node === n && !graph.press.longFired) {
         const p = Math.min(1, (now - graph.press.t0) / LONG_PRESS_MS);
         ctx.beginPath();
-        ctx.arc(n.x, n.y, n.r + 9, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2);
+        ctx.arc(n.x, n.y, n.r + 10, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2);
         ctx.strokeStyle = '#eceef1';
         ctx.lineWidth = 2 * inv;
         ctx.stroke();
       }
     }
 
-    const labelled = new Set([...graph.nodes].sort((a, b) => b.degree - a.degree).slice(0, 14));
-    if (hi) labelled.add(hi);
+    // Подписи: показываем выбранный/hover + самые связанные, но избегаем наложений.
+    const labels = [];
+    const candidates = [...graph.nodes].sort((a, b) => b.degree - a.degree).slice(0, 18);
+    for (const n of selectedNodes()) if (!candidates.includes(n)) candidates.unshift(n);
+    if (hi && !candidates.includes(hi)) candidates.unshift(hi);
     ctx.font = Math.round(12 * inv) + 'px system-ui, -apple-system, Segoe UI, sans-serif';
     ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#eceef1';
-    for (const n of labelled) {
-      ctx.fillText(shorten(n.label, 26), n.x + n.r + 5, n.y);
+    for (const n of candidates) {
+      const text = shorten(n.label, 28);
+      const x = n.x + n.r + 7 * inv;
+      const y = n.y;
+      const w = ctx.measureText(text).width;
+      const h = 14 * inv;
+      const box = { x, y: y - h / 2, w, h };
+      const hit = labels.some((b) => box.x < b.x + b.w + 6 * inv && box.x + box.w + 6 * inv > b.x && box.y < b.y + b.h + 4 * inv && box.y + box.h + 4 * inv > b.y);
+      if (hit && n !== hi && !selIds.has(n.id)) continue;
+      labels.push(box);
+      const dim = hi && !(n === hi || isNeighbor(n, hi) || selIds.has(n.id));
+      ctx.fillStyle = dim ? 'rgba(236,238,241,0.32)' : 'rgba(236,238,241,0.95)';
+      ctx.fillText(text, x, y);
     }
   }
 
@@ -2655,34 +2914,99 @@
     kick();
   }
 
-  function selectNode(n) {
-    graph.selected = n;
-    draw();
+  function selectedNodes() {
+    return graph.nodes.filter((n) => graph.selectedIds.has(n.id));
+  }
+
+  function syncSelection(primary) {
+    const ids = graph.selectedIds;
+    if (primary && ids.has(primary.id)) graph.selected = primary;
+    else if (graph.selected && ids.has(graph.selected.id)) { /* keep */ }
+    else graph.selected = selectedNodes()[0] || null;
+  }
+
+  function toggleNodeSelection(n) {
+    if (!n) return;
+    if (graph.selectedIds.has(n.id)) graph.selectedIds.delete(n.id);
+    else graph.selectedIds.add(n.id);
+    syncSelection(n);
+    selectNode(graph.selected, { silent: true });
+  }
+
+  function setSelectedNodes(nodes, primary) {
+    graph.selectedIds = new Set(nodes.filter(Boolean).map((n) => n.id));
+    syncSelection(primary || nodes[0] || null);
+    selectNode(graph.selected, { silent: true });
+  }
+
+  function clearSelection() {
+    graph.selectedIds.clear();
+    graph.selected = null;
+    selectNode(null, { silent: true });
+  }
+
+  function renderSelectionDetail(nodes) {
     const box = els.graphDetail;
     box.innerHTML = '';
-    if (!n) {
-      box.appendChild(el('div', 'empty', 'Нажмите на узел на карте.'));
+    if (!nodes.length) {
+      box.appendChild(el('div', 'empty', 'Нажмите на узел на карте. Ctrl+клик — выбрать несколько.'));
       return;
     }
+    if (nodes.length === 1) {
+      const n = nodes[0];
+      const head = el('div', 'card');
+      head.appendChild(el('div', 'fact-text', n.label));
+      const meta = [n.type, 'связей: ' + n.degree];
+      if (n.created) meta.push('с ' + new Date(n.created).toLocaleDateString('ru-RU'));
+      if (n.isNew) meta.push('новый в этой сессии');
+      if (!n.linked) meta.push('без сущности');
+      head.appendChild(el('div', 'fact-meta', meta.filter(Boolean).join(' · ')));
+      box.appendChild(head);
+      const related = graph.edges.filter((e) => e.a === n || e.b === n).slice(0, 30);
+      for (const e of related) {
+        const card = el('div', 'card');
+        card.appendChild(el('div', 'fact-text', e.a.label + ' — ' + e.label + ' → ' + e.b.label));
+        const when = e.created ? ' · ' + new Date(e.created).toLocaleString('ru-RU') : '';
+        card.appendChild(el('div', 'fact-meta', 'уверенность ' + e.confidence + when));
+        const factId = e.id || e.fact_id;
+        factActions(factId, card);
+        attachMenu(card, (x, y) => showFactMenu(x, y, factId, e.a.label + ' — ' + e.label + ' → ' + e.b.label));
+        box.appendChild(card);
+      }
+      return;
+    }
+
     const head = el('div', 'card');
-    head.appendChild(el('div', 'fact-text', n.label));
-    const meta = [n.type, 'связей: ' + n.degree];
-    if (n.created) meta.push('с ' + new Date(n.created).toLocaleDateString('ru-RU'));
-    if (n.isNew) meta.push('новый в этой сессии');
-    if (!n.linked) meta.push('без сущности');
-    head.appendChild(el('div', 'fact-meta', meta.filter(Boolean).join(' · ')));
+    head.appendChild(el('div', 'fact-text', 'Выбрано нейронов: ' + nodes.length));
+    head.appendChild(el('div', 'fact-meta', nodes.map((n) => shorten(n.label, 28)).join(' · ')));
+    const row = el('div', 'card-row');
+    const mergeBtn = el('button', 'btn-primary', 'Авто-рекомбинация LLM');
+    mergeBtn.type = 'button';
+    mergeBtn.addEventListener('click', () => autoRecombineSelected(nodes));
+    const clearBtn = el('button', 'btn-ghost', 'Снять выделение');
+    clearBtn.type = 'button';
+    clearBtn.addEventListener('click', clearSelection);
+    row.append(mergeBtn, clearBtn);
+    head.appendChild(row);
     box.appendChild(head);
-    const related = graph.edges.filter((e) => e.a === n || e.b === n).slice(0, 30);
-    for (const e of related) {
+
+    for (const n of nodes.slice(0, 12)) {
       const card = el('div', 'card');
-      card.appendChild(el('div', 'fact-text', e.a.label + ' — ' + e.label + ' → ' + e.b.label));
-      const when = e.created ? ' · ' + new Date(e.created).toLocaleString('ru-RU') : '';
-      card.appendChild(el('div', 'fact-meta', 'уверенность ' + e.confidence + when));
-      const factId = e.id || e.fact_id;
-      factActions(factId, card);
-      attachMenu(card, (x, y) => showFactMenu(x, y, factId, e.a.label + ' — ' + e.label + ' → ' + e.b.label));
+      card.appendChild(el('div', 'fact-text', n.label));
+      card.appendChild(el('div', 'fact-meta', [n.type, 'связей: ' + n.degree].filter(Boolean).join(' · ')));
       box.appendChild(card);
     }
+  }
+
+  function selectNode(n, opts) {
+    const silent = opts && opts.silent;
+    if (!silent) {
+      if (n) graph.selectedIds = new Set([n.id]);
+      else graph.selectedIds.clear();
+    }
+    graph.selected = n || null;
+    draw();
+    renderSelectionDetail(selectedNodes());
   }
 
   function factActions(fid, card) {
@@ -3352,79 +3676,181 @@
     }
   });
 
+  function pointerScreen(ev) {
+    const r = els.graphCanvas.getBoundingClientRect();
+    return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  }
+  function clearPress() {
+    if (graph.press && graph.press.timer) clearTimeout(graph.press.timer);
+    graph.press = null;
+  }
+  function beginPinch() {
+    const pts = [...graph.pointers.values()];
+    if (pts.length < 2) return;
+    const [a, b] = pts;
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    graph.pinch = {
+      dist: Math.hypot(dx, dy) || 1,
+      mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+      view: { ...graph.view },
+    };
+    clearPress();
+    graph.nodeDrag = null;
+    graph.drag = null;
+  }
+
   els.graphCanvas.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0 && ev.pointerType !== 'touch') return;
     if (ev.button !== 0) return;
-    const s = screenPoint(ev);
+    ev.preventDefault();
+    els.graphCanvas.setPointerCapture(ev.pointerId);
+    const s = pointerScreen(ev);
+    graph.pointers.set(ev.pointerId, s);
+    if (graph.pointers.size >= 2) {
+      beginPinch();
+      return;
+    }
     const p = canvasPoint(ev);
     const node = nodeAt(p.x, p.y);
     if (node) {
-      graph.press = { node, sx: s.x, sy: s.y, t0: performance.now(), moved: false, longFired: false };
+      clearPress();
+      graph.press = { pointerId: ev.pointerId, node, sx: s.x, sy: s.y, t0: performance.now(), moved: false, longFired: false, multi: ev.ctrlKey || ev.metaKey };
       graph.press.timer = setTimeout(() => {
-        if (!graph.press || graph.press.moved) return;
+        if (!graph.press || graph.press.moved || graph.press.pointerId !== ev.pointerId) return;
         graph.press.longFired = true;
-        selectNode(graph.press.node);
+        if (!graph.selectedIds.has(graph.press.node.id)) setSelectedNodes([graph.press.node], graph.press.node);
         const at = nodeScreenPoint(graph.press.node);
         showNodeMenu(at.x, at.y, graph.press.node);
       }, LONG_PRESS_MS);
+      els.graphCanvas.style.cursor = 'grabbing';
     } else {
-      graph.drag = { sx: s.x, sy: s.y, ox: graph.view.ox, oy: graph.view.oy };
+      clearPress();
+      if (!ev.shiftKey) clearSelection();
+      graph.drag = { pointerId: ev.pointerId, sx: s.x, sy: s.y, ox: graph.view.ox, oy: graph.view.oy };
       els.graphCanvas.style.cursor = 'grabbing';
     }
   });
+
   els.graphCanvas.addEventListener('pointermove', (ev) => {
-    const s = screenPoint(ev);
-    if (graph.drag) {
+    if (!graph.pointers.has(ev.pointerId)) {
+      const p = canvasPoint(ev);
+      const n = nodeAt(p.x, p.y);
+      if (n !== graph.hover) { graph.hover = n; draw(); }
+      els.graphCanvas.style.cursor = n ? 'grab' : 'default';
+      return;
+    }
+    const s = pointerScreen(ev);
+    graph.pointers.set(ev.pointerId, s);
+
+    if (graph.pinch && graph.pointers.size >= 2) {
+      const pts = [...graph.pointers.values()];
+      const [a, b] = pts;
+      const dist = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      const base = graph.pinch.view;
+      const factor = dist / graph.pinch.dist;
+      const scale = Math.max(0.35, Math.min(4, base.scale * factor));
+      const wx = (graph.pinch.mid.x - base.ox) / base.scale;
+      const wy = (graph.pinch.mid.y - base.oy) / base.scale;
+      graph.view.scale = scale;
+      graph.view.ox = mid.x - wx * scale;
+      graph.view.oy = mid.y - wy * scale;
+      kick();
+      return;
+    }
+
+    if (graph.drag && graph.drag.pointerId === ev.pointerId) {
       graph.view.ox = graph.drag.ox + (s.x - graph.drag.sx);
       graph.view.oy = graph.drag.oy + (s.y - graph.drag.sy);
       kick();
       return;
     }
+
     const p = canvasPoint(ev);
-    if (graph.nodeDrag) {
+    if (graph.nodeDrag && graph.nodeDrag.pointerId === ev.pointerId) {
       const d = graph.nodeDrag;
-      d.node.x = Math.max(d.node.r + 4, Math.min(graph.W - d.node.r - 4, p.x - d.offX));
-      d.node.y = Math.max(d.node.r + 4, Math.min(graph.H - d.node.r - 4, p.y - d.offY));
+      d.node.x = p.x - d.offX;
+      d.node.y = p.y - d.offY;
+      d.node.vx = 0; d.node.vy = 0;
       d.node.fixed = true;
       kick();
       return;
     }
+
     const n = nodeAt(p.x, p.y);
-    if (graph.press && !graph.press.moved &&
+    if (graph.press && graph.press.pointerId === ev.pointerId && !graph.press.moved &&
         Math.hypot(s.x - graph.press.sx, s.y - graph.press.sy) > 6) {
       graph.press.moved = true;
       clearTimeout(graph.press.timer);
-      // Короткое движение = перетаскивание узла, долгое удержание = меню.
-      graph.nodeDrag = { node: graph.press.node, offX: p.x - graph.press.node.x,
-                         offY: p.y - graph.press.node.y };
-      selectNode(graph.press.node);
+      if (graph.press.multi) {
+        if (!graph.selectedIds.has(graph.press.node.id)) toggleNodeSelection(graph.press.node);
+      } else if (!graph.selectedIds.has(graph.press.node.id)) {
+        setSelectedNodes([graph.press.node], graph.press.node);
+      }
+      graph.nodeDrag = { pointerId: ev.pointerId, node: graph.press.node, offX: p.x - graph.press.node.x, offY: p.y - graph.press.node.y };
+      els.graphCanvas.style.cursor = 'grabbing';
     }
     if (n !== graph.hover) {
       graph.hover = n;
-      els.graphCanvas.style.cursor = n ? 'grab' : 'default';
+      if (!graph.nodeDrag && !graph.drag) els.graphCanvas.style.cursor = n ? 'grab' : 'default';
       draw();
     }
   });
-  function endPointer() {
-    const press = graph.press;
-    if (press) {
-      clearTimeout(press.timer);
-      if (!press.moved && !press.longFired) selectNode(graph.selected === press.node ? null : press.node);
+
+  function endPointer(ev) {
+    const id = ev && ev.pointerId;
+    if (id != null) graph.pointers.delete(id);
+    if (graph.pinch) {
+      if (graph.pointers.size < 2) {
+        graph.pinch = null;
+        const rem = [...graph.pointers.entries()][0];
+        if (rem) {
+          const [pid, s] = rem;
+          graph.drag = { pointerId: pid, sx: s.x, sy: s.y, ox: graph.view.ox, oy: graph.view.oy };
+        }
+      }
     }
-    graph.press = null;
-    graph.nodeDrag = null;
-    graph.drag = null;
+    if (graph.press && (id == null || graph.press.pointerId === id)) {
+      const press = graph.press;
+      clearPress();
+      if (!press.moved && !press.longFired) {
+        if (press.multi) toggleNodeSelection(press.node);
+        else selectNode(graph.selected === press.node && graph.selectedIds.size === 1 ? null : press.node);
+      }
+    }
+    if (graph.nodeDrag && (id == null || graph.nodeDrag.pointerId === id)) {
+      graph.nodeDrag.node.vx = 0;
+      graph.nodeDrag.node.vy = 0;
+      graph.nodeDrag = null;
+      graph.temp = Math.max(graph.temp, 0.12);
+    }
+    if (graph.drag && (id == null || graph.drag.pointerId === id)) {
+      graph.drag = null;
+    }
+    if (!graph.pointers.size) {
+      clearPress();
+      graph.nodeDrag = null;
+      graph.drag = null;
+      graph.pinch = null;
+    }
     els.graphCanvas.style.cursor = graph.hover ? 'grab' : 'default';
     draw();
+    kick();
   }
+
   els.graphCanvas.addEventListener('pointerup', endPointer);
   els.graphCanvas.addEventListener('pointercancel', endPointer);
-  els.graphCanvas.addEventListener('pointerleave', () => { graph.hover = null; draw(); });
+  els.graphCanvas.addEventListener('pointerleave', (ev) => {
+    if (graph.pointers.has(ev.pointerId)) return;
+    if (!graph.nodeDrag && !graph.drag && !graph.pinch) { graph.hover = null; draw(); }
+  });
   els.graphCanvas.addEventListener('contextmenu', (ev) => {
     ev.preventDefault();
     const p = canvasPoint(ev);
     const n = nodeAt(p.x, p.y);
     if (n) {
-      selectNode(n);
+      if (!graph.selectedIds.has(n.id)) setSelectedNodes([n], n);
       showNodeMenu(ev.clientX, ev.clientY, n);
     } else {
       showBlankMenu(ev.clientX, ev.clientY);
@@ -3433,7 +3859,8 @@
   els.graphCanvas.addEventListener('wheel', (ev) => {
     ev.preventDefault();
     const s = screenPoint(ev);
-    zoomAt(s.x, s.y, ev.deltaY < 0 ? 1.12 : 1 / 1.12);
+    const factor = Math.pow(1.0015, -ev.deltaY);
+    zoomAt(s.x, s.y, Math.max(0.8, Math.min(1.25, factor)));
   }, { passive: false });
   window.addEventListener('resize', () => { if (graphVisible()) resizeGraph(); });
   // Факты появляются фоном (очередь индексации) — карта обновляется сама, пока открыта.
