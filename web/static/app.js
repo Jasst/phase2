@@ -79,6 +79,9 @@
     syncStatus: $('syncStatus'), syncNow: $('syncNow'),
     confirmDialog: $('confirmDialog'), confirmTitle: $('confirmTitle'), confirmText: $('confirmText'),
     confirmYes: $('confirmYes'), toast: $('toast'),
+    imageDialog: $('imageDialog'), imageDialogImg: $('imageDialogImg'),
+    imageDialogTitle: $('imageDialogTitle'), imageClose: $('imageClose'),
+    imagePrev: $('imagePrev'), imageNext: $('imageNext'), imageStage: $('imageStage'),
   };
 
   let sessions = [];
@@ -97,6 +100,8 @@
   // Блоки рассуждений, обновление которых приостановлено, пока пользователь
   // выделяет в них текст (иначе DOM перерисовывается и выделение сбрасывается).
   const frozenReasonings = new Set();
+  let lightboxItems = [];
+  let lightboxIndex = 0;
   let drawerTab = null;
   let cmdItems = [];
   let cmdIndex = 0;
@@ -162,20 +167,40 @@
     const t = Number(value) || 0;
     return t > 0 && t < 1e12 ? t * 1000 : t;
   }
+  function mergeImages(a, b) {
+    const out = [];
+    const seen = new Set();
+    for (const img of [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])]) {
+      if (!img || typeof img.url !== 'string' || !img.url || seen.has(img.url)) continue;
+      seen.add(img.url);
+      out.push(img);
+    }
+    return out;
+  }
   function dedupeMessages(list) {
     if (!Array.isArray(list)) return list;
-    const seen = new Set();
+    const seen = new Map(); // ключ → индекс в out, чтобы обновить готовое сообщение картинкой
     const out = [];
     for (const m of list) {
       if (!m || typeof m !== 'object') continue;
       // Пустой ответ-артефакт от старого параллельного стрима: только метка очереди.
       if (m.role === 'assistant' && !m.pending && !m.text && !m.reasoning &&
-          !(m.tools || []).length && !(m.sources || []).length &&
+          !(m.tools || []).length && !(m.sources || []).length && !(m.images || []).length &&
           (m.indexPending || (!m.error && !m.note))) continue;
       m.time = normalizeTime(m.time);
       const key = m.id ? 'id:' + m.id
         : 'ct:' + (m.role || '') + '|' + m.time + '|' + String(m.text || '');
-      if (seen.has(key)) continue;
+      const known = seen.get(key);
+      if (known !== undefined) {
+        // Тот же id, но сообщение могло позже заполниться текстом/картинкой.
+        const prev = out[known];
+        const imgs = mergeImages(prev.images, m.images);
+        const longer = String(m.text || '').length > String(prev.text || '').length ||
+          (!prev.text && m.text);
+        if (imgs.length) out[known] = { ...(longer ? m : prev), images: imgs };
+        else if (longer) out[known] = m;
+        continue;
+      }
       // Следствие старого реаттача: один и тот же ответ под разными id, созданными
       // watchRemote() по несколько раз на одно state-changed. Ищем такую копию по
       // всему списку (не только по соседям) — копии могут быть разнесены
@@ -185,12 +210,19 @@
           String(p.text || '') === String(m.text || '') &&
           Math.abs(p.time - m.time) < 600000);
         if (twin) {
-          if (String(m.text || '').length > String(twin.text || '').length ||
-              (!twin.text && m.text)) out[out.indexOf(twin)] = m;
+          const idx = out.indexOf(twin);
+          const imgs = mergeImages(twin.images, m.images);
+          const longer = String(m.text || '').length > String(twin.text || '').length ||
+            (!twin.text && m.text);
+          if (imgs.length) {
+            out[idx] = { ...(longer ? m : twin), images: imgs };
+          } else if (longer) {
+            out[idx] = m;
+          }
           continue;
         }
       }
-      seen.add(key);
+      seen.set(key, out.length);
       out.push(m);
     }
     return out;
@@ -856,6 +888,48 @@
     });
   }
 
+  function safeImageUrl(value) {
+    if (typeof value !== 'string') return '';
+    const url = value.trim();
+    if (/^https?:\/\//i.test(url) || url.startsWith('/images/') || /^data:image\//i.test(url)) return url;
+    return '';
+  }
+
+  function renderLightbox() {
+    const item = lightboxItems[lightboxIndex] || {};
+    const url = safeImageUrl(item.url);
+    if (els.imageDialogImg) {
+      els.imageDialogImg.loading = 'eager';
+      els.imageDialogImg.src = url;
+      els.imageDialogImg.alt = item.prompt || 'Сгенерированное изображение';
+    }
+    if (els.imageDialogTitle) {
+      els.imageDialogTitle.textContent = item.prompt
+        ? String(item.prompt).slice(0, 140)
+        : 'Изображение' + (lightboxItems.length > 1 ? ' ' + (lightboxIndex + 1) + ' из ' + lightboxItems.length : '');
+      els.imageDialogTitle.title = item.prompt || '';
+    }
+    const many = lightboxItems.length > 1;
+    if (els.imagePrev) els.imagePrev.hidden = !many;
+    if (els.imageNext) els.imageNext.hidden = !many;
+  }
+
+  function openImageLightbox(items, index) {
+    lightboxItems = (Array.isArray(items) ? items : [])
+      .map((it) => (typeof it === 'string' ? { url: it } : it))
+      .filter((it) => it && safeImageUrl(it.url));
+    if (!lightboxItems.length || !els.imageDialog) return;
+    lightboxIndex = Math.max(0, Math.min(Number(index) || 0, lightboxItems.length - 1));
+    renderLightbox();
+    if (!els.imageDialog.open) els.imageDialog.showModal();
+  }
+
+  function stepImage(delta) {
+    if (lightboxItems.length < 2) return;
+    lightboxIndex = (lightboxIndex + delta + lightboxItems.length) % lightboxItems.length;
+    renderLightbox();
+  }
+
   function paintBubble(bubble, m, live) {
     const prevReasoning = bubble.querySelector('details.reasoning');
     const wasOpen = !!(prevReasoning || {}).open;
@@ -913,15 +987,25 @@
       if (!live) decorate(md);
     }
     if (isBot && Array.isArray(m.images) && m.images.length) {
+      const imgs = m.images.filter((img) => img && safeImageUrl(img.url));
       const gallery = el('div', 'image-attachments');
-      for (const img of m.images) {
+      imgs.forEach((img, i) => {
+        const url = safeImageUrl(img.url);
         const fig = el('figure', 'image-attachment');
         const a = el('a', 'image-link');
-        a.href = img.url;
+        a.href = url;
         a.target = '_blank';
         a.rel = 'noopener noreferrer';
+        a.title = 'Открыть просмотр';
+        // Обычный клик — в модальный просмотр; Ctrl/средняя кнопка — как раньше,
+        // в новой вкладке.
+        a.addEventListener('click', (e) => {
+          if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+          e.preventDefault();
+          openImageLightbox(imgs, i);
+        });
         const pic = el('img', 'attachment');
-        pic.src = img.url;
+        pic.src = url;
         pic.alt = (img.prompt || 'Сгенерированное изображение').slice(0, 160);
         pic.loading = 'lazy';
         a.appendChild(pic);
@@ -931,8 +1015,8 @@
             (img.backend ? img.backend + ' · ' : '') + 'seed ' + img.seed));
         }
         gallery.appendChild(fig);
-      }
-      bubble.appendChild(gallery);
+      });
+      if (gallery.childElementCount) bubble.appendChild(gallery);
     }
     if (isBot && Array.isArray(m.sources) && m.sources.length) {
       const box = el('div', 'sources');
@@ -3100,6 +3184,7 @@
       return;
     }
     if (e.key === 'Escape') {
+      if (els.imageDialog && els.imageDialog.open) return; // диалог закроется сам
       if (els.app.classList.contains('nav-open')) closeNav();
       else if (els.drawer.classList.contains('open')) closeDrawer();
     }
@@ -3110,6 +3195,39 @@
   if (els.mcpTokenRotate) els.mcpTokenRotate.addEventListener('click', rotateMcpToken);
   if (els.mcpTokenRevoke) els.mcpTokenRevoke.addEventListener('click', revokeMcpToken);
   if (els.settingsBtn) els.settingsBtn.addEventListener('click', loadMcpToken);
+
+  // ---------- просмотр изображений ----------
+  if (els.imageDialog) {
+    if (els.imageClose) els.imageClose.addEventListener('click', () => els.imageDialog.close());
+    if (els.imagePrev) els.imagePrev.addEventListener('click', () => stepImage(-1));
+    if (els.imageNext) els.imageNext.addEventListener('click', () => stepImage(1));
+    if (els.imageStage) {
+      els.imageStage.addEventListener('click', (e) => {
+        if (e.target === els.imageStage) els.imageDialog.close();
+      });
+    }
+    // Клик по фону самого dialog (за пределами белой области) тоже закрывает.
+    els.imageDialog.addEventListener('click', (e) => {
+      if (e.target === els.imageDialog) els.imageDialog.close();
+    });
+    els.imageDialog.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft') { e.preventDefault(); stepImage(-1); }
+      if (e.key === 'ArrowRight') { e.preventDefault(); stepImage(1); }
+    });
+    let touchX = 0, touchY = 0;
+    els.imageDialog.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1) return;
+      touchX = e.touches[0].clientX;
+      touchY = e.touches[0].clientY;
+    }, { passive: true });
+    els.imageDialog.addEventListener('touchend', (e) => {
+      if (!e.changedTouches.length) return;
+      const dx = e.changedTouches[0].clientX - touchX;
+      const dy = e.changedTouches[0].clientY - touchY;
+      if (dy > 90 && Math.abs(dy) > Math.abs(dx) * 1.4) els.imageDialog.close();
+      else if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.4) stepImage(dx < 0 ? 1 : -1);
+    }, { passive: true });
+  }
 
   // ---------- start ----------
 

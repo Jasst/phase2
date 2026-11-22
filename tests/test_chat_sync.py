@@ -92,6 +92,21 @@ def test_chat_store_dedupes_reattached_answer_copies(tmp_path):
     assert [m['id'] for m in msgs] == ['u1m', 'a1']
 
 
+def test_chat_store_keeps_image_only_answer(tmp_path):
+    """Картинка без текста — полноценный ответ, его нельзя выбрасывать при выдаче."""
+    store = ChatStore(str(tmp_path / 'chats.sqlite'))
+    first = {'url': '/images/u1/a.png', 'seed': 1}
+    second = {'url': '/images/u1/b.png', 'seed': 2}
+    store.merge('u1', [_sess('c1')], {'c1': [
+        _msg('u1m', 'user', 'нарисуй', time=1000),
+        {**_msg('a1', 'assistant', '', time=1001), 'images': [first]},
+        {**_msg('a2', 'assistant', '', time=1002), 'images': [first, second]},
+    ]})
+    msgs = store.snapshot('u1')['messages']['c1']
+    assert [m['id'] for m in msgs] == ['u1m', 'a1']
+    assert msgs[1]['images'] == [first, second]
+
+
 def test_save_chat_to_memory_builds_one_stable_document(running, monkeypatch):
     """Чат → память: один документ, системные сообщения выброшены, повтор идемпотентен."""
     app, port = running

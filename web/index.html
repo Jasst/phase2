@@ -262,6 +262,19 @@
   </form>
 </dialog>
 
+<dialog id="imageDialog" class="dialog image-dialog" aria-label="Просмотр изображения">
+  <div class="lightbox">
+    <div class="lightbox-bar">
+      <span class="lightbox-title" id="imageDialogTitle">Изображение</span>
+      <span class="lightbox-hint">Esc · фон · свайп вниз</span>
+      <button class="icon-btn lightbox-nav" id="imagePrev" type="button" aria-label="Предыдущее изображение" hidden>‹</button>
+      <button class="icon-btn lightbox-nav" id="imageNext" type="button" aria-label="Следующее изображение" hidden>›</button>
+      <button class="icon-btn lightbox-close" id="imageClose" type="button" aria-label="Закрыть просмотр">×</button>
+    </div>
+    <div class="lightbox-stage" id="imageStage"><img id="imageDialogImg" alt=""></div>
+  </div>
+</dialog>
+
 <dialog id="confirmDialog" class="dialog dialog-sm">
   <form method="dialog" class="dialog-body">
     <header>

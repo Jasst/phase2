@@ -88,6 +88,21 @@ class ChatStore:
             return fallback
 
     @staticmethod
+    def _merge_images(a, b) -> List[dict]:
+        """Соединяет картинки двух копий ответа без дублей по url."""
+        out: List[dict] = []
+        seen = set()
+        for img in (a if isinstance(a, list) else []) + (b if isinstance(b, list) else []):
+            if not isinstance(img, dict):
+                continue
+            url = img.get("url")
+            if not isinstance(url, str) or not url or url in seen:
+                continue
+            seen.add(url)
+            out.append(img)
+        return out
+
+    @staticmethod
     def _dedupe_messages(items: Iterable[dict]) -> List[dict]:
         """Схлопывает копии одного ответа, оставшиеся от старого реаттача.
 
@@ -103,6 +118,7 @@ class ChatStore:
             text = str(m.get("text") or "")
             if role == "assistant" and not m.get("pending") and not text \
                     and not m.get("reasoning") and not m.get("tools") and not m.get("sources") \
+                    and not m.get("images") \
                     and (m.get("indexPending") or
                          (not m.get("error") and not m.get("note"))):
                 continue
@@ -119,8 +135,17 @@ class ChatStore:
                         break
             if twin is None:
                 out.append(m)
-            elif len(text) > len(str(twin.get("text") or "")) or (not twin.get("text") and text):
-                out[out.index(twin)] = m
+                continue
+            idx = out.index(twin)
+            imgs = ChatStore._merge_images(twin.get("images"), m.get("images"))
+            longer = len(text) > len(str(twin.get("text") or "")) or (not twin.get("text") and text)
+            if imgs:
+                base = m if longer else twin
+                merged = dict(base)
+                merged["images"] = imgs
+                out[idx] = merged
+            elif longer:
+                out[idx] = m
         return out
 
     # ----- чтение -----
