@@ -36,7 +36,7 @@
     { title: 'Чат в память', prompt: '/chatmem', local: true, hint: 'извлечь факты из всего диалога' },
     { title: 'Карта нейронов', prompt: '/graph', local: true, hint: 'как растёт память' },
   ];
-  const PALETTE = ['#8ea2ff', '#4cc38a', '#e0a458', '#e5544f', '#c58af9', '#5bc0de', '#f28db2', '#b5c77a'];
+  const PALETTE = ['#a6bfe0', '#4cc38a', '#e0a458', '#e5544f', '#c58af9', '#7fd2e8', '#f28db2', '#b5c77a'];
   const ICON_SEND = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4Z"/></svg>';
   const ICON_STOP = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
   const ICON_COPY = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
@@ -2164,9 +2164,9 @@
   }
 
   function withAlpha(hex, alpha) {
-    let h = String(hex || '#8ea2ff').replace('#', '');
+    let h = String(hex || '#a6bfe0').replace('#', '');
     if (h.length === 3) h = h.split('').map((x) => x + x).join('');
-    const v = parseInt(h, 16) || 0x8ea2ff;
+    const v = parseInt(h, 16) || 0xa6bfe0;
     return 'rgba(' + ((v >> 16) & 255) + ',' + ((v >> 8) & 255) + ',' + (v & 255) + ',' + alpha + ')';
   }
 
@@ -2268,7 +2268,7 @@
       if (n.fixed) {   // нейрон закреплён перетаскиванием
         ctx.beginPath();
         ctx.arc(n.x + n.r * 0.8, n.y - n.r * 0.8, 2.2 * inv, 0, Math.PI * 2);
-        ctx.fillStyle = '#a9cdff';
+        ctx.fillStyle = '#c3d7f7';
         ctx.fill();
       }
       if (n === graph.selected) {

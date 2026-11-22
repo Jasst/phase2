@@ -45,6 +45,8 @@ def agent_limits(env: Optional[dict] = None) -> dict:
         # субагент: раундов на задачу и одновременных LLM-запросов субагентов
         "sub_rounds": _env_int(env, "SUBAGENT_MAX_ROUNDS", 3, 1, 6),
         "llm_parallel": _env_int(env, "AGENT_LLM_PARALLEL", 1, 1, 4),
+        # пауза после сбоя сервера памяти: ход не ждёт его каждый раз (сек)
+        "mcp_cooldown": _env_int(env, "MCP_COOLDOWN_SECONDS", 45, 0, 600),
     }
 
 

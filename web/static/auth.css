@@ -7,20 +7,20 @@
   --bg-hover: rgba(253, 252, 252, .055);
   --glass-strong: rgba(32, 29, 29, .97);
   --glass-border-light: rgba(253, 252, 252, .14);
-  --accent-color: #4d9dff;
-  --accent-light: #a9cdff;
-  --accent-soft: rgba(0, 122, 255, .16);
-  --accent-gradient: linear-gradient(180deg, #3a91ff 0%, #007aff 100%);
+  --accent-color: #a6bfe0;   /* синий метал — основной акцент (кнопки, рамки) */
+  --accent-light: #dbe8ff;
+  --accent-soft: rgba(166, 191, 224, .16);
+  --accent-gradient: linear-gradient(180deg, #c3d7f7 0%, #a6bfe0 100%);
   --text-main: #fdfcfc;
   --text-secondary: #9a9898;
   --text-muted: #6f6c6c;
   --border-color: rgba(253, 252, 252, .1);
-  --border-focus: #4d9dff;
+  --border-focus: #a6bfe0;
   --success-color: #30d158;
   --danger-color: #ff453a;
   --shadow-xl: 0 16px 48px rgba(0, 0, 0, .6);
-  --glow-sm: 0 0 10px rgba(0, 122, 255, .14);
-  --glow-md: 0 0 20px rgba(0, 122, 255, .18);
+  --glow-sm: 0 0 10px rgba(166, 191, 224, .14);
+  --glow-md: 0 0 20px rgba(166, 191, 224, .18);
   --transition-fast: 150ms cubic-bezier(.4, 0, .2, 1);
   --radius: 6px;
   --font-mono: "Cascadia Code", "Cascadia Mono", "JetBrains Mono", "SFMono-Regular", Consolas, "Courier New", monospace;
@@ -33,7 +33,7 @@ body {
   padding: calc(20px + env(safe-area-inset-top)) max(20px, env(safe-area-inset-right))
            calc(20px + env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
   background:
-    radial-gradient(900px 600px at 50% -12%, rgba(169, 205, 255, .05), transparent 70%),
+    radial-gradient(900px 600px at 50% -12%, rgba(219, 232, 255, .06), transparent 70%),
     var(--bg-primary);
   color: var(--text-main);
   font: 500 15px/1.55 var(--font-mono);
@@ -48,7 +48,7 @@ body {
 .auth-head { padding: 22px 20px 0; text-align: center; }
 .auth-head .mark {
   font-size: 26px; color: var(--accent-light);
-  text-shadow: 0 0 18px rgba(169, 205, 255, .55);
+  text-shadow: 0 0 18px rgba(219, 232, 255, .55);
 }
 .auth-head h1 {
   margin: 4px 0 0; font-size: 13px; font-weight: 650;

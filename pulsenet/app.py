@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -31,6 +32,8 @@ from .workspace import Workspace
 
 CONTEXT_TURNS = 8
 ERROR_LOG_SIZE = 50
+LLM_RETRIES = 2                 # повторы при сбое соединения с LLM, если пользователь ещё ничего не увидел
+LLM_RETRY_DELAY = 1.5           # сек, умножается на номер попытки
 MEMORY_RETRIES = 12          # индексация ждёт недоступный MCP: 12 попыток
 MEMORY_RETRY_SECONDS = 5.0
 
@@ -56,10 +59,14 @@ WORKFLOW_HINT = (
     "3) заметки для себя о работе и о пользователе, а также выводы из ошибок — note_write с kind=self; "
     "обычные заметки — kind=note; "
     "4) картинку из image_generate можно вставить в заметку: image_url=\"last\"; "
-    "5) простые самостоятельные подзадачи (поиск в памяти, факты из сети, картинка) удобно отдать "
-    "субагенту через subagent: несколько вызовов в одном шаге выполняются параллельно."
+    "5) субагент (subagent) — для самостоятельной подзадачи, которую можно описать одной фразой "
+    "(поиск в памяти, сбор фактов, картинка). В task — что вернуть, в context — нужный кусок вопроса. "
+    "Не делегируй то, что сделаешь одним вызовом сам. Несколько subagent в одном шаге идут параллельно."
 )
 
+
+TRIVIAL_RE = re.compile(r"^(привет\w*|здравствуй\w*|спасибо|благодарю|пока|ок|окей|ага|да|нет|хорошо|"
+                        r"понятно|hi|hello|thanks|thank you|ok|okay|bye)[\s!.?,)]*$", re.IGNORECASE)
 
 SUBAGENT_PERSONA = (
     "Ты — субагент. Выполни одну подзадачу коротко и точно. Инструменты вызывай, только если без них "
@@ -73,6 +80,14 @@ def looks_multistep(text: str) -> bool:
     markers = sum(t.count(m) for m in ("\n- ", "\n* ", "\n1.", "\n2.", " затем ", " потом ",
                                        " после этого ", " сначала ", " then ", " and then "))
     return markers >= 2 or (len(t) > 400 and markers >= 1)
+
+
+def _env_num(env: dict, key: str, default: float, lo: float, hi: float) -> float:
+    try:
+        value = float(env.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(lo, min(hi, value))
 
 
 def _preview(text: str, limit: int = 600) -> str:
@@ -138,6 +153,17 @@ class App:
         # общая для всех ваших агентов. Значение по умолчанию local: без .env поведение прежнее.
         self.memory_backend = (self.env.get("PULSENET_MEMORY") or "local").strip().lower()
         self.memory = self._make_remote_memory() if self.memory_backend == "mcp" else self._make_memory(data_dir)
+        # Индексация не должна конкурировать с ответом чата: пока идёт ход, фоновые записи ждут.
+        self._busy_cv = threading.Condition()
+        self._chat_busy = 0
+        self.index_cfg = {
+            "mode": (self.env.get("INDEX_MODE", "batch") or "batch").strip().lower(),
+            "min_chars": _env_num(self.env, "INDEX_MIN_CHARS", 15, 0, 5000),
+            "debounce": _env_num(self.env, "INDEX_DEBOUNCE_SECONDS", 8, 0.1, 3600),
+            "batch_max": int(_env_num(self.env, "INDEX_BATCH_MAX", 8, 1, 100)),
+        }
+        self._index_recent: "deque[int]" = deque(maxlen=200)
+        self._mcp_cool_until = 0.0
         self._index_q: "queue.Queue[tuple]" = queue.Queue()
         self._worker = threading.Thread(target=self._index_loop, daemon=True, name="triplex-index")
         self._worker.start()
@@ -256,24 +282,50 @@ class App:
                              min_cos=min_cos)
 
     def _index_loop(self) -> None:
-        """Одна фоновая очередь: экстракция идёт через ту же модель, что и чат, поэтому по одной.
-        Если MCP-сервер памяти недоступен, сообщение ждёт его (MEMORY_RETRIES попыток), а не теряется."""
+        """Индексация пакетами. Сообщения копятся, пока пользователь пишет (debounce), и записываются
+        только когда модель свободна — то есть нет активного хода чата. Один ingest на чат вместо
+        одного LLM-вызова экстракции на каждое сообщение. Недоступный MCP — повторы, не потеря."""
+        cfg = self.index_cfg
         while True:
-            text, chat_id, role = self._index_q.get()
+            first = self._index_q.get()
+            batch = [first]
+            while len(batch) < cfg["batch_max"]:
+                try:
+                    batch.append(self._index_q.get(timeout=cfg["debounce"]))
+                except queue.Empty:
+                    break
+            self._wait_model_idle()
             try:
-                for attempt in range(MEMORY_RETRIES):
-                    try:
-                        self.ingest(text, session_id=chat_id or "default", role=role)
-                        break
-                    except MemoryUnavailable as exc:
-                        if attempt == MEMORY_RETRIES - 1:
-                            self.log_error("индексация: память недоступна, сообщение не сохранено", exc)
-                        else:
-                            time.sleep(MEMORY_RETRY_SECONDS)
+                self._flush_batch(batch)
             except Exception as exc:              # noqa: BLE001
                 self.log_error("индексация", exc)
             finally:
-                self._index_q.task_done()
+                for _ in batch:
+                    self._index_q.task_done()
+
+    def _wait_model_idle(self) -> None:
+        with self._busy_cv:
+            while self._chat_busy > 0:
+                self._busy_cv.wait(timeout=1.0)
+
+    def _flush_batch(self, batch: list) -> None:
+        per_chat: Dict[str, List[str]] = {}
+        roles: Dict[str, str] = {}
+        for text, chat_id, role in batch:
+            key = chat_id or "default"
+            per_chat.setdefault(key, []).append(text)
+            roles.setdefault(key, role)
+        for chat_id, texts in per_chat.items():
+            joined = "\n".join(texts)
+            for attempt in range(MEMORY_RETRIES):
+                try:
+                    self.ingest(joined, session_id=chat_id, role=roles[chat_id])
+                    break
+                except MemoryUnavailable as exc:
+                    if attempt == MEMORY_RETRIES - 1:
+                        self.log_error("индексация: память недоступна, сообщение не сохранено", exc)
+                    else:
+                        time.sleep(MEMORY_RETRY_SECONDS)
 
     def ingest(self, text: str, session_id: str = "", role: str = "user", recorded_at=None,
                model: str = "") -> dict:
@@ -296,9 +348,22 @@ class App:
             self.log_error("экстракция фактов", RuntimeError(out.get("error", "неизвестная ошибка")))
         return out
 
-    def index_async(self, text: str, chat_id: str, role: str = "user") -> None:
-        if self.memory_enabled:
-            self._index_q.put((text, chat_id, role))
+    def index_async(self, text: str, chat_id: str, role: str = "user", force: bool = False) -> None:
+        """Поставить текст в индексацию. Обычные сообщения: короткие, команды и повторы пропускаются;
+        force=True — явный /remember и инструмент memory_remember."""
+        if not self.memory_enabled:
+            return
+        clean = " ".join(str(text or "").split())
+        if not force:
+            if self.index_cfg["mode"] == "off" or len(clean) < self.index_cfg["min_chars"]:
+                return
+            if TRIVIAL_RE.match(clean):           # приветствия и служебные реплики фактов не содержат
+                return
+            key = hash((chat_id or "default", clean))
+            if key in self._index_recent:
+                return
+            self._index_recent.append(key)
+        self._index_q.put((clean, chat_id, role))
 
     def index_pending(self) -> int:
         return self._index_q.qsize()
@@ -319,14 +384,26 @@ class App:
                 "пересказывай вслух):\n" + "\n".join(lines)[:1200])
 
     def _run_subagent(self, task: str, tools: ChatTools, names: List[str], requested: List[str],
-                      on_delta, cancelled) -> Outcome:
-        """Субагент: отдельный короткий цикл с тем же LLM. Его вызовы видны в трассе (поле sub)."""
+                      on_delta, cancelled, origin: str = "") -> Outcome:
+        """Субагент: отдельный короткий цикл с тем же LLM. Его вызовы видны в трассе (поле sub).
+        Ошибка модели или инструмента не роняет родительский ход: возвращается как результат."""
+        try:
+            return self._run_subagent_impl(task, tools, names, requested, on_delta, cancelled, origin)
+        except Exception as exc:                  # noqa: BLE001
+            self.log_error("субагент", exc)
+            return Outcome(False, f"Субагент не выполнил задачу: {exc}. Сделай это сам или ответь по имеющемуся.",
+                           label=f"Субагент: «{_preview(task, 60)}»", detail="ошибка")
+
+    def _run_subagent_impl(self, task: str, tools: ChatTools, names: List[str], requested: List[str],
+                           on_delta, cancelled, origin: str = "") -> Outcome:
         allowed = [n for n in names if n not in SUBAGENT_DENY]
         if requested:
             allowed = [n for n in allowed if n in requested] or allowed
         sid = "s" + uuid.uuid4().hex[:6]
         lim = self.limits
         system = SUBAGENT_PERSONA
+        if origin:
+            system += f"\n\nОбщий вопрос пользователя (для контекста, не отвечай на него целиком): {_preview(origin, 600)}"
         ins = instructions(allowed, tools.specs(allowed))
         if ins:
             system += "\n\n" + ins
@@ -411,9 +488,13 @@ class App:
     def memory_context(self, message: str) -> str:
         if not self.memory_enabled:
             return ""
+        if time.monotonic() < self._mcp_cool_until:
+            return ""                             # сервер памяти недавно не отвечал: не ждём его каждый ход
         try:
             ctx = self.memory.recall(message)["context"]
         except Exception as exc:                  # noqa: BLE001
+            if isinstance(exc, MemoryUnavailable):
+                self._mcp_cool_until = time.monotonic() + self.limits["mcp_cooldown"]
             self.log_error("поиск в памяти", exc)
             return ""
         if not ctx:
@@ -427,7 +508,7 @@ class App:
     def _tool_remember(self, text: str, chat_id: str) -> dict:
         if not self.memory_enabled:
             return {"status": "disabled"}
-        self.index_async(text, chat_id, "user")
+        self.index_async(text, chat_id, "user", force=True)
         return {"status": "queued"}
 
     def graph(self, max_edges: int = 200) -> dict:
@@ -492,6 +573,20 @@ class App:
     def chat(self, message: str, chat_id: str, on_delta: Callable[[str, object], None],
              cancelled: Optional[Callable[[], bool]] = None, web: bool = False, model: str = "",
              uid: Optional[str] = None) -> str:
+        """Ход чата. Пока он идёт, индексация ждёт: модель занята ответом."""
+        with self._busy_cv:
+            self._chat_busy += 1
+        try:
+            return self._chat_impl(message, chat_id, on_delta, cancelled=cancelled, web=web,
+                                   model=model, uid=uid)
+        finally:
+            with self._busy_cv:
+                self._chat_busy -= 1
+                self._busy_cv.notify_all()
+
+    def _chat_impl(self, message: str, chat_id: str, on_delta: Callable[[str, object], None],
+                   cancelled: Optional[Callable[[], bool]] = None, web: bool = False, model: str = "",
+                   uid: Optional[str] = None) -> str:
         """Ход чата с инструментами.
 
         on_delta(kind, payload):
@@ -517,7 +612,7 @@ class App:
         # Субагент получает инструменты текущего хода (без записи и без рекурсии).
         # Подключаем до available(): иначе инструмент subagent не попадёт в каталог.
         tools.set_subagent(lambda task, requested: self._run_subagent(
-            task, tools, names, requested, on_delta, is_cancelled))
+            task, tools, names, requested, on_delta, is_cancelled, origin=message))
         names = tools.available(web=web, memory=self.memory_enabled)
         specs = tools.specs(names)
         parts: List[str] = []
@@ -597,10 +692,25 @@ class App:
                 else:
                     on_delta(kind, text)
 
-            if native_tools:
-                self.backend.stream(rel, messages, delta, cancelled=is_cancelled, tools=native_tools)
-            else:
-                self.backend.stream(rel, messages, delta, cancelled=is_cancelled)
+            stream_err = None
+            for attempt in range(LLM_RETRIES + 1):
+                try:
+                    if native_tools:
+                        self.backend.stream(rel, messages, delta, cancelled=is_cancelled, tools=native_tools)
+                    else:
+                        self.backend.stream(rel, messages, delta, cancelled=is_cancelled)
+                    stream_err = None
+                    break
+                except llm.BackendError as exc:
+                    stream_err = exc
+                    # повторяем, только если пользователь ещё ничего не увидел и ход не отменён
+                    if step or native or flt.calls_raw or is_cancelled() or attempt == LLM_RETRIES:
+                        break
+                    time.sleep(LLM_RETRY_DELAY * (attempt + 1))
+            if stream_err is not None:
+                self.log_error("модель", stream_err)
+                stop_reason = "llm_error"
+                break
             tail = flt.finish()
             if tail:
                 step.append(tail)
@@ -685,7 +795,11 @@ class App:
                     futures = [pool.submit(self._call_tool, tools, it["name"], it["args"], on_delta)
                                for it in to_run]
                     for it, fut in zip(to_run, futures):
-                        it["out"] = fut.result()
+                        try:
+                            it["out"] = fut.result()
+                        except Exception as exc:          # noqa: BLE001 — инструмент не роняет ход
+                            it["out"] = Outcome(False, f"Ошибка инструмента {it['name']}: {exc}",
+                                                label="Инструмент", detail=_preview(str(exc), 120))
             else:
                 for it in to_run:
                     it["out"] = self._call_tool(tools, it["name"], it["args"], on_delta)
@@ -741,7 +855,8 @@ class App:
                         "call_limit": "Достигнут лимит вызовов инструментов — отвечаю по собранным данным.",
                         "failures": "Инструменты не справились — отвечаю по собранным данным.",
                         "no_progress": "Отвечаю по собранным данным.",
-                        "cancelled": "Ответ остановлен."}.get(stop_reason)
+                        "cancelled": "Ответ остановлен.",
+                        "llm_error": "Модель не ответила: проверь, что LM Studio или llama.cpp запущены и модель загружена."}.get(stop_reason)
             if fallback:
                 emit_text(fallback)
                 answer = "".join(parts).strip()

@@ -127,6 +127,8 @@ SPECS: Dict[str, dict] = {
                        "выполняются параллельно. Субагент не пишет в навыки, заметки и план.",
         "parameters": {"type": "object",
                        "properties": {"task": {"type": "string", "description": "что сделать и что вернуть"},
+                                      "context": {"type": "string",
+                                                  "description": "необязательно: нужный кусок вопроса пользователя"},
                                       "tools": {"type": "array", "items": {"type": "string"},
                                                 "description": "необязательно: какие инструменты дать"}},
                        "required": ["task"]},
@@ -304,6 +306,9 @@ class ChatTools:
                 task = _str(args.get("task"))
                 if not task:
                     return Outcome(False, "Пустая задача для субагента.", label="Субагент")
+                context = _str(args.get("context"))
+                if context:
+                    task = f"{task}\nКонтекст: {context}"
                 requested = args.get("tools")
                 requested = [_str(x) for x in requested] if isinstance(requested, list) else []
                 return self._subagent(task, requested)
