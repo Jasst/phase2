@@ -66,7 +66,7 @@ def running(tmp_path, monkeypatch):
     threading.Thread(target=llm.serve_forever, daemon=True).start()
     env = {"LLM_BACKEND": "lmstudio", "LMSTUDIO_URL": f"http://127.0.0.1:{llm.server_address[1]}/v1",
            "LMSTUDIO_MODEL": "fake-model", "PULSENET_MCP_TOKEN": TOKEN, "PULSENET_MCP_HOSTS": "localhost",
-           "TRIPLEX_EMBED_URL": ""}
+           "TRIPLEX_EMBED_URL": "", "AUTH_DISABLED": "1"}
     app = App(env, data_dir=str(tmp_path / "data"))
     srv = make_server(app, "127.0.0.1", 0, web_dir=WEB_DIR)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -101,6 +101,50 @@ def test_distill_endpoint(running, monkeypatch):
                                                "fact_id": fid, "model": model})
     status, body = _json(port, "POST", "/api/memory/distill", {"fact_id": "f1"})
     assert status == 200 and body["verdict"] == "keep" and body["fact_id"] == "f1"
+
+
+def test_neuron_management_endpoints(running, monkeypatch):
+    app, port = running
+    seen = {}
+
+    def dedupe(model="", fact_ids=None, limit=150):
+        seen["dedupe"] = (model, fact_ids, limit)
+        return {"status": "ok", "scanned": 2, "groups": [{"ids": ["f1", "f2"]}]}
+
+    def recombine(fact_ids, model="", apply=False):
+        seen["recombine"] = (fact_ids, model, apply)
+        return {"status": "ok", "applied": apply, "fact_id": "f3"}
+
+    def edit(fact_id, s="", r="", o="", confidence=0.8, reason="", model=""):
+        seen["edit"] = (fact_id, s, r, o, confidence, reason, model)
+        return {"status": "ok", "new_fact_id": "f4"}
+
+    def forget(fact_ids=None, node_id=""):
+        seen["forget"] = (fact_ids, node_id)
+        return {"status": "ok", "retracted": fact_ids or [], "node_id": node_id}
+
+    monkeypatch.setattr(app, "dedupe_facts", dedupe)
+    monkeypatch.setattr(app, "recombine_facts", recombine)
+    monkeypatch.setattr(app, "edit_fact", edit)
+    monkeypatch.setattr(app, "forget_facts", forget)
+
+    status, body = _json(port, "POST", "/api/memory/dedupe",
+                         {"model": "m1", "fact_ids": ["f1", "f2"], "limit": 40})
+    assert status == 200 and body["groups"][0]["ids"] == ["f1", "f2"]
+    assert seen["dedupe"] == ("m1", ["f1", "f2"], 40)
+
+    status, body = _json(port, "POST", "/api/memory/recombine",
+                         {"fact_ids": ["f1", "f2"], "model": "m1", "apply": True})
+    assert status == 200 and body["applied"] is True and seen["recombine"] == (["f1", "f2"], "m1", True)
+
+    status, body = _json(port, "POST", "/api/memory/edit",
+                         {"fact_id": "f1", "s": "А", "r": "любит", "o": "Б",
+                          "confidence": 0.9, "reason": "правка", "model": "m1"})
+    assert status == 200 and body["new_fact_id"] == "f4"
+    assert seen["edit"] == ("f1", "А", "любит", "Б", 0.9, "правка", "m1")
+
+    status, body = _json(port, "POST", "/api/memory/forget", {"node_id": "e:1"})
+    assert status == 200 and body["node_id"] == "e:1" and seen["forget"] == (None, "e:1")
 
 
 def test_serve_forever_cleans_up_on_ctrl_c(monkeypatch, tmp_path):

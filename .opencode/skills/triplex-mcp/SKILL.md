@@ -1,17 +1,19 @@
 ---
 name: Triplex MCP
-description: Работа с памятью ТРИПЛЕКСИЯ и интернет-поиском через MCP проекта pulsenet (pulsenet-unified). Единая общая память для всех агентов, автор каждого факта — поле agent. Выбор между web_fetch и браузером.
+description: Работа с памятью ТРИПЛЕКСИЯ, интернет-поиском и генерацией изображений через MCP проекта pulsenet (pulsenet-unified). Единая общая память для всех агентов, автор каждого факта — поле agent. Выбор между web_fetch и браузером, вызов image_generate для картинок.
 ---
 
 # Skill: MCP памяти и интернета (проект phase2)
 
-Используйте этот skill, когда задача касается памяти ТРИПЛЕКСИИ, поиска в интернете через MCP
-или выбора между `web_fetch` и браузером.
+Используйте этот skill, когда задача касается памяти ТРИПЛЕКСИИ, поиска в интернете через MCP,
+выбора между `web_fetch` и браузером или генерации изображений через `image_generate`.
 
 ## Архитектура
 
 - Единственный MCP-сервер: `pulsenet-unified`, адрес `http://127.0.0.1:8010/mcp`.
   Запуск: `python -m pulsenet.unified_mcp serve` (из папки `pulsenet`) или `run_server.bat`.
+  `run_server.bat` также поднимает локальный Easy Diffusion на `:9000` (скрипт `start_easydiffusion.ps1`);
+  при его отсутствии генерация автоматически уходит на запасной бэкенд.
 - **Память общая.** Один журнал фактов на всех ваших агентов (`MCP_MEMORY_SCOPE=shared`).
   Агент определяется токеном. Чат пишет под именем `chat`, opencode — под своим токеном.
   Автор каждого факта виден в поле `agent`, сервер заполняет его сам, передавать не нужно.
@@ -22,7 +24,7 @@ description: Работа с памятью ТРИПЛЕКСИЯ и интерн
 
 ## Namespace
 
-- `tools["pulsenet-unified"].*` — основной набор (память, интернет, личность, ядро, код).
+- `tools["pulsenet-unified"].*` — основной набор (память, интернет, изображения, личность, ядро, код).
 - Перед использованием уточняйте точные имена и аргументы через `search({ namespace: "pulsenet-unified" })`.
   Не угадывайте имена.
 
@@ -34,6 +36,7 @@ description: Работа с памятью ТРИПЛЕКСИЯ и интерн
 | Запись | `triplex_ingest`, `triplex_assert`, `triplex_supersede`, `triplex_link` | `triplex_ingest(text, session_id, role)` возвращает `doc_id`. `triplex_assert(s, r, o, doc_id, span, confidence, functional)`. `triplex_supersede(old_fact_id, s, r, o, valid_from, doc_id, span, ...)`, `valid_from` обязателен. `triplex_link(entity_id, alias)` — привязать написание к сущности. |
 | Управление фактами | `triplex_confirm`, `triplex_retract`, `triplex_define_relation`, `triplex_stats`, `triplex_check` | `triplex_confirm(fact_id, yes)`, `triplex_retract(fact_id)`. `triplex_check` проверяет инварианты журнала. |
 | Интернет | `web_search`, `web_fetch` | `web_search(queries | query, max_results)`, до 4 запросов. `web_fetch(url)` — только публичные http(s), без редиректов. Результаты кэшируются на `WEB_CACHE_TTL` секунд (по умолчанию 600). |
+| Изображения | `image_generate` | Картинка по описанию. Локальный Easy Diffusion (`/render` + `/image/stream`) с fallback на Pollinations. См. раздел «Генерация изображений» ниже. |
 | Журнал и описание | `activity_recent`, `pulsenet_guide`, `whoami` | `activity_recent(limit)` — что делалось и что не вышло. `pulsenet_guide()` — описание сервера и рабочий процесс, вызывайте первым, если не уверены. |
 | Личность и ядро | `identity_propose`, `identity_commit`, `identity_chain`, `core_get`, `core_propose`, `core_commit` | Личность — с карантином (подтверждение в разные дни, по цитате из памяти). Ядро меняет только администратор. |
 | Код | `code_list`, `code_read`, `code_search` | Только для пользователей из `CODE_ACCESS_USERS`, только корни из `CODE_ROOTS`. |
@@ -44,6 +47,45 @@ description: Работа с памятью ТРИПЛЕКСИЯ и интерн
 2. **Если память расходится с кодом или реальностью:** доверяйте реальности, затем `triplex_supersede` (новый факт вытесняет старый) или `triplex_retract`.
 3. **После подтверждённого решения** (архитектура, исправление, правило): `triplex_ingest` текста → `doc_id` → `triplex_assert` с `doc_id` и `span` (символьный диапазон `[начало, конец]` внутри документа).
 4. **Неуверенные факты:** `triplex_confirm(fact_id, yes)`. Конфликт функционального отношения при записи возвращает `status: conflict` и `old_fact_id`.
+
+## Генерация изображений: `image_generate`
+
+Вызывается **только как MCP-инструмент** — без slash-команды `/image`, без триггерных фраз и авто-регексов.
+Промпт формулирует сам агент (авто-улучшения `enhance_prompt` нет: лишний LLM-вызов и риск исказить намерение).
+
+```js
+const r = await tools["pulsenet-unified"].image_generate({
+  prompt: "лисёнок в зимнем лесу, мягкий свет, подробная шерсть",
+  seed: 42,                 // -1 или пусто — случайное; один seed = повторяемый результат
+  steps: 30,                // пусто — EASYDIFFUSION_STEPS
+  width: 512, height: 768,  // округляются до кратных 8; пусто — из .env
+  cfg_scale: 7.0,
+  sampler: "Euler",
+  negative_prompt: "blurry, lowres, watermark",
+  backends: ["easydiffusion", "pollinations"],  // пусто — IMAGE_BACKENDS_ORDER
+  return_image: true,       // по умолчанию true
+});
+```
+
+- Бэкенды перебираются по порядку, **побеждает первый успешный**. Если локальный
+  Easy Diffusion не отвечает, срабатывает запасной `pollinations` — вызов не падает.
+- PNG сохраняется в `IMAGE_OUTPUT_DIR/<user>/image_<дата>_<случайный_суффикс>.png`;
+  рядом лежит `.json` с prompt, seed и всеми параметрами (для повтора генерации).
+- Открыть файл можно по `url` вида `/images/<user>/<file>.png` на том же сервере `:8010`
+  (раздача не требует токена — middleware защищает только `/mcp`).
+
+**Что именно приходит в чат:** приходят **и картинка, и текст** — это два content block'а в одном ответе:
+
+1. `image/png` — само изображение, отображается в чате как вложение;
+2. `text` — JSON с метаданными: `status`, `backend`, `file_path`, `url`, `prompt`, `seed`,
+   `width`, `height`, `steps`, `bytes`, `attempts` (какие бэкенды упали до успеха), `note`.
+
+Исключения:
+- `return_image: false` → в чат придёт **только JSON** (картинки не будет, но файл на диске останется);
+- если PNG больше `IMAGE_INLINE_MAX_BYTES` (по умолчанию 1.5 МБ), встроенной картинки не будет —
+  придёт только JSON с `note` и путём к файлу. Типичный локальный рендер 512×512 ≈ 550 КБ,
+  так что обычные вызовы приходят с картинкой.
+- при отказе всех бэкендов приходит `{"status": "error", "attempts": [...]}` — без картинки.
 
 ## Инварианты и безопасность
 
@@ -86,4 +128,7 @@ description: Работа с памятью ТРИПЛЕКСИЯ и интерн
 ## Быстрая проверка
 
 - В `execute`: `tools["pulsenet-unified"].whoami()` (кто вы для сервера), `pulsenet_guide()` (состояние памяти и режим `memory_scope`).
+  В `whoami()` есть `image_backends` — список бэкендов генерации.
 - Если в `.env` задан `SEARXNG_URL`, проверьте, что `http://127.0.0.1:8080` отвечает.
+- Генерация: `image_generate({prompt: "тест", steps: 6, return_image: false})` — быстрая проверка цепочки
+  бэкендов без нагрузки на модель; в `status`/`backend`/`attempts` видно, кто сработал.

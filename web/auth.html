@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#201d1d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Вход — ТРИПЛЕКСИЯ</title>
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="manifest" href="/static/manifest.json">
+<link rel="stylesheet" href="/static/auth.css">
+</head>
+<body>
+<div class="auth-card">
+  <div class="auth-head">
+    <div class="mark">✦</div>
+    <h1>ТРИПЛЕКСИЯ</h1>
+    <div class="auth-tabs" role="tablist">
+      <button class="auth-tab" role="tab" data-tab="login" aria-selected="true">Вход</button>
+      <button class="auth-tab" role="tab" data-tab="register" aria-selected="false">Регистрация</button>
+      <button class="auth-tab" role="tab" data-tab="forgot" aria-selected="false">Восстановление</button>
+    </div>
+  </div>
+
+  <div class="auth-body">
+    <section data-panel="login">
+      <h2>Вход</h2>
+      <p class="lead">Войдите по email и паролю.</p>
+      <form id="loginForm">
+        <div class="field"><label for="loginEmail">Email</label>
+          <input id="loginEmail" type="email" autocomplete="email" required></div>
+        <div class="field"><label for="loginPass">Пароль</label>
+          <div class="pw-wrap"><input id="loginPass" type="password" autocomplete="current-password" required>
+            <button class="pw-eye" type="button" data-pw-toggle="loginPass" aria-label="Показать пароль" title="Показать пароль">👁</button></div></div>
+        <button class="btn-main" type="submit">Войти</button>
+      </form>
+      <div class="row-between">
+        <button class="btn-link" type="button" data-go="forgot">Забыли пароль?</button>
+        <button class="btn-link" type="button" data-go="register">Создать аккаунт</button>
+      </div>
+      <div class="msg" id="loginMsg"></div>
+    </section>
+
+    <section data-panel="register" hidden>
+      <h2>Регистрация</h2>
+      <p class="lead">Укажите email и пароль. Мы пришлём код подтверждения.</p>
+      <form id="registerForm">
+        <div class="field"><label for="regEmail">Email</label>
+          <input id="regEmail" type="email" autocomplete="email" required></div>
+        <div class="field"><label for="regPass">Пароль (не короче 8 символов)</label>
+          <div class="pw-wrap"><input id="regPass" type="password" autocomplete="new-password" minlength="8" required>
+            <button class="pw-eye" type="button" data-pw-toggle="regPass" aria-label="Показать пароль" title="Показать пароль">👁</button></div></div>
+        <div class="field"><label for="regPassConfirm">Подтвердите пароль</label>
+          <div class="pw-wrap"><input id="regPassConfirm" type="password" autocomplete="new-password"
+                                      minlength="8" required aria-describedby="regPassHint">
+            <button class="pw-eye" type="button" data-pw-toggle="regPassConfirm" aria-label="Показать пароль" title="Показать пароль">👁</button></div>
+          <div class="pw-hint" id="regPassHint"></div></div>
+        <button class="btn-main" type="submit">Получить код</button>
+      </form>
+      <form id="registerConfirmForm" hidden>
+        <p class="lead" id="regSentTo"></p>
+        <div class="field"><label for="regCode">Код из письма</label>
+          <input id="regCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required></div>
+        <button class="btn-main" type="submit">Подтвердить и войти</button>
+        <div class="row-between">
+          <button class="btn-link" type="button" id="regBack">Другой email</button>
+          <button class="btn-link" type="button" id="regResend">Отправить код ещё раз</button>
+        </div>
+      </form>
+      <div class="msg" id="regMsg"></div>
+    </section>
+
+    <section data-panel="forgot" hidden>
+      <h2>Восстановление пароля</h2>
+      <p class="lead">Введите email, мы пришлём код для нового пароля.</p>
+      <form id="forgotForm">
+        <div class="field"><label for="forgotEmail">Email</label>
+          <input id="forgotEmail" type="email" autocomplete="email" required></div>
+        <button class="btn-main" type="submit">Отправить код</button>
+      </form>
+      <form id="resetForm" hidden>
+        <p class="lead" id="resetSentTo"></p>
+        <div class="field"><label for="resetCode">Код из письма</label>
+          <input id="resetCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required></div>
+        <div class="field"><label for="resetPass">Новый пароль (не короче 8 символов)</label>
+          <div class="pw-wrap"><input id="resetPass" type="password" autocomplete="new-password" minlength="8" required>
+            <button class="pw-eye" type="button" data-pw-toggle="resetPass" aria-label="Показать пароль" title="Показать пароль">👁</button></div></div>
+        <div class="field"><label for="resetPassConfirm">Подтвердите новый пароль</label>
+          <div class="pw-wrap"><input id="resetPassConfirm" type="password" autocomplete="new-password"
+                                      minlength="8" required aria-describedby="resetPassHint">
+            <button class="pw-eye" type="button" data-pw-toggle="resetPassConfirm" aria-label="Показать пароль" title="Показать пароль">👁</button></div>
+          <div class="pw-hint" id="resetPassHint"></div></div>
+        <button class="btn-main" type="submit">Сменить пароль</button>
+        <div class="row-between">
+          <button class="btn-link" type="button" id="resetBack">Другой email</button>
+          <button class="btn-link" type="button" id="resetResend">Отправить код ещё раз</button>
+        </div>
+      </form>
+      <div class="msg" id="forgotMsg"></div>
+    </section>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  const $ = (s) => document.querySelector(s);
+  const $$ = (s) => document.querySelectorAll(s);
+  const RESEND_SEC = 60;
+
+  function showTab(name) {
+    $$('.auth-tab').forEach((t) => t.setAttribute('aria-selected', String(t.dataset.tab === name)));
+    $$('[data-panel]').forEach((p) => { p.hidden = p.dataset.panel !== name; });
+    const path = name === 'login' ? '/login' : name === 'register' ? '/register' : '/forgot';
+    if (location.pathname !== path) history.replaceState(null, '', path);
+  }
+  $$('.auth-tab').forEach((t) => t.addEventListener('click', () => showTab(t.dataset.tab)));
+  $$('[data-go]').forEach((b) => b.addEventListener('click', () => showTab(b.dataset.go)));
+
+  function msg(id, text, ok) {
+    const el = $(id);
+    el.textContent = text || '';
+    el.className = 'msg' + (text ? (ok ? ' ok' : ' err') : '');
+  }
+
+  async function call(url, body) {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(body || {}),
+    });
+    let data = {};
+    try { data = await r.json(); } catch (_) { /* пустой ответ */ }
+    if (!r.ok) {
+      const err = new Error(data.error || ('Ошибка ' + r.status));
+      err.status = r.status;
+      err.retryAfter = Number(r.headers.get('Retry-After') || 0);
+      throw err;
+    }
+    return data;
+  }
+
+  function cooldown(btn) {
+    let left = RESEND_SEC;
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = `Отправить ещё раз через ${left} с`;
+    const timer = setInterval(() => {
+      left -= 1;
+      btn.textContent = `Отправить ещё раз через ${left} с`;
+      if (left <= 0) { clearInterval(timer); btn.disabled = false; btn.textContent = original; }
+    }, 1000);
+  }
+
+  function busy(form, on) {
+    const btn = form.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = on;
+  }
+
+  // Показать/скрыть пароль во всех полях (включая поле входа).
+  $$('[data-pw-toggle]').forEach((btn) => btn.addEventListener('click', () => {
+    const input = document.getElementById(btn.dataset.pwToggle);
+    if (!input) return;
+    const wasHidden = input.type === 'password';
+    input.type = wasHidden ? 'text' : 'password';
+    btn.textContent = wasHidden ? '🙈' : '👁';
+    const label = wasHidden ? 'Скрыть пароль' : 'Показать пароль';
+    btn.setAttribute('aria-label', label);
+    btn.title = label;
+  }));
+
+  // Живая проверка: два поля пароля должны совпадать.
+  function watchMatch(passSel, confirmSel, hintSel) {
+    const pass = $(passSel), confirm = $(confirmSel), hint = $(hintSel);
+    const check = () => {
+      if (!confirm.value) { hint.textContent = ''; hint.className = 'pw-hint'; return false; }
+      const ok = pass.value === confirm.value;
+      hint.textContent = ok ? '✓ Пароли совпадают' : '✗ Пароли не совпадают';
+      hint.className = 'pw-hint ' + (ok ? 'ok' : 'err');
+      return ok;
+    };
+    pass.addEventListener('input', check);
+    confirm.addEventListener('input', check);
+    return check;
+  }
+  const checkRegMatch = watchMatch('#regPass', '#regPassConfirm', '#regPassHint');
+  const checkResetMatch = watchMatch('#resetPass', '#resetPassConfirm', '#resetPassHint');
+
+  $('#loginForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email = $('#loginEmail').value.trim();
+    busy(e.target, true); msg('#loginMsg', '');
+    try {
+      await call('/auth/login', { email, password: $('#loginPass').value });
+      location.href = '/';
+    } catch (err) {
+      if (err.status === 403) {
+        $('#regEmail').value = email;
+        showTab('register');
+        $('#registerForm').hidden = true;
+        $('#registerConfirmForm').hidden = false;
+        $('#regSentTo').textContent = `Код отправлен на ${email}`;
+        msg('#regMsg', 'Email не подтверждён. Введите код из письма.', false);
+        try { await call('/auth/code/resend', { email, purpose: 'verify' }); } catch (_) { /* покажем ниже */ }
+      } else {
+        msg('#loginMsg', err.message, false);
+      }
+    } finally { busy(e.target, false); }
+  });
+
+  $('#registerForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email = $('#regEmail').value.trim();
+    if (!checkRegMatch()) {
+      msg('#regMsg', 'Пароли не совпадают', false);
+      $('#regPassConfirm').focus();
+      return;
+    }
+    busy(e.target, true); msg('#regMsg', '');
+    try {
+      const data = await call('/auth/register', {
+        email, password: $('#regPass').value, password_confirm: $('#regPassConfirm').value,
+      });
+      msg('#regMsg', data.message, true);
+      $('#registerForm').hidden = true;
+      $('#registerConfirmForm').hidden = false;
+      $('#regSentTo').textContent = `Код отправлен на ${email}`;
+      $('#regCode').focus();
+    } catch (err) { msg('#regMsg', err.message, false); }
+    finally { busy(e.target, false); }
+  });
+
+  $('#registerConfirmForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    busy(e.target, true); msg('#regMsg', '');
+    try {
+      await call('/auth/register/confirm', { email: $('#regEmail').value.trim(), code: $('#regCode').value.trim() });
+      location.href = '/';
+    } catch (err) { msg('#regMsg', err.message, false); }
+    finally { busy(e.target, false); }
+  });
+
+  $('#regBack').addEventListener('click', () => {
+    $('#registerForm').hidden = false; $('#registerConfirmForm').hidden = true; msg('#regMsg', '');
+  });
+  $('#regResend').addEventListener('click', async (e) => {
+    try {
+      const data = await call('/auth/code/resend', { email: $('#regEmail').value.trim(), purpose: 'verify' });
+      msg('#regMsg', data.message, true); cooldown(e.currentTarget);
+    } catch (err) {
+      msg('#regMsg', err.message, false);
+      if (err.retryAfter) cooldown(e.currentTarget);
+    }
+  });
+
+  let forgotEmail = '';
+  $('#forgotForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    forgotEmail = $('#forgotEmail').value.trim();
+    busy(e.target, true); msg('#forgotMsg', '');
+    try {
+      const data = await call('/auth/reset/request', { email: forgotEmail });
+      $('#resetSentTo').textContent = `Если аккаунт ${forgotEmail} есть, код отправлен на него.`;
+      e.target.hidden = true; $('#resetForm').hidden = false;
+      msg('#forgotMsg', data.message, true); $('#resetCode').focus();
+    } catch (err) { msg('#forgotMsg', err.message, false); }
+    finally { busy(e.target, false); }
+  });
+
+  $('#resetForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!checkResetMatch()) {
+      msg('#forgotMsg', 'Пароли не совпадают', false);
+      $('#resetPassConfirm').focus();
+      return;
+    }
+    busy(e.target, true); msg('#forgotMsg', '');
+    try {
+      await call('/auth/reset/confirm', {
+        email: forgotEmail, code: $('#resetCode').value.trim(),
+        password: $('#resetPass').value, password_confirm: $('#resetPassConfirm').value,
+      });
+      $('#loginEmail').value = forgotEmail;
+      $('#resetForm').hidden = true; $('#forgotForm').hidden = false;
+      showTab('login');
+      msg('#loginMsg', 'Пароль изменён. Войдите с новым паролем.', true);
+    } catch (err) { msg('#forgotMsg', err.message, false); }
+    finally { busy(e.target, false); }
+  });
+
+  $('#resetBack').addEventListener('click', () => {
+    $('#resetForm').hidden = true; $('#forgotForm').hidden = false; msg('#forgotMsg', '');
+  });
+  $('#resetResend').addEventListener('click', async (e) => {
+    try {
+      const data = await call('/auth/code/resend', { email: forgotEmail, purpose: 'reset' });
+      msg('#forgotMsg', data.message, true); cooldown(e.currentTarget);
+    } catch (err) {
+      msg('#forgotMsg', err.message, false);
+      if (err.retryAfter) cooldown(e.currentTarget);
+    }
+  });
+
+  // Если уже авторизован — сразу в чат.
+  fetch('/auth/status', { credentials: 'same-origin', cache: 'no-store' })
+    .then((r) => r.json())
+    .then((j) => { if (j.authenticated && j.required) location.href = '/'; })
+    .catch(() => {});
+
+  const path = location.pathname;
+  showTab(path.startsWith('/register') ? 'register' : path.startsWith('/forgot') ? 'forgot' : 'login');
+})();
+</script>
+</body>
+</html>

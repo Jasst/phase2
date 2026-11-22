@@ -12,14 +12,40 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Dict, List, Optional, Tuple
 
 OPEN = "<tool_call>"
 CLOSE = "</tool_call>"
-MAX_STEPS = 4              # сколько раз модель может вызвать инструменты за один ответ
-MAX_CALLS_PER_STEP = 3     # сколько вызовов за один шаг принимаем
-MAX_RESULT_CHARS = 6000    # потолок текста результата, который уходит в контекст модели
+
+
+def _env_int(env: dict, key: str, default: int, lo: int = 1, hi: int = 100) -> int:
+    try:
+        return max(lo, min(hi, int(str(env.get(key, "")).strip() or default)))
+    except ValueError:
+        return default
+
+
+def agent_limits(env: Optional[dict] = None) -> dict:
+    """Лимиты агентного цикла. env=None — текущее окружение (значения по умолчанию 6/8/12)."""
+    env = os.environ if env is None else env
+    rounds = _env_int(env, "AGENT_MAX_ROUNDS", 6, 1, 7)
+    return {
+        "max_rounds": rounds,
+        "hard_cap": _env_int(env, "AGENT_HARD_CAP", max(rounds + 2, 8), rounds, 12),
+        "max_calls": _env_int(env, "AGENT_MAX_CALLS", 12, 1, 40),
+        "reflection_budget": _env_int(env, "AGENT_REFLECTION_BUDGET", 2, 0, 10),
+        "result_chars": _env_int(env, "TOOL_RESULT_CONTEXT_CHARS", 1200, 200, 20000),
+        "native_max": _env_int(env, "TOOL_NATIVE_MAX", 10, 3, 30),
+        "image_timeout": _env_int(env, "MCP_TOOL_TIMEOUT_IMAGE", 300, 30, 900),
+    }
+
+
+LIMITS = agent_limits()
+MAX_STEPS = LIMITS["max_rounds"]   # сколько раз модель может вызвать инструменты за один ответ
+MAX_CALLS_PER_STEP = 3             # сколько вызовов за один шаг принимаем
+MAX_RESULT_CHARS = 6000            # потолок текста результата, который уходит в контекст модели
 
 # Команды: ключ — имя без слэша, usage — подсказка, local — выполняется только в интерфейсе.
 COMMANDS: Dict[str, dict] = {
@@ -31,6 +57,8 @@ COMMANDS: Dict[str, dict] = {
                "hint": "поиск по памяти", "local": False},
     "remember": {"usage": "/remember текст — сохранить в память",
                  "hint": "сохранить в память", "local": False},
+    "chatmem": {"usage": "/chatmem — загрузить текущий чат в память как документ и извлечь факты",
+                "hint": "чат → память (с дедупликацией)", "local": True},
     "graph": {"usage": "/graph — открыть карту нейронов памяти",
               "hint": "карта нейронов", "local": True},
     "new": {"usage": "/new — новый чат", "hint": "новый чат", "local": True},
@@ -123,7 +151,10 @@ def parse_calls(raw_bodies: List[str]) -> List[dict]:
     return calls
 
 
-def tool_result_block(name: str, text: str) -> str:
-    """Текст результата в том виде, в котором модель его получает."""
-    body = text if len(text) <= MAX_RESULT_CHARS else text[:MAX_RESULT_CHARS] + "\n…(обрезано)"
+def tool_result_block(name: str, text: str, limit: Optional[int] = None) -> str:
+    """Текст результата в том виде, в котором модель его получает.
+
+    limit — пер-вызов потолок контекста (AGENT_* настройки); по умолчанию MAX_RESULT_CHARS."""
+    cap = int(limit or MAX_RESULT_CHARS)
+    body = text if len(text) <= cap else text[:cap] + "\n…(обрезано)"
     return f'<tool_result name="{name}">\n{body}\n</tool_result>'

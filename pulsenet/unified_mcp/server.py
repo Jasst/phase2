@@ -9,6 +9,7 @@
   личность          : identity_propose, identity_commit, identity_chain
   общее ядро        : core_get; core_propose / core_commit — только администратор
   интернет          : web_search, web_fetch
+  изображения       : image_generate (локальный EasyDiffusion с цепочкой бэкендов)
   код               : code_list, code_read, code_search — только CODE_ACCESS_USERS
   служебное         : whoami, pulsenet_guide (описание для агентов)
 """
@@ -22,6 +23,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import Context, FastMCP
+try:
+    from mcp.server.fastmcp.utilities.types import Image as MCPImage
+except ImportError:  # pragma: no cover — совместимость со старыми версиями SDK
+    MCPImage = None
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 from starlette.applications import Starlette
@@ -30,6 +35,7 @@ from ..triplex.journal import ConflictError, InvariantError
 from ..triplex.mcp import _fact_dict
 from . import web
 from .activity import ActivityLog
+from .image import ImageConfig, ImageGenerator
 from .auth import BearerAuthMiddleware, TokenStore
 from .code import CodeAccess, parse_roots
 from .store import IDENTITY_KINDS, IdentityStore, SharedCore, UserMemories
@@ -99,10 +105,12 @@ def _err(msg: str, **extra) -> Dict[str, Any]:
 
 
 def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
-              core: SharedCore, code: CodeAccess, transport_security=None) -> FastMCP:
+              core: SharedCore, code: CodeAccess, transport_security=None,
+              image_cfg: Optional[ImageConfig] = None) -> FastMCP:
     mcp = FastMCP(SERVER_NAME, stateless_http=True, json_response=True,
                   transport_security=transport_security)
     activity = ActivityLog(cfg.data_dir)
+    images = ImageGenerator(image_cfg or ImageConfig.from_env(cfg.env or None))
 
     def audit(tool: str, summarize=None):
         """Пишет вызов в журнал активности пользователя. Ошибка журнала инструмент не ломает."""
@@ -151,6 +159,8 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
                        role: str = Field("user", description="user | assistant | system"),
                        model: str = Field("", description="Модель экстракции; пусто — TRIPLEX_LLM_MODEL. "
                                                           "Веб-чат передаёт модель текущего ответа"),
+                       recorded_at: str = Field("", description="Стабильная ISO-метка для идемпотентной "
+                                                                "загрузки чата; пусто — время сервера"),
                        ctx: Context = None) -> Dict[str, Any]:
         """Сохранить документ в память и извлечь из него факты. Документ сохраняется даже при сбое
         извлечения. Возвращает doc_id: его нужно указать как source при triplex_assert.
@@ -168,7 +178,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
                 if extractor is None:              # TRIPLEX_EXTRACT=0 — экстракция отключена
                     extractor = _NO_EXTRACT
             return mem.ingest(text, session_id=session_id, role=role, agent=uid,
-                              extractor=extractor)
+                              recorded_at=(recorded_at or None), extractor=extractor)
         except ValueError as exc:
             return _err(str(exc))
 
@@ -403,6 +413,44 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
             return _err(err)
         return await web.fetch(url)
 
+    # ---------- изображения ----------
+
+    @mcp.tool()
+    @audit("image_generate", lambda k: k.get("prompt", ""))
+    async def image_generate(
+            prompt: str = Field(..., description="Описание изображения"),
+            steps: Optional[int] = Field(None, ge=1, le=60, description="Шаги диффузии; пусто — из .env"),
+            width: Optional[int] = Field(None, ge=64, le=1536, description="Ширина, округляется до кратной 8"),
+            height: Optional[int] = Field(None, ge=64, le=1536, description="Высота, округляется до кратной 8"),
+            cfg_scale: Optional[float] = Field(None, ge=1, le=30, description="CFG; пусто — из .env"),
+            seed: Optional[int] = Field(None, description="Зерно; -1 или пусто — случайное"),
+            sampler: Optional[str] = Field(None, description="Сэмплер; пусто — из .env"),
+            negative_prompt: Optional[str] = Field(None, description="Что исключить; пусто — из .env"),
+            backends: Optional[List[str]] = Field(None, description="Порядок бэкендов; пусто — IMAGE_BACKENDS_ORDER"),
+            return_image: bool = Field(True, description="Приложить картинку к ответу (до IMAGE_INLINE_MAX_BYTES)"),
+            ctx: Context = None) -> Any:
+        """Сгенерировать изображение по описанию. Бэкенды перебираются по порядку, первый успешный побеждает.
+
+        Возвращает путь к файлу и URL раздачи /images/<user>/<file>; рядом с PNG лежит .json
+        с prompt, seed и параметрами для повтора. При return_image=true картинка прикладывается
+        к ответу как image content block (если файл не слишком большой).
+        """
+        uid, err = _uid(ctx)
+        if err:
+            return _err(err)
+
+        async def progress(value, total, message):
+            await ctx.report_progress(value, total, message)
+
+        result = await images.generate(
+            prompt, uid=uid, steps=steps, width=width, height=height, cfg_scale=cfg_scale,
+            seed=seed, sampler=sampler, negative_prompt=negative_prompt,
+            backends=backends, progress=progress if ctx is not None else None)
+        raw = result.pop("image_data", None)
+        if raw and return_image and MCPImage is not None:
+            return [MCPImage(data=raw, format="png"), result]
+        return result
+
     # ---------- код ----------
 
     def _code_gate(ctx):
@@ -470,6 +518,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
                 "Перед нетривиальной задачей: triplex_search с формулировкой задачи.",
                 "После решения: triplex_ingest (получить doc_id), затем triplex_assert с источником.",
                 "Свежие факты, документация, сравнения: web_search, затем web_fetch для полного текста.",
+                "Картинка по описанию: image_generate (локальный EasyDiffusion, fallback на Pollinations).",
                 "Что уже делалось и что сорвалось: activity_recent.",
                 "Что накоплено: triplex_graph (узлы и связи) или triplex_stats.",
             ],
@@ -482,6 +531,8 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
                 "triplex_graph": "карта нейронов памяти",
                 "triplex_check": "проверка инвариантов журнала",
                 "web_search / web_fetch": "поиск в интернете и чтение публичной страницы",
+                "image_generate": "картинка по описанию: prompt, steps, width, height, seed, backends; "
+                    "возвращает file_path, url /images/... и саму картинку",
                 "activity_recent": "журнал действий пользователя",
                 "triplex_facts": "действующие факты с автором (agent)",
                 "triplex_link": "привязать написание к сущности",
@@ -503,14 +554,19 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
             return _err(err)
         return {"server": SERVER_NAME, "version": SERVER_VERSION, "user": uid,
                 "admin": is_admin(uid), "code_access": uid in cfg.code_users,
-                "web_backends": web.backends_order(), "searxng_configured": bool(os.getenv("SEARXNG_URL"))}
+                "web_backends": web.backends_order(), "searxng_configured": bool(os.getenv("SEARXNG_URL")),
+                "image_backends": images.cfg.backends}
 
     return mcp
 
 
 def create_app(cfg: Settings) -> Starlette:
     os.makedirs(cfg.data_dir, exist_ok=True)
-    tokens = TokenStore(os.path.join(cfg.data_dir, "tokens.sqlite"), cfg.owner_token, cfg.owner_id)
+    tokens = TokenStore(
+        os.path.join(cfg.data_dir, "tokens.sqlite"), cfg.owner_token, cfg.owner_id,
+        secret=cfg.env.get("MCP_TOKEN_SECRET", ""),
+        key_path=cfg.env.get("MCP_TOKEN_KEY_PATH")
+        or os.path.join(cfg.data_dir, "mcp_token.key"))
     from ..memory_service import build_encoder, build_extractor
 
     def _log(where, exc):
@@ -523,11 +579,19 @@ def create_app(cfg: Settings) -> Starlette:
     identity = IdentityStore(cfg.data_dir, cfg.identity_min_days)
     core = SharedCore(os.path.join(cfg.data_dir, "core.json"), cfg.core_min_interval_hours)
     code = CodeAccess(cfg.code_roots, cfg.code_users)
+    image_cfg = ImageConfig.from_env(cfg.env or None)
     from mcp.server.transport_security import TransportSecuritySettings as TSS
     sec = TSS(enable_dns_rebinding_protection=True, allowed_hosts=cfg.allowed_hosts,
               allowed_origins=cfg.allowed_origins)
-    mcp = build_mcp(cfg, memories, identity, core, code, transport_security=sec)
+    mcp = build_mcp(cfg, memories, identity, core, code, transport_security=sec,
+                    image_cfg=image_cfg)
     app = mcp.streamable_http_app()
     app.add_middleware(BearerAuthMiddleware, tokens=tokens)
     app.state.tokens = tokens
+
+    # Сгенерированные картинки: /images/<user>/<file>.png (auth middleware трогает только /mcp).
+    from starlette.staticfiles import StaticFiles
+    image_dir = os.path.abspath(image_cfg.output_dir)
+    os.makedirs(image_dir, exist_ok=True)
+    app.mount("/images", StaticFiles(directory=image_dir), name="generated-images")
     return app

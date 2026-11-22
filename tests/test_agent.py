@@ -2,6 +2,7 @@
 """Инструменты в чате: протокол <tool_call>, команды, агентный цикл, веб-инструменты,
 карта нейронов, журнал активности и кэш веб-поиска. Модель подменяется сценарием."""
 import asyncio
+import json
 import os
 
 import pytest
@@ -208,6 +209,51 @@ def test_distill_fact_rewrites_through_supersede(tmp_path, monkeypatch):
     current = app.memory.list_facts(10)
     assert any(x["o"] == "Роттердаме" for x in current)
     assert all(x["fact_id"] != f.fact_id for x in current)  # старый факт закрыт supersede
+
+
+def test_neuron_tools_dedupe_recombine_edit_and_forget(tmp_path, monkeypatch):
+    """Управление нейронами поверх общего memory-интерфейса: работает и local, и mcp."""
+    import pulsenet.app as appmod
+
+    app = _app(tmp_path, monkeypatch, [["ok"]])
+    doc = app.memory.ingest("Нел живёт в Амстердаме и любит кофе", session_id="s", role="user")
+    src = {"doc_id": doc["doc_id"], "span": [0, 8]}
+    f1 = app.memory.journal.assert_fact("Нел", "живёт в", "Амстердаме", source=src)
+    f2 = app.memory.journal.assert_fact("Нел", "проживает в", "Амстердаме", source=src)
+    f3 = app.memory.journal.assert_fact("Нел", "любит", "кофе", source=src)
+    monkeypatch.setattr(app, "model_id", lambda: "fake")
+    answers = iter([
+        json.dumps({"groups": [{"ids": [f1.fact_id, f2.fact_id],
+                                "reason": "один смысл", "canonical": "Нел живёт в Амстердаме"}]}),
+        json.dumps({"s": "Нел", "r": "живёт в", "o": "Амстердаме",
+                    "confidence": 0.9, "reason": "объединили переформулировки"}),
+        json.dumps({"s": "Нел", "r": "любит", "o": "чай",
+                    "confidence": 0.95, "reason": "уточнено вручную"}),
+    ])
+    monkeypatch.setattr(appmod, "openai_chat_caller",
+                        lambda *a, **kw: (lambda prompt: next(answers)))
+
+    dup = app.dedupe_facts()
+    assert dup["groups"] and set(dup["groups"][0]["ids"]) == {f1.fact_id, f2.fact_id}
+
+    preview = app.recombine_facts([f1.fact_id, f2.fact_id])
+    assert preview["applied"] is False and preview["preview"]["o"] == "Амстердаме"
+
+    merged = app.recombine_facts([f1.fact_id, f2.fact_id], apply=True)
+    assert merged["applied"] and merged["superseded"] == f1.fact_id
+    assert f2.fact_id in merged["retracted"]
+    alive = {f["fact_id"]: f for f in app.memory.list_facts(50)}
+    assert f1.fact_id not in alive and f2.fact_id not in alive and f3.fact_id in alive
+    assert merged["fact_id"] in alive
+
+    edited = app.edit_fact(f3.fact_id, o="чай", reason="уточнено вручную")
+    alive = {f["fact_id"]: f for f in app.memory.list_facts(50)}
+    assert f3.fact_id not in alive and alive[edited["new_fact_id"]]["o"] == "чай"
+
+    node = next(n for n in app.memory.graph(50)["nodes"] if n["label"] == "Нел")
+    gone = app.forget_facts(node_id=node["id"])
+    assert gone["retracted"]
+    assert not any(f["s"] == "Нел" or f["o"] == "Нел" for f in app.memory.list_facts(50))
 
 
 def test_model_choice_follows_loaded_and_active_model(tmp_path, monkeypatch):

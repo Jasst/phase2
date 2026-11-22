@@ -54,32 +54,74 @@ def _http_detail(exc: BaseException) -> str:
     return ""
 
 
+def _content_text(content) -> str:
+    """Собрать текст из content blocks MCP. image_generate может вернуть image + text —
+    брать content[0].text нельзя: у image-блока нет поля text."""
+    parts: List[str] = []
+    for block in (content or []):
+        text = getattr(block, "text", None)
+        if text is None and isinstance(block, dict):
+            text = block.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts) if parts else "{}"
+
+
 class MCPClient:
     def __init__(self, url: str, token: str, timeout: float = 30.0):
         self.url = url
         self.token = token
         self.timeout = timeout
 
-    def call(self, tool: str, args: Optional[Dict[str, Any]] = None) -> dict:
+    def _session(self):
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
-
         if not self.token:
             raise MemoryUnavailable("не задан PULSENET_CHAT_MCP_TOKEN (см. .env.example)")
+        return ClientSession, streamablehttp_client
+
+    def list_tools(self) -> List[dict]:
+        """Каталог инструментов MCP-сервера. Раньше чат его не запрашивал — отсюда и
+        «я текстовая нейросеть»: модель видела только 4 захардкоженных имени."""
+        ClientSession, streamablehttp_client = self._session()
 
         async def run():
-            async with streamablehttp_client(self.url, headers={"Authorization": f"Bearer {self.token}"}) as (r, w, _):
+            async with streamablehttp_client(self.url,
+                                             headers={"Authorization": f"Bearer {self.token}"}) as (r, w, _):
+                async with ClientSession(r, w) as sess:
+                    await sess.initialize()
+                    res = await sess.list_tools()
+                    return [{
+                        "name": t.name,
+                        "description": getattr(t, "description", "") or "",
+                        "inputSchema": getattr(t, "inputSchema", None) or {"type": "object", "properties": {}},
+                    } for t in (res.tools or [])]
+
+        try:
+            # Новый поток asyncio в каждом вызове: вызовы приходят из рабочих потоков чата.
+            return asyncio.run(asyncio.wait_for(run(), self.timeout))
+        except Exception as exc:                  # noqa: BLE001
+            detail = _http_detail(exc) or str(exc)
+            raise MemoryUnavailable(f"MCP-сервер недоступен ({self.url}): {detail}") from exc
+
+    def call(self, tool: str, args: Optional[Dict[str, Any]] = None,
+             timeout: Optional[float] = None) -> dict:
+        ClientSession, streamablehttp_client = self._session()
+
+        async def run():
+            async with streamablehttp_client(self.url,
+                                             headers={"Authorization": f"Bearer {self.token}"}) as (r, w, _):
                 async with ClientSession(r, w) as sess:
                     await sess.initialize()
                     return await sess.call_tool(tool, args or {})
 
         try:
             # Новый поток asyncio в каждом вызове: вызовы приходят из рабочих потоков чата.
-            res = asyncio.run(asyncio.wait_for(run(), self.timeout))
+            res = asyncio.run(asyncio.wait_for(run(), timeout or self.timeout))
         except Exception as exc:                  # noqa: BLE001
             detail = _http_detail(exc) or str(exc)
-            raise MemoryUnavailable(f"MCP-сервер памяти недоступен ({self.url}): {detail}") from exc
-        text = res.content[0].text if res.content else "{}"
+            raise MemoryUnavailable(f"MCP-сервер недоступен ({self.url}): {detail}") from exc
+        text = _content_text(res.content)
         if getattr(res, "isError", False):
             raise MemoryUnavailable(text[:300])
         try:
@@ -108,9 +150,12 @@ class RemoteMemory:
 
     def ingest(self, text: str, session_id: str = "", role: str = "user",
                recorded_at: Optional[str] = None, model: str = "") -> dict:
-        # recorded_at на сервере выставляет сам сервер: внешнее время для чата не нужно.
+        # Обычные сообщения сохраняются с серверным временем. А «чат → память»
+        # передаёт стабильное recorded_at: иначе каждый повтор создавал бы новый doc_id.
         # model — модель текущего ответа: факты извлекаются ею же, а не TRIPLEX_LLM_MODEL из .env.
         args = {"text": text, "session_id": session_id, "role": role}
+        if recorded_at:
+            args["recorded_at"] = recorded_at
         if model:
             args["model"] = model
         return self.client.call("triplex_ingest", args)

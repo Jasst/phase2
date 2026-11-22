@@ -30,6 +30,20 @@ function Stop-One($proc, $why) {
     }
 }
 
+# 1a) EasyDiffusion, запущенный start_easydiffusion.ps1 (только по нашему PID-файлу)
+$imgPidFile = Join-Path $PSScriptRoot 'data_unified\easydiffusion.pid'
+if (Test-Path $imgPidFile) {
+    $imgPid = 0
+    $rawPid = (Get-Content $imgPidFile -Raw -ErrorAction SilentlyContinue).Trim()
+    if ([int]::TryParse($rawPid, [ref]$imgPid)) {
+        $imgProc = Get-CimInstance Win32_Process -Filter "ProcessId=$imgPid" -ErrorAction SilentlyContinue
+        if ($imgProc -and $imgProc.CommandLine -match 'Easy-Diffusion|check_modules\.py') {
+            Stop-One $imgProc 'EasyDiffusion (PID-файл)'
+        }
+    }
+    Remove-Item $imgPidFile -Force -ErrorAction SilentlyContinue
+}
+
 # 1) python-процессы из pulsenet
 Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
     Where-Object { $_.CommandLine -match 'pulsenet' } |

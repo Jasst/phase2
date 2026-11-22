@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0d0e11">
 <meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>ТРИПЛЕКСИЯ · чат и память</title>
 <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
 <link rel="apple-touch-icon" href="/static/icon-192.png">
@@ -15,6 +17,13 @@
 <script src="/static/vendor/marked.min.js" defer></script>
 <script src="/static/vendor/highlight.min.js" defer></script>
 <script src="/static/app.js" defer></script>
+<script>
+  // Масштаб интерфейса из настроек (s / m / l). Определяется до отложенного app.js.
+  function setUIScale(value) {
+    const scale = { s: 0.92, m: 1, l: 1.12 }[value] || 1;
+    document.documentElement.style.setProperty('--ui-scale', String(scale));
+  }
+</script>
 </head>
 <body class="ai-body">
 <div class="app" id="app">
@@ -37,12 +46,13 @@
     <nav class="sb-list" id="sessionList" aria-label="Чаты"></nav>
 
     <div class="sb-bottom">
+      <div class="auth-user" id="authUser" hidden>
+        <span class="auth-email" id="userEmail" title="Вы вошли как"></span>
+        <button class="icon-btn" id="logoutBtn" type="button" title="Выйти" aria-label="Выйти">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>
+        </button>
+      </div>
       <div class="sb-stat" id="sbStat">память: —</div>
-      <button class="sb-link" id="memoryBtn" type="button">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 2A2.5 2.5 0 0 0 7 4.5v1A2.5 2.5 0 0 0 4.5 8v1A2.5 2.5 0 0 0 3 11.3V14a2 2 0 0 0 2 2v1.5A2.5 2.5 0 0 0 7.5 20 2.5 2.5 0 0 0 10 17.5V6.5A2.5 2.5 0 0 0 7.5 4"/><path d="M14.5 2A2.5 2.5 0 0 1 17 4.5v1A2.5 2.5 0 0 1 19.5 8v1a2.5 2.5 0 0 1 1.5 2.3V14a2 2 0 0 1-2 2v1.5a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5V6.5A2.5 2.5 0 0 1 14.5 4"/></svg>
-        Память
-        <span class="pill" id="memCount">0</span>
-      </button>
       <button class="sb-link" id="settingsBtn" type="button">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         Настройки
@@ -93,8 +103,11 @@
 
     <div class="composer-wrap">
       <div class="cmd-pop" id="cmdPop" role="listbox" aria-label="Команды" hidden></div>
-      <div class="composer">
-        <textarea id="input" rows="1" placeholder="Напишите сообщение…" aria-label="Сообщение"></textarea>
+      <div class="composer" id="composer">
+        <div class="input-line">
+          <span class="prompt" aria-hidden="true">❯</span>
+          <textarea id="input" rows="1" placeholder="Напишите сообщение…" aria-label="Сообщение"></textarea>
+        </div>
         <div class="composer-bar">
           <div class="tools">
             <button class="tool" id="reasonBtn" type="button" aria-pressed="false" aria-label="Показывать рассуждения" title="Показывать ход рассуждений">
@@ -105,13 +118,21 @@
               <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18"/></svg>
               <span>Интернет</span>
             </button>
-            <button class="tool" id="memoryTool" type="button" aria-label="Открыть память" title="Открыть память">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a3 3 0 0 0-3 3v.2A3 3 0 0 0 6.8 9 3 3 0 0 0 5 11.8V14a3 3 0 0 0 2 2.8V18a3 3 0 0 0 5 2 3 3 0 0 0 5-2v-1.2A3 3 0 0 0 19 14v-2.2A3 3 0 0 0 17.2 9 3 3 0 0 0 15 6.2V6a3 3 0 0 0-3-3Z"/><path d="M12 3v17"/></svg>
-              <span>Память</span>
-            </button>
+          </div>
+          <div class="composer-status">
+            <div class="inline-model" title="Модель для следующего ответа">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9zM9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/></svg>
+              <select id="modelSelect" aria-label="Модель для ответов"><option value="">по умолчанию</option></select>
+              <button class="btn-ghost" id="modelsReload" type="button" title="Обновить список моделей" aria-label="Обновить список моделей">↻</button>
+            </div>
+            <div class="metrics" id="metrics" title="Оценка по длине текста ответа: ~3.6 символа на токен">
+              <span class="metric"><b id="metricSpeed">—</b><i>tok/s</i></span>
+              <span class="metric"><b id="metricTokens">—</b><i>ток</i></span>
+              <span class="metric"><b id="metricTime">—</b><i>сек</i></span>
+            </div>
           </div>
           <span class="counter" id="counter"></span>
-          <button class="send" id="sendBtn" type="button" title="Отправить" aria-label="Отправить">
+          <button class="send" id="sendBtn" type="button" title="Отправить · долгое нажатие — голосовой ввод" aria-label="Отправить">
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4Z"/></svg>
           </button>
         </div>
@@ -165,6 +186,7 @@
     <section class="pane" id="pane-graph" role="tabpanel">
       <div class="pane-bar">
         <button class="btn-ghost" id="graphReload" type="button">Обновить</button>
+        <button class="btn-ghost" id="graphRelayout" type="button" title="Плавно переложить узлы заново">Разложить</button>
         <label class="check"><input type="checkbox" id="graphLive" checked> обновлять каждые 4 с</label>
       </div>
       <div class="graph-stats" id="graphStats"></div>
@@ -176,7 +198,7 @@
           <button class="icon-btn" id="graphZoomReset" type="button" title="Сбросить масштаб">⌖</button>
           <button class="icon-btn" id="graphFullscreen" type="button" title="На весь экран">⛶</button>
         </div>
-        <div class="graph-hint">клик — выбрать · долгое нажатие / правый клик — выбор · колесо — масштаб · тянуть — движение</div>
+        <div class="graph-hint">клик — выбрать · тянуть узел — переместить · долгое нажатие / правый клик — меню нейрона · колесо — масштаб</div>
         <div class="graph-empty" id="graphEmpty" hidden>Нейронов пока нет. Они появятся, когда в памяти появятся факты.</div>
       </div>
       <div class="graph-legend" id="graphLegend"></div>
@@ -219,19 +241,38 @@
       <label class="row"><span>Прокручивать к новым сообщениям</span><input type="checkbox" id="setAutoScroll"></label>
       <label class="row"><span>Отправлять по Enter</span><input type="checkbox" id="setEnterSends"></label>
       <label class="row"><span>Показывать рассуждения</span><input type="checkbox" id="setReasoning"></label>
-      <label class="row"><span>Модель</span>
-        <span class="model-pick"><select id="setModel" aria-label="Модель для ответов"><option value="">по умолчанию</option></select>
-        <button class="btn-ghost" id="modelsReload" type="button" title="Обновить список моделей">↻</button></span>
-      </label>
-      <p class="muted" id="modelHint"></p>
+    </section>
+    <section>
+      <h3>Доступ к MCP</h3>
+      <p class="muted" id="mcpTokenHint">Токен внешнего ИИ под вашим аккаунтом. Новый токен отключает прежние подключения.</p>
+      <div class="row"><span>Текущий токен</span><code class="token-value" id="mcpTokenValue">—</code></div>
+      <div class="row"><span>Состояние</span><span id="mcpTokenMeta">проверяю…</span></div>
+      <div class="row"><span>Обновить ключ</span><button class="btn-ghost" id="mcpTokenRotate" type="button">Выпустить новый</button></div>
+      <div class="row"><span>Отозвать ключ</span><button class="btn-danger" id="mcpTokenRevoke" type="button">Отозвать</button></div>
     </section>
     <section>
       <h3>Данные</h3>
+      <p class="muted">Чаты привязаны к аккаунту и синхронизируются между устройствами: телефон → компьютер → PWA.</p>
+      <div class="row"><span>Синхронизация</span><span id="syncStatus">не запущена</span></div>
+      <div class="row"><span>Синхронизировать сейчас</span><button class="btn-ghost" id="syncNow" type="button">Обновить</button></div>
       <div class="row"><span>Экспорт всех чатов</span><button class="btn-ghost" id="exportAll" type="button">Скачать JSON</button></div>
-      <div class="row"><span>Удалить все чаты в браузере</span><button class="btn-danger" id="wipeAll" type="button">Удалить</button></div>
+      <div class="row"><span>Удалить все чаты (на всех устройствах)</span><button class="btn-danger" id="wipeAll" type="button">Удалить</button></div>
     </section>
     <footer><button class="btn-primary" value="close">Готово</button></footer>
   </form>
+</dialog>
+
+<dialog id="imageDialog" class="dialog image-dialog" aria-label="Просмотр изображения">
+  <div class="lightbox">
+    <div class="lightbox-bar">
+      <span class="lightbox-title" id="imageDialogTitle">Изображение</span>
+      <span class="lightbox-hint">Esc · фон · свайп вниз</span>
+      <button class="icon-btn lightbox-nav" id="imagePrev" type="button" aria-label="Предыдущее изображение" hidden>‹</button>
+      <button class="icon-btn lightbox-nav" id="imageNext" type="button" aria-label="Следующее изображение" hidden>›</button>
+      <button class="icon-btn lightbox-close" id="imageClose" type="button" aria-label="Закрыть просмотр">×</button>
+    </div>
+    <div class="lightbox-stage" id="imageStage"><img id="imageDialogImg" alt=""></div>
+  </div>
 </dialog>
 
 <dialog id="confirmDialog" class="dialog dialog-sm">
