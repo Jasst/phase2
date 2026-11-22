@@ -61,6 +61,7 @@ from .auth_routes import AuthAPI
 from .auth_session import clear_cookie_header, make_session, session_cookie_header
 from .auth_store import AuthStore
 from .chat_store import ChatStore
+from .settings_store import SettingsStore
 from .mailer import Mailer
 from .unified_mcp.auth import TokenStore
 
@@ -266,6 +267,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         for key, value in {**getattr(self, "_extra_headers", {}), **(headers or {})}.items():
+            self.send_header(key, str(value))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_bytes(self, data: bytes, content_type: str):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        for key, value in getattr(self, "_extra_headers", {}).items():
             self.send_header(key, str(value))
         self.end_headers()
         self.wfile.write(data)
@@ -797,7 +808,82 @@ def _chat_save_memory(h, b, _q):
     h.send_json(out)
 
 
+_SETTING_BOOLS = ("compact", "autoScroll", "enterSends", "showReasoning", "webSearch")
+_SETTING_STRINGS = ("fontSize", "model", "ttsVoice")
+
+
+def _clean_settings(b):
+    """Не доверяем телу запроса: храним только известные поля и разумные значения."""
+    from .tts import normalize_speaker
+    out = {}
+    for key in _SETTING_BOOLS:
+        if key in b:
+            out[key] = bool(b[key])
+    for key in _SETTING_STRINGS:
+        if key in b:
+            out[key] = str(b.get(key) or "")[:200]
+    if "fontSize" in out and out["fontSize"] not in ("s", "m", "l"):
+        out["fontSize"] = "m"
+    if out.get("ttsVoice"):
+        try:
+            out["ttsVoice"] = normalize_speaker(out["ttsVoice"])
+        except ValueError:
+            out["ttsVoice"] = ""
+    if "updatedAt" in b:
+        try:
+            out["updatedAt"] = int(b["updatedAt"])
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _settings_get(h, _b, _q):
+    if h.settings_store is None:
+        return h.send_json({"error": "серверное хранилище настроек недоступно"}, 503)
+    h.send_json(h.settings_store.get(h.storage_uid()))
+
+
+def _settings_put(h, b, _q):
+    if h.settings_store is None:
+        return h.send_json({"error": "серверное хранилище настроек недоступно"}, 503)
+    data, updated = h.settings_store.put(h.storage_uid(), _clean_settings(b))
+    h.send_json({"settings": data, "updated": updated, "updatedAt": data.get("updatedAt", 0)})
+
+
+def _tts_status(h, _b, q):
+    # ?retry=1 — пользователь нажал «Озвучить»: пробуем ещё раз после исправления окружения
+    if str((q or {}).get("retry", [""])[0]).lower() in ("1", "true", "yes"):
+        h.app.tts.reset_error()
+    h.send_json(h.app.tts.status())
+
+
+def _tts_segments(h, b, _q):
+    """Текст ответа → список фраз для поочерёдной озвучки (очистка markdown и кода — на сервере)."""
+    from .tts import split_segments
+    h.send_json({"segments": split_segments(str(b.get("text") or ""))})
+
+
+def _tts_speak(h, b, _q):
+    """Одна фраза → WAV. Голос передаётся в запросе, ошибки — 503 с понятной причиной."""
+    from .tts import TTSError, normalize_speaker
+    text = str(b.get("text") or "").strip()
+    if not text:
+        raise ValueError("пустой текст для озвучки")
+    raw = b.get("speaker")
+    speaker = normalize_speaker(raw) if raw not in (None, "") else None
+    try:
+        data = h.app.tts.synth(text, speaker)
+    except TTSError as exc:
+        return h.send_json({"error": "tts_unavailable", "message": str(exc)}, 503)
+    h.send_bytes(data, "audio/wav")
+
+
 ROUTES = {
+    ("GET", "/api/settings"): _settings_get,
+    ("PUT", "/api/settings"): _settings_put,
+    ("GET", "/api/tts/status"): _tts_status,
+    ("POST", "/api/tts/segments"): _tts_segments,
+    ("POST", "/api/tts"): _tts_speak,
     ("GET", "/api/status"): _status,
     ("GET", "/api/models"): _models,
     ("GET", "/api/tools"): _tools,
@@ -841,6 +927,7 @@ def make_server(app, host="127.0.0.1", port=8000, web_dir=WEB_DIR_DEFAULT, auth=
     # Серверные чаты и токены: каталог данных MCP берём из той же переменной, что
     # и unified_mcp — иначе веб будет читать не ту базу токенов.
     chat_store = ChatStore(os.path.join(data_dir, "chats.sqlite"))
+    settings_store = SettingsStore(os.path.join(data_dir, "settings.sqlite"))
     mcp_dir = (env.get("PULSENET_DATA_DIR")
                or os.path.join(os.path.dirname(os.path.abspath(data_dir)), "data_unified"))
     os.makedirs(mcp_dir, exist_ok=True)
@@ -851,6 +938,7 @@ def make_server(app, host="127.0.0.1", port=8000, web_dir=WEB_DIR_DEFAULT, auth=
         key_path=env.get("MCP_TOKEN_KEY_PATH") or os.path.join(mcp_dir, "mcp_token.key"))
     notifier = ChatNotifier()
     _H.chat_store = chat_store
+    _H.settings_store = settings_store
     _H.token_store = token_store
     _H.chat_notifier = notifier
     _H.jobs = ChatJobs(app, store=chat_store, notifier=notifier)

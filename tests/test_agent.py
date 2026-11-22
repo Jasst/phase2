@@ -342,7 +342,8 @@ def test_command_without_argument_replies_with_usage(tmp_path, monkeypatch):
 def test_command_remember_stores_text(tmp_path, monkeypatch):
     app = _app(tmp_path, monkeypatch, [["Запомнила."]])
     queued = []
-    monkeypatch.setattr(app, "index_async", lambda text, chat_id, role="user": queued.append(text))
+    monkeypatch.setattr(app, "index_async",
+                        lambda text, chat_id, role="user", force=False: queued.append(text))
     _run(app, "/remember Проект живёт в pulsenet")
     assert queued == ["Проект живёт в pulsenet"]
 

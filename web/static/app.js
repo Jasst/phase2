@@ -18,6 +18,8 @@
     showReasoning: false,
     webSearch: false,
     model: '',
+    ttsVoice: '',        // пусто = голос сервера по умолчанию
+    updatedAt: 0,        // для синхронизации с сервером: побеждает более свежая копия
   };
   // Команды: серверные уходят в чат, local — выполняются в интерфейсе.
   const COMMANDS = [
@@ -53,6 +55,7 @@
     drawerBtn: $('drawerBtn'), menuBtn: $('menuBtn'), messages: $('messages'), inner: $('inner'),
     scrollBottomBtn: $('scrollBottomBtn'), input: $('input'), sendBtn: $('sendBtn'), counter: $('counter'),
     hint: $('hint'), reasonBtn: $('reasonBtn'), webTool: $('webTool'), composer: $('composer'),
+    voiceBtn: $('voiceBtn'), voiceBtnLabel: $('voiceBtnLabel'),
     sbStat: $('sbStat'), settingsBtn: $('settingsBtn'),
     modelSelect: $('modelSelect'), metrics: $('metrics'), metricSpeed: $('metricSpeed'),
     metricTokens: $('metricTokens'), metricTime: $('metricTime'),
@@ -527,7 +530,8 @@
     if (!sessions.some((s) => s.id === currentId)) currentId = sessions[0] && sessions[0].id;
     renderSessions();
     updateTitle();
-    renderMessages({ force: true });
+    // Синхронизация не должна дёргать прокрутку: следуем за ответом, только если уже внизу.
+    renderMessages({ keep: true });
   }
 
   async function syncPull() {
@@ -618,6 +622,7 @@
           bot.pending = false;
           bot.gen = captureMetrics();
           bot.indexPending = Number(ev.done.index_pending) || 0;
+        feedTts(bot, true);
           finished = true;
         }
       }, abortCtl.signal, '/api/chat/stream?chat_id=' + encodeURIComponent(cid), 'GET');
@@ -694,8 +699,45 @@
   function loadSettings() {
     settings = { ...DEFAULTS, ...(readJSON(LS.settings, {}) || {}) };
   }
-  function saveSettings() {
+  function saveSettings(localOnly) {
+    settings.updatedAt = Date.now();
     writeJSON(LS.settings, settings);
+    if (!localOnly) scheduleSettingsPush();
+  }
+
+  // Настройки живут и в браузере, и на сервере (settings.sqlite по uid). Сервер — источник
+  // истины после перезапуска/смены устройства; localStorage даёт мгновенную реакцию и офлайн.
+  const SET_SYNC = { timer: null, busy: false, applying: false };
+  function scheduleSettingsPush() {
+    clearTimeout(SET_SYNC.timer);
+    SET_SYNC.timer = setTimeout(pushSettings, 800);
+  }
+  async function pushSettings() {
+    if (SET_SYNC.applying || SET_SYNC.busy) return;
+    clearTimeout(SET_SYNC.timer);
+    SET_SYNC.busy = true;
+    try {
+      const data = await api('PUT', '/api/settings', settings);
+      if (data && Number(data.updatedAt) > Number(settings.updatedAt || 0)) {
+        settings.updatedAt = Number(data.updatedAt);
+        writeJSON(LS.settings, settings);
+      }
+    } catch (e) { /* офлайн: локальная копия уже сохранена */ }
+    finally { SET_SYNC.busy = false; }
+  }
+  async function pullSettings() {
+    if (SET_SYNC.applying) return;
+    try {
+      const data = await api('GET', '/api/settings');
+      const remote = data && data.settings;
+      if (!remote || !(Number(remote.updatedAt) > Number(settings.updatedAt || 0))) return;
+      SET_SYNC.applying = true;
+      settings = { ...DEFAULTS, ...remote };
+      writeJSON(LS.settings, settings);
+      applySettings();
+      applyVoiceButton();
+    } catch (e) { /* сервер недоступен — остаёмся на локальной копии */ }
+    finally { SET_SYNC.applying = false; }
   }
   function applySettings() {
     document.body.dataset.fs = settings.fontSize || 'm';
@@ -709,6 +751,7 @@
     els.setAutoScroll.checked = !!settings.autoScroll;
     els.setEnterSends.checked = !!settings.enterSends;
     els.setReasoning.checked = !!settings.showReasoning;
+    applyVoiceButton();
     els.hint.textContent = (settings.enterSends
       ? 'Enter — отправить · Shift+Enter — новая строка'
       : 'Ctrl+Enter — отправить · Enter — новая строка') + ' · / — команды · Ctrl K — новый чат';
@@ -1116,13 +1159,14 @@
     foot.appendChild(el('span', 'time', fmtTime(m.time)));
     const stats = statsNode(m);
     if (stats) foot.appendChild(stats);
+    if (!isUser && m.text && m.pending) {
+      foot.appendChild(actButton('Озвучивать по ходу генерации', ICON_SPEAK, (b) => toggleSpeak(m, b)));
+    }
     if (m.text && !m.pending) {
       foot.appendChild(actButton('Копировать', ICON_COPY, () => copyText(m.text)));
       if (!isUser) {
         foot.appendChild(actButton('Другой ответ', ICON_REFRESH, () => regenerate(idx)));
-        if ('speechSynthesis' in window) {
-          foot.appendChild(actButton('Озвучить ответ', ICON_SPEAK, (b) => toggleSpeak(m.text, b)));
-        }
+        foot.appendChild(actButton('Озвучить ответ', ICON_SPEAK, (b) => toggleSpeak(m, b)));
       }
     }
     body.appendChild(foot);
@@ -1134,6 +1178,8 @@
   function renderMessages(opts) {
     opts = opts || {};
     const wasAtBottom = isNearBottom();
+    // Перерисовка пересобирает ленту; без сохранения позиции браузер сбрасывает прокрутку в начало.
+    const savedTop = els.messages.scrollTop;
     els.inner.innerHTML = '';
     const s = currentSession();
     const list = s ? (messages[s.id] || []) : [];
@@ -1143,8 +1189,9 @@
       list.forEach((m, i) => els.inner.appendChild(buildMessage(m, i)));
     }
     updateActions();
-    updateScrollButton();
     if (opts.force || (wasAtBottom && settings.autoScroll)) scrollEnd();
+    else els.messages.scrollTop = savedTop;
+    updateScrollButton();
   }
 
   function updateCounter() {
@@ -1178,8 +1225,11 @@
       const bubble = els.inner.querySelector('.msg[data-idx="' + idx + '"] .bubble');
       if (!bubble) return;
       const atBottom = isNearBottom();
+      const savedTop = els.messages.scrollTop;
       updateLiveBubble(bubble, bot);
+      feedTts(bot, false);
       if (atBottom && settings.autoScroll) scrollEnd();
+      else els.messages.scrollTop = savedTop;
     }, 60);
   }
 
@@ -1436,6 +1486,7 @@
           bot.pending = false;
           bot.gen = captureMetrics();
           bot.indexPending = Number(ev.done.index_pending) || 0;
+        feedTts(bot, true);
           finished = true;
         }
       }, abortCtl.signal);
@@ -1511,15 +1562,234 @@
   }
 
   let speakingBtn = null;
+  let ttsServer = false;                 // сервер озвучки (Silero) включён И готов
+  let ttsError = '';                     // причина, по которой сервер озвучки недоступен
+  let ttsToken = 0;                      // номер текущей озвучки: остановка отменяет предыдущую
+  let ttsAudio = null;                   // проигрываемый фрагмент
+  let ttsQueue = [];                     // фразы, которые ждут озвучки
+  let ttsLive = null;                    // { id, pos } — ответ, озвучиваемый по мере генерации
+  let ttsDone = true;                    // ответ полностью получен, новых фраз не будет
+  let ttsFeeding = 0;                    // сколько фрагментов ещё режутся на фразы на сервере
+  let ttsChain = Promise.resolve();      // фрагменты режутся по порядку
+  let ttsRunToken = -1;                  // для какой очереди уже запущен проигрыватель
+  let ttsVoices = [];                    // список голосов с примерами от сервера
+  let ttsDefaultVoice = '';              // голос по умолчанию из .env, если пользователь не выбирал
+  let previewAudio = null;               // сейчас играет пример голоса
+  let previewToken = 0;
+  async function loadTtsStatus(retry) {
+    try {
+      const st = await api('GET', '/api/tts/status' + (retry ? '?retry=1' : ''));
+      // ready=false до первого синтеза (модель грузится лениво), поэтому смотрим available
+      const available = st && (st.available !== undefined ? st.available : (st.enabled && st.ready));
+      ttsServer = !!available;
+      ttsError = ttsServer ? '' : ((st && st.error) ||
+        (st && st.enabled && !st.model_exists && !st.autodownload ? 'модель не найдена' : ''));
+      if (st && Array.isArray(st.voices) && st.voices.length) ttsVoices = st.voices;
+      if (st && st.speaker) ttsDefaultVoice = st.speaker;
+      applyVoiceButton();
+    } catch (e) {
+      ttsServer = false;
+      ttsError = '';
+    }
+    return ttsServer;
+  }
+  function voiceById(id) {
+    return ttsVoices.find((v) => v.id === id) ||
+      { id: id || '', label: id || 'Голос', description: '', preview: '' };
+  }
+  function applyVoiceButton() {
+    if (!els.voiceBtn) return;
+    const v = voiceById(currentVoice());
+    if (els.voiceBtnLabel) els.voiceBtnLabel.textContent = v.label;
+    els.voiceBtn.setAttribute('aria-label', 'Голос озвучки: ' + v.label + '. Выбрать или прослушать');
+    els.voiceBtn.classList.toggle('on', !!settings.ttsVoice);
+  }
+  function currentVoice() {
+    return settings.ttsVoice || ttsDefaultVoice || (ttsVoices[0] && ttsVoices[0].id) || '';
+  }
+  function setVoice(id) {
+    if (!id || settings.ttsVoice === id) return;
+    stopSpeech();                        // сменить голос можно только на новую озвучку
+    settings.ttsVoice = id;
+    saveSettings();
+    applyVoiceButton();
+    toast('Голос: ' + voiceById(id).label);
+  }
+  const ttsSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
   function stopSpeech() {
+    ttsToken++;
+    ttsQueue = [];
+    ttsLive = null;
+    ttsDone = true;
+    if (ttsAudio) {
+      ttsAudio.pause();
+      if (ttsAudio._stop) ttsAudio._stop();
+      ttsAudio = null;
+    }
+    if (previewAudio) { previewToken++; previewAudio.pause(); previewAudio = null; }
     if ('speechSynthesis' in window) window.speechSynthesis.cancel();
     if (speakingBtn) { speakingBtn.classList.remove('on'); speakingBtn = null; }
   }
-  function toggleSpeak(text, btn) {
-    if (!('speechSynthesis' in window)) return;
+
+  // Нажатие «Озвучить»: во время генерации озвучиваем уже готовые фразы и дальше — по мере появления.
+  async function toggleSpeak(msg, btn) {
     const wasThis = speakingBtn && speakingBtn === btn;
     stopSpeech();
     if (wasThis) return;
+    const text = (msg && msg.text) || '';
+    if (!text.trim()) return;
+    if (await loadTtsStatus(true)) { startTts(msg, btn); return; }
+    if (ttsError) toast('Silero не готов: ' + ttsError + '. Использую голос браузера');
+    legacySpeak(text, btn);
+  }
+
+  function startTts(msg, btn) {
+    const token = ttsToken;
+    ttsQueue = [];
+    ttsLive = { id: msg.id, pos: 0 };
+    ttsDone = false;
+    speakingBtn = btn;
+    if (btn) btn.classList.add('on');
+    feedTts(msg, !msg.pending);
+    runTts(token, btn, currentVoice());
+  }
+
+  // Режем новый кусок ответа на фразы и ставим в очередь. Только законченные предложения:
+  // хвост без точки ждёт продолжения, а при final — озвучивается целиком.
+  function feedTts(msg, final) {
+    if (!ttsLive || !msg || ttsLive.id !== msg.id) return;
+    const text = msg.text || '';
+    let cut = text.length;
+    if (!final) {
+      const re = /[.!?…]+(\s|$)/g;
+      const rest = text.slice(ttsLive.pos);
+      let end = -1;
+      let m;
+      while ((m = re.exec(rest))) end = m.index + m[0].length;
+      if (end < 0) return;
+      cut = ttsLive.pos + end;
+    }
+    const chunk = text.slice(ttsLive.pos, cut);
+    ttsLive.pos = cut;
+    if (!chunk.trim()) { if (final) ttsDone = true; return; }
+    const token = ttsToken;
+    ttsFeeding++;
+    ttsChain = ttsChain.then(async () => {
+      try {
+        const r = await api('POST', '/api/tts/segments', { text: chunk });
+        if (token === ttsToken && Array.isArray(r.segments)) ttsQueue.push(...r.segments);
+      } catch (e) {
+        // фрагмент не разрезался: пропускаем, ответ всё равно озвучится дальше
+      } finally {
+        ttsFeeding--;
+        if (final) ttsDone = true;
+      }
+    });
+  }
+
+  function fetchTtsSegment(seg, voice) {
+    return fetch('/api/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ text: seg, speaker: voice || currentVoice() }),
+    }).then(async (r) => {
+      if (!r.ok) {
+        let msg = '';
+        try { msg = (await r.json()).message || ''; } catch (e) { /* не JSON */ }
+        throw new Error(msg || ('tts ' + r.status));
+      }
+      return r.blob();
+    }).then((blob) => URL.createObjectURL(blob));
+  }
+
+  // Короткий пример голоса из списка. Не трогает очередь основного озвучивания.
+  async function previewVoice(id) {
+    const token = ++previewToken;
+    if (previewAudio) { previewAudio.pause(); previewAudio = null; }
+    document.querySelectorAll('.voice-play.playing').forEach((b) => b.classList.remove('playing'));
+    if (!(await loadTtsStatus(true))) {
+      toast('Silero недоступен' + (ttsError ? ': ' + ttsError : ''));
+      return;
+    }
+    const v = voiceById(id);
+    const text = v.preview || 'Привет! Это пример озвучки.';
+    try {
+      const url = await fetchTtsSegment(text, id);
+      if (token !== previewToken) { URL.revokeObjectURL(url); return; }
+      const a = new Audio(url);
+      previewAudio = a;
+      const done = () => {
+        if (previewAudio === a) previewAudio = null;
+        URL.revokeObjectURL(url);
+        document.querySelectorAll('.voice-play.playing').forEach((b) => b.classList.remove('playing'));
+      };
+      a.onended = done;
+      a.onerror = done;
+      a.play().catch(done);
+    } catch (e) {
+      toast('Не удалось прослушать голос: ' + ((e && e.message) || e));
+    }
+  }
+
+  // Проигрыватель: берёт фразы из очереди, следующую качает, пока играет текущая.
+  async function runTts(token, btn, voice) {
+    if (ttsRunToken === token) return;
+    ttsRunToken = token;
+    let prefetched = null;
+    const finish = () => {
+      if (token !== ttsToken) return;
+      if (btn) btn.classList.remove('on');
+      if (speakingBtn === btn) speakingBtn = null;
+      ttsLive = null;
+      ttsAudio = null;
+      ttsRunToken = -1;
+    };
+    for (;;) {
+      if (token !== ttsToken) return;
+      if (!ttsQueue.length) {
+        if (ttsDone && ttsFeeding === 0) break;
+        await ttsSleep(120);
+        continue;
+      }
+      const seg = ttsQueue.shift();
+      const ready = prefetched && prefetched.seg === seg ? prefetched.p : fetchTtsSegment(seg, voice);
+      prefetched = null;
+      let url;
+      try {
+        url = await ready;
+      } catch (e) {
+        // сервер озвучки не ответил: остаток ответа — голосом браузера
+        ttsServer = false;
+        const why = (e && e.message) ? ': ' + String(e.message).slice(0, 120) : '';
+        toast('Озвучка сервера недоступна' + why + '. Использую голос браузера');
+        const rest = [seg, ...ttsQueue].join(' ');
+        ttsQueue = [];
+        finish();
+        legacySpeak(rest, btn);
+        return;
+      }
+      if (ttsQueue.length) {
+        const nxt = ttsQueue[0];
+        prefetched = { seg: nxt, p: fetchTtsSegment(nxt, voice) };
+        prefetched.p.catch(() => {});
+      }
+      await new Promise((resolve) => {
+        const a = new Audio(url);
+        a._stop = resolve;
+        ttsAudio = a;
+        a.onended = resolve;
+        a.onerror = resolve;
+        a.play().catch(resolve);
+      });
+      URL.revokeObjectURL(url);
+    }
+    finish();
+  }
+
+  function legacySpeak(text, btn) {
+    if (!('speechSynthesis' in window)) return;
     const plain = speechPlainText(text);
     if (!plain) return;
     const u = new SpeechSynthesisUtterance(plain);
@@ -1564,7 +1834,24 @@
 
   let menuEl = null;
   function closeMenu() {
-    if (menuEl) { menuEl.remove(); menuEl = null; }
+    if (menuEl) {
+      menuEl.remove();
+      menuEl = null;
+      document.dispatchEvent(new Event('pulsenet:menu-close'));
+    }
+  }
+  function placeMenu(m, x, y) {
+    document.body.appendChild(m);
+    const r = m.getBoundingClientRect();
+    // visualViewport учитывает клавиатуру iOS; window.innerHeight — нет.
+    const vv = window.visualViewport;
+    const vLeft = vv ? vv.offsetLeft : 0;
+    const vTop = vv ? vv.offsetTop : 0;
+    const vw = vv ? vv.width : window.innerWidth;
+    const vh = vv ? vv.height : window.innerHeight;
+    m.style.left = Math.max(vLeft + 8, Math.min(x, vLeft + vw - r.width - 8)) + 'px';
+    m.style.top = Math.max(vTop + 8, Math.min(y, vTop + vh - r.height - 8)) + 'px';
+    menuEl = m;
   }
   function showMenu(x, y, items) {
     closeMenu();
@@ -1579,17 +1866,45 @@
       b.addEventListener('click', () => { closeMenu(); if (it.onClick) it.onClick(); });
       m.appendChild(b);
     }
-    document.body.appendChild(m);
-    const r = m.getBoundingClientRect();
-    // visualViewport учитывает клавиатуру iOS; window.innerHeight — нет.
-    const vv = window.visualViewport;
-    const vLeft = vv ? vv.offsetLeft : 0;
-    const vTop = vv ? vv.offsetTop : 0;
-    const vw = vv ? vv.width : window.innerWidth;
-    const vh = vv ? vv.height : window.innerHeight;
-    m.style.left = Math.max(vLeft + 8, Math.min(x, vLeft + vw - r.width - 8)) + 'px';
-    m.style.top = Math.max(vTop + 8, Math.min(y, vTop + vh - r.height - 8)) + 'px';
-    menuEl = m;
+    placeMenu(m, x, y);
+  }
+  function showVoiceMenu(anchor) {
+    closeMenu();
+    if (!ttsVoices.length) ttsVoices = [
+      { id: 'aidar', label: 'Айдар', description: 'низкий мужской' },
+      { id: 'baya', label: 'Бая', description: 'мягкий женский' },
+      { id: 'kseniya', label: 'Ксения', description: 'ровный женский' },
+      { id: 'xenia', label: 'Ксения 2', description: 'живой женский' },
+      { id: 'eugene', label: 'Евгений', description: 'мужской' },
+    ];
+    const m = el('div', 'ui-menu voice-menu');
+    m.setAttribute('role', 'menu');
+    m.appendChild(el('div', 'voice-menu-title', 'Голос озвучки · ▶ — пример'));
+    const activeVoice = currentVoice();
+    for (const v of ttsVoices) {
+      const row = el('div', 'voice-item' + (activeVoice === v.id ? ' selected' : ''));
+      row.setAttribute('role', 'menuitem');
+      const meta = el('div', 'voice-meta');
+      meta.appendChild(el('div', 'voice-name', v.label || v.id));
+      if (v.description) meta.appendChild(el('div', 'voice-desc', v.description));
+      const play = el('button', 'voice-play', '▶');
+      play.type = 'button';
+      play.title = 'Прослушать: ' + (v.label || v.id);
+      play.setAttribute('aria-label', play.title);
+      play.addEventListener('click', (e) => { e.stopPropagation(); previewVoice(v.id); });
+      row.appendChild(meta);
+      row.appendChild(play);
+      row.addEventListener('click', () => { setVoice(v.id); closeMenu(); });
+      m.appendChild(row);
+    }
+    const r = anchor.getBoundingClientRect();
+    placeMenu(m, Math.max(8, r.left), r.bottom + 6);
+    els.voiceBtn.setAttribute('aria-expanded', 'true');
+    const off = () => {
+      els.voiceBtn.setAttribute('aria-expanded', 'false');
+      document.removeEventListener('pulsenet:menu-close', off);
+    };
+    document.addEventListener('pulsenet:menu-close', off);
   }
   function showMessageMenu(x, y, idx) {
     const s = currentSession();
@@ -1605,8 +1920,8 @@
       { label: 'Копировать', disabled: !m.text, onClick: () => copyText(m.text || '') },
       { label: 'Другой ответ', disabled: !isBot || busy, onClick: () => regenerate(idx) },
       { label: speakingBtn && isBot ? 'Остановить озвучивание' : 'Озвучить',
-        disabled: (!speakingBtn || !isBot) && (!isBot || !m.text || !('speechSynthesis' in window)),
-        onClick: () => { if (speakingBtn) stopSpeech(); else toggleSpeak(m.text, null); } },
+        disabled: (!speakingBtn || !isBot) && (!isBot || !m.text),
+        onClick: () => { if (speakingBtn) stopSpeech(); else toggleSpeak(m, null); } },
       { sep: true },
       { label: 'Метрики: ' + stat, disabled: true },
     ]);
@@ -1903,6 +2218,7 @@
     statusBusy = true;
     try {
       const s = await api('GET', '/api/status');
+      pullSettings();  // подхватить настройки, изменённые на другом устройстве
       const m = s.memory || {};
       els.statusDot.className = 'status ok';
       els.modelChip.classList.remove('bad');
@@ -3242,6 +3558,13 @@
     applySettings();
     toast(settings.webSearch ? 'Интернет включён: модель может искать и читать страницы' : 'Интернет выключен');
   });
+  if (els.voiceBtn) {
+    els.voiceBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (menuEl && menuEl.classList.contains('voice-menu')) closeMenu();
+      else showVoiceMenu(els.voiceBtn);
+    });
+  }
   els.scrollBottomBtn.addEventListener('click', scrollEnd);
   els.messages.addEventListener('scroll', updateScrollButton, { passive: true });
 
@@ -3357,6 +3680,7 @@
   loadState();
   SYNC.ready = true;   // только теперь локальные изменения уходят на сервер
   applySettings();
+  pullSettings();      // серверная копия настроек (если свежее локальной)
   updateComposer();
   updateCounter();
   renderMetrics();
@@ -3364,6 +3688,7 @@
   renderSessions();
   updateTitle();
   renderMessages({ force: true });
+  loadTtsStatus();
   refreshStatus();
   setInterval(refreshStatus, 10000);
   // Подтягиваем чаты с сервера и подписываемся на изменения других устройств.

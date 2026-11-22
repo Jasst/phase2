@@ -1,0 +1,8 @@
+# Озвучка Silero (локально). Ставится отдельно: torch большой.
+# ВАЖНО: ставить нужно в то же окружение, которым запускается сервер.
+# run_server.bat активирует .venv, поэтому глобальный Python не подходит:
+#   .venv\Scripts\python.exe -m pip install -r requirements-tts.txt
+# CPU-сборка torch (нужна только для озвучки; модель чата от него не зависит):
+#   .venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0
+omegaconf
