@@ -608,6 +608,8 @@
         if (typeof ev.token === 'string') { bot.text += ev.token; addMetricsText(ev.token); schedulePaint(bot, idx); }
         if (typeof ev.reasoning === 'string') { bot.reasoning += ev.reasoning; schedulePaint(bot, idx); }
         if (ev.tool) { upsertTool(bot, ev.tool); schedulePaint(bot, idx); }
+        if (Array.isArray(ev.todo)) { bot.todos = ev.todo; schedulePaint(bot, idx); }
+        if (ev.trace) { bot.trace = { ...(bot.trace || {}), ...ev.trace }; schedulePaint(bot, idx); }
         if (Array.isArray(ev.sources)) { addSources(bot, ev.sources); schedulePaint(bot, idx); }
         if (ev.image) { addImage(bot, ev.image); schedulePaint(bot, idx); }
         if (ev.error) bot.error = String(ev.error);
@@ -964,16 +966,9 @@
       d.appendChild(rbody);
       bubble.appendChild(d);
     }
-    if (isBot && Array.isArray(m.tools) && m.tools.length) {
-      const row = el('div', 'tool-row');
-      for (const t of m.tools) {
-        const chip = el('span', 'tool-chip ' + (t.status || 'running'));
-        const mark = t.status === 'done' ? '✓ ' : (t.status === 'error' ? '✕ ' : '');
-        chip.textContent = mark + (t.label || t.name || 'инструмент');
-        if (t.detail) chip.title = t.detail;
-        row.appendChild(chip);
-      }
-      bubble.appendChild(row);
+    if (isBot) {
+      const trace = renderTrace(m);
+      if (trace) bubble.appendChild(trace);
     }
     if (m.pending && !m.text) {
       const t = el('div', 'typing');
@@ -1041,7 +1036,8 @@
     const tools = (m.tools || []).map((t) => (t.status || '') + ':' + (t.label || t.name || '')).join('|');
     return [settings.showReasoning ? 1 : 0, m.pending ? 1 : 0, tools,
       (m.images || []).length, (m.sources || []).length,
-      m.error || '', m.note || '', m.indexPending || 0, m.gen ? 1 : 0].join('~');
+      m.error || '', m.note || '', m.indexPending || 0, m.gen ? 1 : 0,
+      JSON.stringify(m.todos || []), JSON.stringify(m.trace || null)].join('~');
   }
 
   // Во время стриминга перерисовываем только текст: так выделение и прокрутка
@@ -1189,6 +1185,112 @@
 
   // ---------- инструменты и источники в ответе ----------
 
+  // ---------- трасса работы агента: шаги, карточки инструментов, план ----------
+
+  const openTraceCards = new Set();
+  const TRACE_BADGE = { web: 'веб', mem: 'память', img: 'картинка', skill: 'навык', note: 'заметка', plan: 'план', tool: 'инструмент' };
+  const TRACE_GROUP = {
+    web: ['web_search', 'web_fetch'],
+    mem: ['memory_search', 'memory_remember', 'triplex_search', 'triplex_ingest'],
+    img: ['image_generate'],
+    skill: ['skill_list', 'skill_read', 'skill_write', 'skill_patch'],
+    note: ['note_write', 'note_append', 'note_read', 'note_list'],
+    plan: ['todo_write'],
+  };
+  const STOP_LABEL = {
+    model_done: 'ответ готов', round_limit: 'лимит шагов', call_limit: 'лимит вызовов',
+    failures: 'ошибки инструментов', no_progress: 'нет прогресса', cancelled: 'остановлено',
+  };
+  function traceKind(name) {
+    for (const [kind, names] of Object.entries(TRACE_GROUP)) if (names.includes(name)) return kind;
+    return 'tool';
+  }
+  function fmtMs(ms) {
+    return ms < 1000 ? ms + ' мс' : (ms / 1000).toFixed(1) + ' с';
+  }
+  function renderPlan(todos) {
+    const done = todos.filter((x) => x.status === 'done').length;
+    const box = el('div', 'trace-plan');
+    box.append(el('div', 'plan-title', 'План · ' + done + ' из ' + todos.length));
+    const ul = el('ul', 'plan-list');
+    for (const it of todos) {
+      const st = it.status || 'pending';
+      const li = el('li', 'plan-item ' + st);
+      li.append(el('span', 'plan-mark', st === 'done' ? '●' : (st === 'in_progress' ? '◐' : '○')));
+      li.append(el('span', 'plan-text', it.text || ''));
+      ul.append(li);
+    }
+    box.append(ul);
+    return box;
+  }
+  function renderCard(t) {
+    const st = t.status || 'running';
+    const kind = traceKind(t.name);
+    const card = el('details', 'trace-card ' + st);
+    if (t.sub) card.classList.add('nested');
+    const id = t.id || (t.name + ':' + (t.label || ''));
+    card.open = st === 'error' || openTraceCards.has(id);
+    card.addEventListener('toggle', () => {
+      if (card.open) openTraceCards.add(id); else openTraceCards.delete(id);
+    });
+    const sum = el('summary', 'card-sum');
+    sum.append(el('span', 'card-kind', TRACE_BADGE[kind]));
+    sum.append(el('span', 'card-label', t.label || t.name || 'инструмент'));
+    sum.append(el('span', 'card-status', st === 'done' ? '✓' : (st === 'error' ? '✕' : '')));
+    if (t.ms) sum.append(el('span', 'card-ms', fmtMs(t.ms)));
+    card.append(sum);
+    const body = el('div', 'card-body');
+    if (t.detail) body.append(el('div', 'card-detail', t.detail));
+    if (t.preview) body.append(el('pre', 'card-preview', t.preview));
+    if (!t.detail && !t.preview) {
+      body.append(el('div', 'card-detail muted', st === 'running' ? 'выполняется…' : 'подробностей нет'));
+    }
+    card.append(body);
+    return card;
+  }
+  function renderTrace(m) {
+    const tools = Array.isArray(m.tools) ? m.tools : [];
+    const todos = Array.isArray(m.todos) ? m.todos : [];
+    if (!tools.length && !todos.length) return null;
+    const trace = m.trace || {};
+    const wrap = el('div', 'trace' + (m.pending ? ' live' : ''));
+    const totalMs = tools.reduce((a, t) => a + (t.ms || 0), 0);
+    const steps = Math.max(trace.round || 0, ...tools.map((t) => t.step || 0));
+    const head = el('div', 'trace-head');
+    head.append(el('span', 'trace-title', 'Ход работы'));
+    const meta = [];
+    if (steps) meta.push('шагов ' + steps);
+    meta.push('инструментов ' + tools.length);
+    if (totalMs) meta.push(fmtMs(totalMs));
+    head.append(el('span', 'trace-meta', meta.join(' · ')));
+    if (trace.stop) head.append(el('span', 'trace-stop stop-' + trace.stop, STOP_LABEL[trace.stop] || trace.stop));
+    else if (m.pending) head.append(el('span', 'trace-stop running', 'выполняется'));
+    wrap.append(head);
+    if (todos.length) wrap.append(renderPlan(todos));
+    const groups = new Map();
+    for (const t of tools) {
+      const key = t.step || 0;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(t);
+    }
+    if (groups.size) {
+      const list = el('ol', 'trace-steps');
+      for (const [key, items] of groups) {
+        const li = el('li', 'trace-step');
+        li.append(el('span', 'step-dot'));
+        const body = el('div', 'step-body');
+        body.append(el('div', 'step-label', key ? 'Шаг ' + key : 'Инструменты'));
+        const cards = el('div', 'trace-cards');
+        for (const t of items) cards.append(renderCard(t));
+        body.append(cards);
+        li.append(body);
+        list.append(li);
+      }
+      wrap.append(list);
+    }
+    return wrap;
+  }
+
   function upsertTool(bot, t) {
     if (!t || !t.id) return;
     if (!Array.isArray(bot.tools)) bot.tools = [];
@@ -1324,6 +1426,8 @@
         if (typeof ev.token === 'string') { bot.text += ev.token; addMetricsText(ev.token); schedulePaint(bot, botIdx); }
         if (typeof ev.reasoning === 'string') { bot.reasoning += ev.reasoning; schedulePaint(bot, botIdx); }
         if (ev.tool) { upsertTool(bot, ev.tool); schedulePaint(bot, botIdx); }
+        if (Array.isArray(ev.todo)) { bot.todos = ev.todo; schedulePaint(bot, botIdx); }
+        if (ev.trace) { bot.trace = { ...(bot.trace || {}), ...ev.trace }; schedulePaint(bot, botIdx); }
         if (Array.isArray(ev.sources)) { addSources(bot, ev.sources); schedulePaint(bot, botIdx); }
         if (ev.image) { addImage(bot, ev.image); schedulePaint(bot, botIdx); }
         if (ev.error) { bot.error = String(ev.error); bot.pending = false; }

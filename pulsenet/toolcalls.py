@@ -39,6 +39,12 @@ def agent_limits(env: Optional[dict] = None) -> dict:
         "result_chars": _env_int(env, "TOOL_RESULT_CONTEXT_CHARS", 1200, 200, 20000),
         "native_max": _env_int(env, "TOOL_NATIVE_MAX", 10, 3, 30),
         "image_timeout": _env_int(env, "MCP_TOOL_TIMEOUT_IMAGE", 300, 30, 900),
+        # параллельные вызовы в одном шаге: сколько принимаем и сколько выполняем одновременно
+        "calls_per_step": _env_int(env, "AGENT_CALLS_PER_STEP", 4, 1, 8),
+        "parallel": _env_int(env, "AGENT_PARALLEL", 4, 1, 8),
+        # субагент: раундов на задачу и одновременных LLM-запросов субагентов
+        "sub_rounds": _env_int(env, "SUBAGENT_MAX_ROUNDS", 3, 1, 6),
+        "llm_parallel": _env_int(env, "AGENT_LLM_PARALLEL", 1, 1, 4),
     }
 
 

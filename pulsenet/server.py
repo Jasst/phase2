@@ -104,7 +104,7 @@ class ChatJob:
         with self._lock:
             if kind == "reasoning":
                 self.reasoning += payload
-            elif kind in ("tool", "sources", "image"):
+            elif kind in ("tool", "sources", "image", "todo", "trace"):
                 self.events.append({"kind": kind, "data": payload, "at": len(self.text)})
             else:
                 self.text += payload
@@ -199,7 +199,8 @@ class ChatJobs:
                                  "time": time.time()}], title=job.message[:48])
         try:
             answer = self.app.chat(job.message, job.chat_id, job.add_delta,
-                                   cancelled=job.cancelled.is_set, web=job.web, model=job.model)
+                                   cancelled=job.cancelled.is_set, web=job.web, model=job.model,
+                                   uid=job.uid)
             job.complete(answer, self.app.index_pending(),
                          "stopped" if job.cancelled.is_set() else "done")
         except Exception as exc:                  # noqa: BLE001
@@ -209,6 +210,9 @@ class ChatJobs:
             snap = job.snapshot()
             tools = [ev["data"] for ev in snap["events"] if ev["kind"] == "tool"]
             sources, images = [], []
+            # План и трасса: последнее состояние. Полная лента шагов остаётся в tools (поле step).
+            todos = next((ev["data"] for ev in reversed(snap["events"]) if ev["kind"] == "todo"), [])
+            trace = next((ev["data"] for ev in reversed(snap["events"]) if ev["kind"] == "trace"), None)
             for ev in snap["events"]:
                 if ev["kind"] == "sources" and isinstance(ev["data"], list):
                     sources.extend(ev["data"])
@@ -217,6 +221,7 @@ class ChatJobs:
             msg = {"id": job.assistant_msg_id, "role": "assistant",
                    "text": snap["answer"] or snap["text"], "reasoning": snap["reasoning"],
                    "time": time.time(), "tools": tools, "sources": sources, "images": images,
+                   "todos": todos or [], "trace": trace,
                    "indexPending": snap["index_pending"]}
             if snap["error"]:
                 msg["error"] = snap["error"]

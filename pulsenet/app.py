@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 
@@ -24,7 +25,9 @@ from .triplex import TriplexMemory, make_extractor, openai_chat_caller
 from .triplex import sleep
 from .toolcalls import (COMMANDS, MAX_CALLS_PER_STEP, ToolCallFilter, agent_limits,
                          parse_calls, parse_command, tool_result_block)
-from .tools import ChatTools, Outcome, catalog, instructions
+from .tools import SEQUENTIAL_TOOLS, SUBAGENT_DENY, ChatTools, Outcome, catalog, instructions
+from .unified_mcp.store import IdentityStore
+from .workspace import Workspace
 
 CONTEXT_TURNS = 8
 ERROR_LOG_SIZE = 50
@@ -40,6 +43,42 @@ ASSISTANT_PERSONA = (
     "вставить промпт в Midjourney/DALL·E и не советуй другие сервисы: ты можешь создать изображение сам(а). "
     "Для поиска фактов и свежих данных используй доступные инструменты, а не догадки."
 )
+
+
+WORKSPACE_TOOLS_NAMES = ("skill_list", "skill_read", "skill_write", "skill_patch",
+                         "note_write", "note_append", "note_read", "note_list", "todo_write")
+PLAN_TOOL_NAME = "todo_write"
+WORKFLOW_HINT = (
+    "Как работать с навыками и заметками: "
+    "1) перед задачей, похожей на навык из списка ниже, загрузи его через skill_read и следуй шагам; "
+    "2) если нашёл последовательность, которая сработала и повторяется, сохрани её навыком через "
+    "skill_write (короткие шаги, без личных данных и секретов); если навык устарел — skill_patch; "
+    "3) заметки для себя о работе и о пользователе, а также выводы из ошибок — note_write с kind=self; "
+    "обычные заметки — kind=note; "
+    "4) картинку из image_generate можно вставить в заметку: image_url=\"last\"; "
+    "5) простые самостоятельные подзадачи (поиск в памяти, факты из сети, картинка) удобно отдать "
+    "субагенту через subagent: несколько вызовов в одном шаге выполняются параллельно."
+)
+
+
+SUBAGENT_PERSONA = (
+    "Ты — субагент. Выполни одну подзадачу коротко и точно. Инструменты вызывай, только если без них "
+    "нельзя; результаты не выдумывай. В конце верни итог одним-двумя абзацами, без вступлений."
+)
+
+
+def looks_multistep(text: str) -> bool:
+    """Грубая эвристика: длинный запрос или несколько связок/пунктов — похоже на план из шагов."""
+    t = str(text or "").lower()
+    markers = sum(t.count(m) for m in ("\n- ", "\n* ", "\n1.", "\n2.", " затем ", " потом ",
+                                       " после этого ", " сначала ", " then ", " and then "))
+    return markers >= 2 or (len(t) > 400 and markers >= 1)
+
+
+def _preview(text: str, limit: int = 600) -> str:
+    """Короткий кусок результата инструмента для раскрытия карточки в интерфейсе."""
+    text = str(text or "").strip()
+    return text if len(text) <= limit else text[:limit] + " …"
 
 
 def _parse_json_loose(raw: str) -> dict:
@@ -74,6 +113,19 @@ class App:
         self.embed_model = ""
         self.active_model = ""       # модель последнего ответа: экстракция идёт ею же, без второй загрузки
         self.limits = agent_limits(self.env)
+        # Субагенты делят одну модель: их запросы к LLM идут по очереди (или по AGENT_LLM_PARALLEL).
+        self._llm_slot = threading.BoundedSemaphore(self.limits["llm_parallel"])
+        # Навыки, заметки и правила агента — в data_unified (та же папка, что у unified MCP).
+        ws_root = (self.env.get("AGENT_WORKSPACE_DIR") or self.env.get("PULSENET_DATA_DIR")
+                   or os.path.join(os.path.dirname(os.path.abspath(data_dir)), "data_unified"))
+        self.workspace = Workspace(ws_root,
+                                   skills_write=self.env.get("AGENT_SKILLS_WRITE", "1") == "1")
+        # Корневой AGENTS.md описывает инструменты для внешних клиентов (opencode). В чат его
+        # подключают только по AGENT_PROJECT_RULES=1; по умолчанию чат читает data_unified/AGENTS.md.
+        self.project_agents = None
+        if self.env.get("AGENT_PROJECT_RULES", "0") == "1":
+            self.project_agents = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "AGENTS.md")
         # Один клиент на все MCP-вызовы: память, каталог инструментов и генерация картинок.
         # Объект не подключается до первого вызова, поэтому его можно создавать всегда.
         self._mcp = MCPClient(
@@ -251,6 +303,111 @@ class App:
     def index_pending(self) -> int:
         return self._index_q.qsize()
 
+    def _identity_context(self, uid: Optional[str]) -> str:
+        """Подтверждённая цепочка личной идентичности пользователя (только committed-звенья)."""
+        if not uid:
+            return ""
+        try:
+            chain = IdentityStore(self.workspace.root).chain(uid)["chain"]
+        except (ValueError, OSError) as exc:      # noqa: BLE001
+            self.log_error("цепочка идентичности", exc)
+            return ""
+        lines = [f"- {c.get('content', '')}" for c in chain[-12:] if c.get("content")]
+        if not lines:
+            return ""
+        return ("Твоя личная цепочка идентичности (подтверждённые самоформулировки; держись их и не "
+                "пересказывай вслух):\n" + "\n".join(lines)[:1200])
+
+    def _run_subagent(self, task: str, tools: ChatTools, names: List[str], requested: List[str],
+                      on_delta, cancelled) -> Outcome:
+        """Субагент: отдельный короткий цикл с тем же LLM. Его вызовы видны в трассе (поле sub)."""
+        allowed = [n for n in names if n not in SUBAGENT_DENY]
+        if requested:
+            allowed = [n for n in allowed if n in requested] or allowed
+        sid = "s" + uuid.uuid4().hex[:6]
+        lim = self.limits
+        system = SUBAGENT_PERSONA
+        ins = instructions(allowed, tools.specs(allowed))
+        if ins:
+            system += "\n\n" + ins
+        messages: List[dict] = [{"role": "system", "content": system}, {"role": "user", "content": task}]
+        target = self.active_model or self.default_rel()
+
+        def sub_delta(kind, payload):
+            if kind == "tool" and isinstance(payload, dict):
+                payload = {**payload, "sub": sid}
+            on_delta(kind, payload)
+
+        calls = 0
+        final = ""
+        for rnd in range(lim["sub_rounds"] + 1):
+            flt = ToolCallFilter()
+            visible: List[str] = []
+
+            def tok(kind, text, flt=flt, visible=visible):
+                if kind == "token":
+                    visible.append(flt.feed(text))
+
+            with self._llm_slot:
+                self.backend.stream(target, messages, tok, cancelled=cancelled)
+            visible.append(flt.finish())
+            text = "".join(visible).strip()
+            raw = flt.calls_raw[: lim["calls_per_step"]]
+            if not raw or rnd == lim["sub_rounds"] or cancelled():
+                final = text
+                break
+            messages.append({"role": "assistant",
+                             "content": text + "".join(f"<tool_call>{r}</tool_call>" for r in raw)})
+            blocks: List[str] = []
+            for call in parse_calls(raw):
+                name = call.get("name") or "?"
+                args = call.get("arguments") or {}
+                calls += 1
+                if call.get("error"):
+                    out = Outcome(False, call["error"], label="Инструмент", detail=call["error"])
+                elif name not in allowed:
+                    out = Outcome(False, f"Субагенту недоступен инструмент {name}. "
+                                         f"Доступны: {', '.join(allowed) or 'нет'}.",
+                                  label="Инструмент", detail=name)
+                    sub_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "error",
+                                       "step": getattr(self, "_agent_step", 0),
+                                       "label": f"Нет доступа у субагента: {name}",
+                                       "detail": "субагенту не разрешено", "preview": ""})
+                else:
+                    out = self._call_tool(tools, name, args, sub_delta)
+                blocks.append(tool_result_block(name, out.text, lim["result_chars"]))
+            messages.append({"role": "user", "content": "\n".join(blocks)})
+        return Outcome(True, final or "Субагент не дал ответа.", label=f"Субагент: «{_preview(task, 60)}»",
+                       detail=f"вызовов: {calls}")
+
+    def _agent_context(self, message: str, names: List[str]) -> str:
+        """Правила (AGENTS.md), каталог навыков, самонаблюдения и навыки, подходящие к запросу.
+        Всё необязательно: при ошибке чтения агент работает без этого блока."""
+        parts: List[str] = []
+        ws_on = any(n in names for n in WORKSPACE_TOOLS_NAMES)
+        if ws_on:
+            parts.append(WORKFLOW_HINT)
+        if PLAN_TOOL_NAME in names and looks_multistep(message):
+            parts.append("Задача похоже из нескольких шагов: сначала вызови todo_write с планом, "
+                         "потом выполняй шаги и отмечай прогресс.")
+        try:
+            rules = self.workspace.instructions(self.project_agents)
+            if rules:
+                parts.append(rules)
+            catalog_text = self.workspace.skill_catalog()
+            if catalog_text:
+                parts.append(catalog_text)
+            notes = self.workspace.self_notes()
+            if notes:
+                parts.append(notes)
+            for skill in self.workspace.skill_match(message, k=1):
+                body = skill["body"].strip()[:4000]
+                parts.append(f"Подходящий навык «{skill['name']}» (применяй его шаги):\n{body}")
+        except Exception as exc:                  # noqa: BLE001
+            self.log_error("рабочее пространство агента", exc)
+            return ""
+        return "\n\n".join(parts)
+
     def memory_context(self, message: str) -> str:
         if not self.memory_enabled:
             return ""
@@ -292,12 +449,18 @@ class App:
             self.history.setdefault(chat_id or "default", []).append({"role": role, "content": content})
 
     def _call_tool(self, tools: ChatTools, name: str, args: dict, on_delta) -> Outcome:
-        """Исполняет инструмент и сообщает интерфейсу о ходе: running → done/error, источники."""
+        """Исполняет инструмент и сообщает интерфейсу о ходе: running → done/error, источники.
+        step — номер раунда агента; ms — длительность; preview — что вернулось (для раскрытия в UI)."""
         cid = "t" + uuid.uuid4().hex[:8]
-        on_delta("tool", {"id": cid, "name": name, "status": "running", "label": tools.describe(name, args)})
+        step = getattr(self, "_agent_step", 0)     # номер раунда ставит цикл chat()
+        started = time.monotonic()
+        on_delta("tool", {"id": cid, "name": name, "status": "running", "step": step,
+                          "label": tools.describe(name, args)})
         out = tools.run(name, args)
         on_delta("tool", {"id": cid, "name": name, "status": "done" if out.ok else "error",
-                          "label": out.label, "detail": out.detail})
+                          "step": step, "label": out.label, "detail": out.detail,
+                          "ms": int((time.monotonic() - started) * 1000),
+                          "preview": _preview(out.text)})
         if out.sources:
             on_delta("sources", out.sources)
         if out.image:
@@ -327,7 +490,8 @@ class App:
         return {"reply": COMMANDS[name]["usage"]}
 
     def chat(self, message: str, chat_id: str, on_delta: Callable[[str, object], None],
-             cancelled: Optional[Callable[[], bool]] = None, web: bool = False, model: str = "") -> str:
+             cancelled: Optional[Callable[[], bool]] = None, web: bool = False, model: str = "",
+             uid: Optional[str] = None) -> str:
         """Ход чата с инструментами.
 
         on_delta(kind, payload):
@@ -347,7 +511,13 @@ class App:
         tools = ChatTools(recall=self._tool_recall,
                           remember=lambda text: self._tool_remember(text, chat_id),
                           mcp_call=self._mcp_tool_call if self.mcp_tools_enabled else None,
-                          mcp_specs=mcp_specs)
+                          mcp_specs=mcp_specs,
+                          workspace=self.workspace,
+                          on_event=lambda kind, payload: on_delta(kind, payload))
+        # Субагент получает инструменты текущего хода (без записи и без рекурсии).
+        # Подключаем до available(): иначе инструмент subagent не попадёт в каталог.
+        tools.set_subagent(lambda task, requested: self._run_subagent(
+            task, tools, names, requested, on_delta, is_cancelled))
         names = tools.available(web=web, memory=self.memory_enabled)
         specs = tools.specs(names)
         parts: List[str] = []
@@ -368,6 +538,12 @@ class App:
 
         # 2) контекст: персона + память по вопросу + инструкция по инструментам
         system = [ASSISTANT_PERSONA]
+        ident = self._identity_context(uid)
+        if ident:
+            system.append(ident)
+        rules = self._agent_context(user_text, names)
+        if rules:
+            system.append(rules)
         mem = self.memory_context(user_text)
         if mem:
             system.append(mem)
@@ -386,6 +562,7 @@ class App:
         # 3) агентный цикл: запрос → инструменты → реакт → инструменты → ... → ответ.
         # Лимиты из env; один вызов инструмента не занимает больше result_chars контекста.
         lim = self.limits
+        per_step = lim["calls_per_step"]
         max_rounds = lim["max_rounds"]
         hard_cap = lim["hard_cap"]
         max_calls = lim["max_calls"]
@@ -429,10 +606,10 @@ class App:
                 step.append(tail)
                 emit_text(tail)
             native_mode = bool(native and not flt.calls_raw)
-            raw_calls = flt.calls_raw[:MAX_CALLS_PER_STEP]
+            raw_calls = flt.calls_raw[:per_step]
             if native_mode:
                 raw_calls = [json.dumps({"name": c["name"], "arguments": c["arguments"]},
-                                        ensure_ascii=False) for c in native[:MAX_CALLS_PER_STEP]]
+                                        ensure_ascii=False) for c in native[:per_step]]
 
             if is_cancelled():
                 stop_reason = "cancelled"
@@ -454,7 +631,7 @@ class App:
                          "content": "".join(step) + "".join(f"<tool_call>{r}</tool_call>" for r in raw_calls)}
             if native_mode:
                 assistant["tool_calls"] = []
-                for i, c in enumerate(native[:MAX_CALLS_PER_STEP]):
+                for i, c in enumerate(native[:per_step]):
                     tid = c.get("id") or ("call_" + uuid.uuid4().hex[:8])
                     c["id"] = tid
                     assistant["tool_calls"].append({"id": tid, "type": "function", "function": {
@@ -463,12 +640,18 @@ class App:
             blocks: List[str] = []
             native_msgs: List[dict] = []
             had_error = False
+            # 1) разбор по порядку: повторы, ошибки, недоступные инструменты — без исполнения;
+            # 2) исполнение: независимые вызовы — параллельно, инструменты записи — по очереди;
+            # 3) результаты возвращаются модели в исходном порядке.
+            items: List[dict] = []
+            batch_sigs: Dict[str, int] = {}
             for idx, call in enumerate(parse_calls(raw_calls)):
                 if calls_used >= max_calls:
                     break
                 name = call.get("name") or "?"
                 args = call.get("arguments") or {}
                 signature = name + ":" + json.dumps(args, sort_keys=True, ensure_ascii=False)
+                calls_used += 1
                 if signature in seen_calls:
                     # Повтор того же вывода: не перевызываем дорогой инструмент (особенно генерацию).
                     stuck += 1
@@ -476,19 +659,49 @@ class App:
                                   detail="результат из кэша")
                     on_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "done",
                                       "label": out.label, "detail": out.detail})
+                    items.append({"idx": idx, "name": name, "out": out})
+                elif signature in batch_sigs:
+                    stuck += 1
+                    items.append({"idx": idx, "name": name, "dup": batch_sigs[signature]})
                 elif call.get("error"):
                     out = Outcome(False, call["error"], label="Инструмент", detail=call["error"])
                     on_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "error",
                                       "label": "Ошибка вызова", "detail": call["error"]})
+                    items.append({"idx": idx, "name": name, "out": out})
                 elif name not in names:
                     out = Outcome(False, f"Инструмент {name} недоступен. Доступны: {', '.join(names) or 'нет'}.",
                                   label="Инструмент", detail=name)
                     on_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "error",
                                       "label": f"Нет инструмента: {name}", "detail": ""})
+                    items.append({"idx": idx, "name": name, "out": out})
                 else:
-                    out = self._call_tool(tools, name, args, on_delta)
-                    seen_calls[signature] = out.text
-                calls_used += 1
+                    batch_sigs[signature] = len(items)
+                    items.append({"idx": idx, "name": name, "args": args, "sig": signature, "run": True})
+
+            to_run = [it for it in items if it.get("run")]
+            self._agent_step = rounds
+            if len(to_run) > 1 and not any(it["name"] in SEQUENTIAL_TOOLS for it in to_run):
+                with ThreadPoolExecutor(max_workers=min(len(to_run), lim["parallel"])) as pool:
+                    futures = [pool.submit(self._call_tool, tools, it["name"], it["args"], on_delta)
+                               for it in to_run]
+                    for it, fut in zip(to_run, futures):
+                        it["out"] = fut.result()
+            else:
+                for it in to_run:
+                    it["out"] = self._call_tool(tools, it["name"], it["args"], on_delta)
+            for it in items:
+                if "dup" in it:
+                    it["out"] = items[it["dup"]]["out"]
+                if it.get("run"):
+                    seen_calls[it["sig"]] = it["out"].text
+
+            blocks: List[str] = []
+            native_msgs: List[dict] = []
+            had_error = False
+            for it in items:
+                out = it["out"]
+                name = it["name"]
+                idx = it["idx"]
                 if not out.ok:
                     failures += 1
                     had_error = True
@@ -514,10 +727,14 @@ class App:
                     last += "\n\n" + final_hint
                 messages.append({"role": "user", "content": last})
 
+            on_delta("trace", {"round": rounds, "calls": len(blocks), "failures": failures,
+                               "state": "running"})
             if failures >= 4:
                 stop_reason = "failures"
                 break
 
+        on_delta("trace", {"round": rounds, "calls": calls_used, "failures": failures,
+                           "state": "done", "stop": stop_reason})
         answer = "".join(parts).strip()
         if not answer:
             fallback = {"round_limit": "Достигнут лимит шагов — отвечаю по собранным данным.",
