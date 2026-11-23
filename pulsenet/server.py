@@ -18,7 +18,7 @@
        /auth/reset/confirm     восстановление пароля по коду из письма
   GET  /api/status             бэкенд, память, журнал ошибок (требует входа)
   GET  /api/models             модели бэкенда
-  POST /api/chat               чат, поток SSE: token | reasoning | tool | sources | image | done | error
+  POST /api/chat               чат, поток SSE: token | reasoning | step | tool | sources | image | trace | done | error
                                тело: {message, chat_id, web, model} — web разрешает веб-инструменты,
                                model выбирает модель для ответа (пусто — по умолчанию)
   GET  /api/chat/stream        продолжить поток после перезагрузки / с другого устройства
@@ -54,6 +54,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Dict, List
 from urllib.parse import parse_qs, urlparse
 
 from .auth_config import AuthConfig
@@ -61,6 +62,7 @@ from .auth_routes import AuthAPI
 from .auth_session import clear_cookie_header, make_session, session_cookie_header
 from .auth_store import AuthStore
 from .chat_store import ChatStore
+from .settings_store import SettingsStore
 from .mailer import Mailer
 from .unified_mcp.auth import TokenStore
 
@@ -92,6 +94,7 @@ class ChatJob:
         self.assistant_msg_id = assistant_msg_id
         self.text = ""
         self.reasoning = ""
+        self.reasoning_events = []       # куски <think> с позицией в тексте на момент появления
         self.answer = ""
         self.error = ""
         self.status = "running"          # running | done | stopped | error
@@ -104,7 +107,8 @@ class ChatJob:
         with self._lock:
             if kind == "reasoning":
                 self.reasoning += payload
-            elif kind in ("tool", "sources", "image"):
+                self.reasoning_events.append({"text": payload, "at": len(self.text)})
+            elif kind in ("tool", "sources", "image", "todo", "trace", "step"):
                 self.events.append({"kind": kind, "data": payload, "at": len(self.text)})
             else:
                 self.text += payload
@@ -126,6 +130,7 @@ class ChatJob:
             return {
                 "text": self.text,
                 "reasoning": self.reasoning,
+                "reasoning_events": list(self.reasoning_events),
                 "events": list(self.events),
                 "answer": self.answer,
                 "error": self.error,
@@ -199,7 +204,8 @@ class ChatJobs:
                                  "time": time.time()}], title=job.message[:48])
         try:
             answer = self.app.chat(job.message, job.chat_id, job.add_delta,
-                                   cancelled=job.cancelled.is_set, web=job.web, model=job.model)
+                                   cancelled=job.cancelled.is_set, web=job.web, model=job.model,
+                                   uid=job.uid)
             job.complete(answer, self.app.index_pending(),
                          "stopped" if job.cancelled.is_set() else "done")
         except Exception as exc:                  # noqa: BLE001
@@ -209,14 +215,32 @@ class ChatJobs:
             snap = job.snapshot()
             tools = [ev["data"] for ev in snap["events"] if ev["kind"] == "tool"]
             sources, images = [], []
+            # План и трасса: последнее состояние. Полная лента шагов — отдельным массивом:
+            # start/end одного шага склеиваются по id, чтобы не терять детали при реаттаче.
+            todos = next((ev["data"] for ev in reversed(snap["events"]) if ev["kind"] == "todo"), [])
+            trace = next((ev["data"] for ev in reversed(snap["events"]) if ev["kind"] == "trace"), None)
+            steps: List[dict] = []
+            step_index: Dict[str, dict] = {}
             for ev in snap["events"]:
                 if ev["kind"] == "sources" and isinstance(ev["data"], list):
                     sources.extend(ev["data"])
                 elif ev["kind"] == "image" and isinstance(ev["data"], dict):
                     images.append(ev["data"])
+                elif ev["kind"] == "step" and isinstance(ev["data"], dict):
+                    data = ev["data"]
+                    sid = str(data.get("id") or "")
+                    existing = step_index.get(sid) if sid else None
+                    if existing is not None and data.get("phase") != "start":
+                        existing.update(data)
+                    else:
+                        item = dict(data)
+                        steps.append(item)
+                        if sid:
+                            step_index[sid] = item
             msg = {"id": job.assistant_msg_id, "role": "assistant",
                    "text": snap["answer"] or snap["text"], "reasoning": snap["reasoning"],
                    "time": time.time(), "tools": tools, "sources": sources, "images": images,
+                   "todos": todos or [], "trace": trace, "steps": steps,
                    "indexPending": snap["index_pending"]}
             if snap["error"]:
                 msg["error"] = snap["error"]
@@ -261,6 +285,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         for key, value in {**getattr(self, "_extra_headers", {}), **(headers or {})}.items():
+            self.send_header(key, str(value))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_bytes(self, data: bytes, content_type: str):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        for key, value in getattr(self, "_extra_headers", {}).items():
             self.send_header(key, str(value))
         self.end_headers()
         self.wfile.write(data)
@@ -371,25 +405,37 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
         text_pos = 0
-        reasoning_pos = 0
+        reason_pos = 0
         event_pos = 0
         try:
             while True:
                 snap = job.snapshot()
                 text = snap["text"]
-                reasoning = snap["reasoning"]
-                for ev in snap["events"][event_pos:]:
-                    if ev["at"] > text_pos:
-                        self.sse({"token": text[text_pos:ev["at"]]})
-                        text_pos = ev["at"]
-                    self.sse({ev["kind"]: ev["data"]})
-                    event_pos += 1
-                if len(text) > text_pos:
-                    self.sse({"token": text[text_pos:]})
-                    text_pos = len(text)
-                if len(reasoning) > reasoning_pos:
-                    self.sse({"reasoning": reasoning[reasoning_pos:]})
-                    reasoning_pos = len(reasoning)
+
+                def emit_until(pos):
+                    nonlocal text_pos
+                    if pos > text_pos:
+                        self.sse({"token": text[text_pos:pos]})
+                        text_pos = pos
+
+                # Рассуждения и события (step, tool, …) имеют позицию в тексте.
+                # Объединяем их в один timeline: <think> уходит ДО токенов, которые
+                # модель выдала после него, а не в конце всего ответа.
+                events = snap["events"]
+                reasons = snap["reasoning_events"]
+                while event_pos < len(events) or reason_pos < len(reasons):
+                    ev_at = events[event_pos]["at"] if event_pos < len(events) else float("inf")
+                    rs_at = reasons[reason_pos]["at"] if reason_pos < len(reasons) else float("inf")
+                    if ev_at <= rs_at:
+                        emit_until(ev_at)
+                        ev = events[event_pos]
+                        self.sse({ev["kind"]: ev["data"]})
+                        event_pos += 1
+                    else:
+                        emit_until(rs_at)
+                        self.sse({"reasoning": reasons[reason_pos]["text"]})
+                        reason_pos += 1
+                emit_until(len(text))
                 if snap["status"] != "running":
                     if snap["error"]:
                         self.sse({"error": snap["error"]})
@@ -792,7 +838,82 @@ def _chat_save_memory(h, b, _q):
     h.send_json(out)
 
 
+_SETTING_BOOLS = ("compact", "autoScroll", "enterSends", "showReasoning", "webSearch")
+_SETTING_STRINGS = ("fontSize", "model", "ttsVoice")
+
+
+def _clean_settings(b):
+    """Не доверяем телу запроса: храним только известные поля и разумные значения."""
+    from .tts import normalize_speaker
+    out = {}
+    for key in _SETTING_BOOLS:
+        if key in b:
+            out[key] = bool(b[key])
+    for key in _SETTING_STRINGS:
+        if key in b:
+            out[key] = str(b.get(key) or "")[:200]
+    if "fontSize" in out and out["fontSize"] not in ("s", "m", "l"):
+        out["fontSize"] = "m"
+    if out.get("ttsVoice"):
+        try:
+            out["ttsVoice"] = normalize_speaker(out["ttsVoice"])
+        except ValueError:
+            out["ttsVoice"] = ""
+    if "updatedAt" in b:
+        try:
+            out["updatedAt"] = int(b["updatedAt"])
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _settings_get(h, _b, _q):
+    if h.settings_store is None:
+        return h.send_json({"error": "серверное хранилище настроек недоступно"}, 503)
+    h.send_json(h.settings_store.get(h.storage_uid()))
+
+
+def _settings_put(h, b, _q):
+    if h.settings_store is None:
+        return h.send_json({"error": "серверное хранилище настроек недоступно"}, 503)
+    data, updated = h.settings_store.put(h.storage_uid(), _clean_settings(b))
+    h.send_json({"settings": data, "updated": updated, "updatedAt": data.get("updatedAt", 0)})
+
+
+def _tts_status(h, _b, q):
+    # ?retry=1 — пользователь нажал «Озвучить»: пробуем ещё раз после исправления окружения
+    if str((q or {}).get("retry", [""])[0]).lower() in ("1", "true", "yes"):
+        h.app.tts.reset_error()
+    h.send_json(h.app.tts.status())
+
+
+def _tts_segments(h, b, _q):
+    """Текст ответа → список фраз для поочерёдной озвучки (очистка markdown и кода — на сервере)."""
+    from .tts import split_segments
+    h.send_json({"segments": split_segments(str(b.get("text") or ""))})
+
+
+def _tts_speak(h, b, _q):
+    """Одна фраза → WAV. Голос передаётся в запросе, ошибки — 503 с понятной причиной."""
+    from .tts import TTSError, normalize_speaker
+    text = str(b.get("text") or "").strip()
+    if not text:
+        raise ValueError("пустой текст для озвучки")
+    raw = b.get("speaker")
+    speaker = normalize_speaker(raw) if raw not in (None, "") else None
+    try:
+        data = h.app.tts.synth(text, speaker)
+    except TTSError as exc:
+        return h.send_json({"error": "tts_unavailable", "message": str(exc)}, 503)
+    h.send_bytes(data, "audio/wav")
+
+
 ROUTES = {
+    ("GET", "/api/settings"): _settings_get,
+    ("PUT", "/api/settings"): _settings_put,
+    ("GET", "/api/tts/status"): _tts_status,
+    ("POST", "/api/tts/segments"): _tts_segments,
+    ("POST", "/api/tts"): _tts_speak,
     ("GET", "/api/status"): _status,
     ("GET", "/api/models"): _models,
     ("GET", "/api/tools"): _tools,
@@ -836,6 +957,7 @@ def make_server(app, host="127.0.0.1", port=8000, web_dir=WEB_DIR_DEFAULT, auth=
     # Серверные чаты и токены: каталог данных MCP берём из той же переменной, что
     # и unified_mcp — иначе веб будет читать не ту базу токенов.
     chat_store = ChatStore(os.path.join(data_dir, "chats.sqlite"))
+    settings_store = SettingsStore(os.path.join(data_dir, "settings.sqlite"))
     mcp_dir = (env.get("PULSENET_DATA_DIR")
                or os.path.join(os.path.dirname(os.path.abspath(data_dir)), "data_unified"))
     os.makedirs(mcp_dir, exist_ok=True)
@@ -846,6 +968,7 @@ def make_server(app, host="127.0.0.1", port=8000, web_dir=WEB_DIR_DEFAULT, auth=
         key_path=env.get("MCP_TOKEN_KEY_PATH") or os.path.join(mcp_dir, "mcp_token.key"))
     notifier = ChatNotifier()
     _H.chat_store = chat_store
+    _H.settings_store = settings_store
     _H.token_store = token_store
     _H.chat_notifier = notifier
     _H.jobs = ChatJobs(app, store=chat_store, notifier=notifier)

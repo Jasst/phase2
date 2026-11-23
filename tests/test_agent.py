@@ -256,12 +256,16 @@ def test_neuron_tools_dedupe_recombine_edit_and_forget(tmp_path, monkeypatch):
     assert not any(f["s"] == "Нел" or f["o"] == "Нел" for f in app.memory.list_facts(50))
 
 
-def test_model_choice_follows_loaded_and_active_model(tmp_path, monkeypatch):
+def test_model_choice_is_stable_and_only_explicit(tmp_path, monkeypatch):
     app = _app(tmp_path, monkeypatch, [["ok"]])
+    # Даже если в LM Studio загружена другая модель, приложение не «подхватывает» её.
     app.backend.refresh_loaded = lambda: "loaded-in-lmstudio"
-    assert app.default_rel() == "loaded-in-lmstudio"   # не дёргаем модель из .env
+    assert app.default_rel() == ""
+    assert app.model_id() == "local"
     app.active_model = "explicit/model"
     assert app.model_id() == "explicit/model"          # экстракция идёт моделью чата
+    assert app.resolve_model("user/choice") == "user/choice"
+    assert app.model_id() == "explicit/model"          # явная модель для операции не меняет глобальный выбор
 
 
 def _run(app, message, web=False, chat_id="c1"):
@@ -293,11 +297,24 @@ def test_agent_loop_runs_tool_and_hides_call(tmp_path, monkeypatch):
 
 
 def test_agent_loop_stops_after_max_steps(tmp_path, monkeypatch):
-    call = '<tool_call>{"name": "memory_search", "arguments": {"query": "x"}}</tool_call>'
-    scripts = [[call] for _ in range(MAX_STEPS + 3)]
+    # Разные вызовы в каждом раунде: прогресс есть, останавливает только лимит раундов.
+    scripts = [['<tool_call>{"name": "memory_search", "arguments": {"query": "x%d"}}</tool_call>' % i]
+               for i in range(MAX_STEPS + 3)]
     app = _app(tmp_path, monkeypatch, scripts)
     _run(app, "вопрос")
     assert len(app.backend.seen) == MAX_STEPS + 1
+
+
+def test_agent_loop_stops_early_when_model_repeats_same_call(tmp_path, monkeypatch):
+    # Одинаковый вызов из раунда в раунд: результат берётся из кэша, прогресса нет.
+    # Два холостых раунда подряд — финальный ответ, а не лишние шаги модели.
+    call = '<tool_call>{"name": "memory_search", "arguments": {"query": "x"}}</tool_call>'
+    # Раунд 1 выполняет вызов, раунды 2 и 3 — повторы из кэша; финальный шаг получает текст.
+    scripts = [[call], [call], [call], ["Итог по собранному."]]
+    app = _app(tmp_path, monkeypatch, scripts)
+    answer, _, _ = _run(app, "вопрос")
+    assert len(app.backend.seen) < MAX_STEPS + 1
+    assert "Итог" in answer
 
 
 def test_unknown_tool_is_reported_to_model(tmp_path, monkeypatch):
@@ -342,7 +359,8 @@ def test_command_without_argument_replies_with_usage(tmp_path, monkeypatch):
 def test_command_remember_stores_text(tmp_path, monkeypatch):
     app = _app(tmp_path, monkeypatch, [["Запомнила."]])
     queued = []
-    monkeypatch.setattr(app, "index_async", lambda text, chat_id, role="user": queued.append(text))
+    monkeypatch.setattr(app, "index_async",
+                        lambda text, chat_id, role="user", force=False: queued.append(text))
     _run(app, "/remember Проект живёт в pulsenet")
     assert queued == ["Проект живёт в pulsenet"]
 

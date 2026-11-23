@@ -17,6 +17,11 @@ def load_dotenv(path=".env"):
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                 value = value[1:-1]
+            else:
+                # inline-комментарий: '# ...' или ' # ...'; '#' без пробела — часть значения
+                value = value.split(" #", 1)[0].strip()
+                if value.startswith("#"):
+                    value = ""
             if key and key not in os.environ:
                 os.environ[key] = value
                 loaded += 1

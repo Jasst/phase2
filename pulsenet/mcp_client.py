@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 
@@ -67,11 +68,27 @@ def _content_text(content) -> str:
     return "\n".join(parts) if parts else "{}"
 
 
+# Инструменты только для чтения: при сбое связи их можно повторить один раз.
+# Записи (triplex_ingest и т. п.) не повторяем, чтобы не создать дубль.
+READ_TOOLS = frozenset({"triplex_search", "triplex_facts", "triplex_graph", "triplex_stats",
+                        "activity_recent", "pulsenet_guide", "whoami", "web_search", "web_fetch"})
+RETRY_DELAY = 0.7
+
+
+def _is_outage(exc: BaseException, detail: str) -> bool:
+    """Сбой связи или сервера (а не отказ по существу и не таймаут долгой операции)."""
+    return not isinstance(exc, TimeoutError) and "HTTP 40" not in detail
+
+
 class MCPClient:
-    def __init__(self, url: str, token: str, timeout: float = 30.0):
+    def __init__(self, url: str, token: str, timeout: float = 30.0, cooldown: float = 0.0):
         self.url = url
         self.token = token
         self.timeout = timeout
+        # Пауза после сбоя связи: следующие вызовы сразу получают MemoryUnavailable, а не ждут
+        # таймаут каждый. В одном ходе агента таких вызовов бывает несколько.
+        self.cooldown = max(0.0, float(cooldown))
+        self._down_until = 0.0
 
     def _session(self):
         from mcp import ClientSession
@@ -80,10 +97,21 @@ class MCPClient:
             raise MemoryUnavailable("не задан PULSENET_CHAT_MCP_TOKEN (см. .env.example)")
         return ClientSession, streamablehttp_client
 
+    def _check_cooldown(self) -> None:
+        if self.cooldown and time.monotonic() < self._down_until:
+            raise MemoryUnavailable(f"MCP-сервер недавно не отвечал ({self.url}); повторим позже")
+
+    def _fail(self, exc: BaseException) -> MemoryUnavailable:
+        detail = _http_detail(exc) or str(exc) or type(exc).__name__
+        if self.cooldown and _is_outage(exc, detail):
+            self._down_until = time.monotonic() + self.cooldown
+        return MemoryUnavailable(f"MCP-сервер недоступен ({self.url}): {detail}")
+
     def list_tools(self) -> List[dict]:
         """Каталог инструментов MCP-сервера. Раньше чат его не запрашивал — отсюда и
         «я текстовая нейросеть»: модель видела только 4 захардкоженных имени."""
         ClientSession, streamablehttp_client = self._session()
+        self._check_cooldown()
 
         async def run():
             async with streamablehttp_client(self.url,
@@ -101,12 +129,12 @@ class MCPClient:
             # Новый поток asyncio в каждом вызове: вызовы приходят из рабочих потоков чата.
             return asyncio.run(asyncio.wait_for(run(), self.timeout))
         except Exception as exc:                  # noqa: BLE001
-            detail = _http_detail(exc) or str(exc)
-            raise MemoryUnavailable(f"MCP-сервер недоступен ({self.url}): {detail}") from exc
+            raise self._fail(exc) from exc
 
     def call(self, tool: str, args: Optional[Dict[str, Any]] = None,
              timeout: Optional[float] = None) -> dict:
         ClientSession, streamablehttp_client = self._session()
+        self._check_cooldown()
 
         async def run():
             async with streamablehttp_client(self.url,
@@ -115,12 +143,18 @@ class MCPClient:
                     await sess.initialize()
                     return await sess.call_tool(tool, args or {})
 
-        try:
-            # Новый поток asyncio в каждом вызове: вызовы приходят из рабочих потоков чата.
-            res = asyncio.run(asyncio.wait_for(run(), timeout or self.timeout))
-        except Exception as exc:                  # noqa: BLE001
-            detail = _http_detail(exc) or str(exc)
-            raise MemoryUnavailable(f"MCP-сервер недоступен ({self.url}): {detail}") from exc
+        attempts = 2 if tool in READ_TOOLS else 1
+        for attempt in range(attempts):
+            try:
+                # Новый поток asyncio в каждом вызове: вызовы приходят из рабочих потоков чата.
+                res = asyncio.run(asyncio.wait_for(run(), timeout or self.timeout))
+                break
+            except Exception as exc:              # noqa: BLE001
+                detail = _http_detail(exc) or str(exc) or type(exc).__name__
+                if attempt + 1 < attempts and _is_outage(exc, detail):
+                    time.sleep(RETRY_DELAY)
+                    continue
+                raise self._fail(exc) from exc
         text = _content_text(res.content)
         if getattr(res, "isError", False):
             raise MemoryUnavailable(text[:300])

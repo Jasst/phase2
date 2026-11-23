@@ -18,6 +18,8 @@
     showReasoning: false,
     webSearch: false,
     model: '',
+    ttsVoice: '',        // пусто = голос сервера по умолчанию
+    updatedAt: 0,        // для синхронизации с сервером: побеждает более свежая копия
   };
   // Команды: серверные уходят в чат, local — выполняются в интерфейсе.
   const COMMANDS = [
@@ -36,7 +38,7 @@
     { title: 'Чат в память', prompt: '/chatmem', local: true, hint: 'извлечь факты из всего диалога' },
     { title: 'Карта нейронов', prompt: '/graph', local: true, hint: 'как растёт память' },
   ];
-  const PALETTE = ['#8ea2ff', '#4cc38a', '#e0a458', '#e5544f', '#c58af9', '#5bc0de', '#f28db2', '#b5c77a'];
+  const PALETTE = ['#a6bfe0', '#4cc38a', '#e0a458', '#e5544f', '#c58af9', '#7fd2e8', '#f28db2', '#b5c77a'];
   const ICON_SEND = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4Z"/></svg>';
   const ICON_STOP = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
   const ICON_COPY = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
@@ -53,6 +55,7 @@
     drawerBtn: $('drawerBtn'), menuBtn: $('menuBtn'), messages: $('messages'), inner: $('inner'),
     scrollBottomBtn: $('scrollBottomBtn'), input: $('input'), sendBtn: $('sendBtn'), counter: $('counter'),
     hint: $('hint'), reasonBtn: $('reasonBtn'), webTool: $('webTool'), composer: $('composer'),
+    voiceBtn: $('voiceBtn'), voiceBtnLabel: $('voiceBtnLabel'),
     sbStat: $('sbStat'), settingsBtn: $('settingsBtn'),
     modelSelect: $('modelSelect'), metrics: $('metrics'), metricSpeed: $('metricSpeed'),
     metricTokens: $('metricTokens'), metricTime: $('metricTime'),
@@ -177,6 +180,33 @@
     }
     return out;
   }
+  const MAX_TRACE_STEPS = 40;
+  function mergeStepLists(a, b) {
+    const listA = Array.isArray(a) ? a : [];
+    const listB = Array.isArray(b) ? b : [];
+    if (!listA.length && !listB.length) return null;
+    const out = listA.slice();
+    for (const s of listB) {
+      if (!s || !s.id) continue;
+      const i = out.findIndex((x) => x && x.id === s.id);
+      if (i < 0) out.push({ ...s });
+      else out[i] = { ...out[i], ...s };
+    }
+    return out.length > MAX_TRACE_STEPS ? out.slice(-MAX_TRACE_STEPS) : out;
+  }
+  // Копии одного ответа могут прийти с сервера, из черновика другой вкладки и из
+  // localStorage. Трасса и шаги не должны теряться, если «короткая» копия побеждает
+  // при склейке по тексту — собираем их из обеих версий.
+  function mergeMessageCopies(prev, next, preferNext) {
+    const out = { ...(preferNext ? next : prev) };
+    const steps = mergeStepLists(prev.steps, next.steps);
+    if (steps) out.steps = steps;
+    const trace = { ...(prev.trace || {}), ...(next.trace || {}) };
+    if (Object.keys(trace).length) out.trace = trace;
+    const imgs = mergeImages(prev.images, next.images);
+    if (imgs.length) out.images = imgs;
+    return out;
+  }
   function dedupeMessages(list) {
     if (!Array.isArray(list)) return list;
     const seen = new Map(); // ключ → индекс в out, чтобы обновить готовое сообщение картинкой
@@ -185,20 +215,19 @@
       if (!m || typeof m !== 'object') continue;
       // Пустой ответ-артефакт от старого параллельного стрима: только метка очереди.
       if (m.role === 'assistant' && !m.pending && !m.text && !m.reasoning &&
-          !(m.tools || []).length && !(m.sources || []).length && !(m.images || []).length &&
+          !(m.tools || []).length && !(m.steps || []).length && !m.trace &&
+          !(m.sources || []).length && !(m.images || []).length &&
           (m.indexPending || (!m.error && !m.note))) continue;
       m.time = normalizeTime(m.time);
       const key = m.id ? 'id:' + m.id
         : 'ct:' + (m.role || '') + '|' + m.time + '|' + String(m.text || '');
       const known = seen.get(key);
       if (known !== undefined) {
-        // Тот же id, но сообщение могло позже заполниться текстом/картинкой.
+        // Тот же id, но сообщение могло позже заполниться текстом/картинкой/трассой.
         const prev = out[known];
-        const imgs = mergeImages(prev.images, m.images);
         const longer = String(m.text || '').length > String(prev.text || '').length ||
           (!prev.text && m.text);
-        if (imgs.length) out[known] = { ...(longer ? m : prev), images: imgs };
-        else if (longer) out[known] = m;
+        out[known] = mergeMessageCopies(prev, m, longer);
         continue;
       }
       // Следствие старого реаттача: один и тот же ответ под разными id, созданными
@@ -211,14 +240,9 @@
           Math.abs(p.time - m.time) < 600000);
         if (twin) {
           const idx = out.indexOf(twin);
-          const imgs = mergeImages(twin.images, m.images);
           const longer = String(m.text || '').length > String(twin.text || '').length ||
             (!twin.text && m.text);
-          if (imgs.length) {
-            out[idx] = { ...(longer ? m : twin), images: imgs };
-          } else if (longer) {
-            out[idx] = m;
-          }
+          out[idx] = mergeMessageCopies(twin, m, longer);
           continue;
         }
       }
@@ -510,7 +534,8 @@
           cur.push({ ...rm });
           changed = true;
         } else if (!rm.pending && (cur[i].pending || (rm.time || 0) >= normalizeTime(cur[i].time || 0))) {
-          cur[i] = { ...rm };
+          // Сервер мог прислать ответ без steps/trace — сохранённую трассу не выбрасываем.
+          cur[i] = mergeMessageCopies(cur[i], rm, true);
           changed = true;
         }
       }
@@ -527,7 +552,8 @@
     if (!sessions.some((s) => s.id === currentId)) currentId = sessions[0] && sessions[0].id;
     renderSessions();
     updateTitle();
-    renderMessages({ force: true });
+    // Синхронизация не должна дёргать прокрутку: следуем за ответом, только если уже внизу.
+    renderMessages({ keep: true });
   }
 
   async function syncPull() {
@@ -593,7 +619,7 @@
       }
       if (!bot) {
         bot = { id: j.assistant_msg_id || newId(), role: 'assistant', text: '', reasoning: '',
-                time: Date.now(), pending: true, tools: [], sources: [], images: [] };
+                time: Date.now(), pending: true, tools: [], steps: [], sources: [], images: [] };
         const userIdx = j.user_msg_id ? list.findIndex((m) => m && m.id === j.user_msg_id) : -1;
         if (userIdx >= 0) { list.splice(userIdx + 1, 0, bot); idx = userIdx + 1; }
         else { list.push(bot); idx = list.length - 1; }
@@ -608,6 +634,9 @@
         if (typeof ev.token === 'string') { bot.text += ev.token; addMetricsText(ev.token); schedulePaint(bot, idx); }
         if (typeof ev.reasoning === 'string') { bot.reasoning += ev.reasoning; schedulePaint(bot, idx); }
         if (ev.tool) { upsertTool(bot, ev.tool); schedulePaint(bot, idx); }
+        if (ev.step) { upsertStep(bot, ev.step); schedulePaint(bot, idx); }
+        if (Array.isArray(ev.todo)) { bot.todos = ev.todo; schedulePaint(bot, idx); }
+        if (ev.trace) { bot.trace = { ...(bot.trace || {}), ...ev.trace }; schedulePaint(bot, idx); }
         if (Array.isArray(ev.sources)) { addSources(bot, ev.sources); schedulePaint(bot, idx); }
         if (ev.image) { addImage(bot, ev.image); schedulePaint(bot, idx); }
         if (ev.error) bot.error = String(ev.error);
@@ -616,6 +645,7 @@
           bot.pending = false;
           bot.gen = captureMetrics();
           bot.indexPending = Number(ev.done.index_pending) || 0;
+        feedTts(bot, true);
           finished = true;
         }
       }, abortCtl.signal, '/api/chat/stream?chat_id=' + encodeURIComponent(cid), 'GET');
@@ -692,8 +722,45 @@
   function loadSettings() {
     settings = { ...DEFAULTS, ...(readJSON(LS.settings, {}) || {}) };
   }
-  function saveSettings() {
+  function saveSettings(localOnly) {
+    settings.updatedAt = Date.now();
     writeJSON(LS.settings, settings);
+    if (!localOnly) scheduleSettingsPush();
+  }
+
+  // Настройки живут и в браузере, и на сервере (settings.sqlite по uid). Сервер — источник
+  // истины после перезапуска/смены устройства; localStorage даёт мгновенную реакцию и офлайн.
+  const SET_SYNC = { timer: null, busy: false, applying: false };
+  function scheduleSettingsPush() {
+    clearTimeout(SET_SYNC.timer);
+    SET_SYNC.timer = setTimeout(pushSettings, 800);
+  }
+  async function pushSettings() {
+    if (SET_SYNC.applying || SET_SYNC.busy) return;
+    clearTimeout(SET_SYNC.timer);
+    SET_SYNC.busy = true;
+    try {
+      const data = await api('PUT', '/api/settings', settings);
+      if (data && Number(data.updatedAt) > Number(settings.updatedAt || 0)) {
+        settings.updatedAt = Number(data.updatedAt);
+        writeJSON(LS.settings, settings);
+      }
+    } catch (e) { /* офлайн: локальная копия уже сохранена */ }
+    finally { SET_SYNC.busy = false; }
+  }
+  async function pullSettings() {
+    if (SET_SYNC.applying) return;
+    try {
+      const data = await api('GET', '/api/settings');
+      const remote = data && data.settings;
+      if (!remote || !(Number(remote.updatedAt) > Number(settings.updatedAt || 0))) return;
+      SET_SYNC.applying = true;
+      settings = { ...DEFAULTS, ...remote };
+      writeJSON(LS.settings, settings);
+      applySettings();
+      applyVoiceButton();
+    } catch (e) { /* сервер недоступен — остаёмся на локальной копии */ }
+    finally { SET_SYNC.applying = false; }
   }
   function applySettings() {
     document.body.dataset.fs = settings.fontSize || 'm';
@@ -707,6 +774,7 @@
     els.setAutoScroll.checked = !!settings.autoScroll;
     els.setEnterSends.checked = !!settings.enterSends;
     els.setReasoning.checked = !!settings.showReasoning;
+    applyVoiceButton();
     els.hint.textContent = (settings.enterSends
       ? 'Enter — отправить · Shift+Enter — новая строка'
       : 'Ctrl+Enter — отправить · Enter — новая строка') + ' · / — команды · Ctrl K — новый чат';
@@ -964,16 +1032,9 @@
       d.appendChild(rbody);
       bubble.appendChild(d);
     }
-    if (isBot && Array.isArray(m.tools) && m.tools.length) {
-      const row = el('div', 'tool-row');
-      for (const t of m.tools) {
-        const chip = el('span', 'tool-chip ' + (t.status || 'running'));
-        const mark = t.status === 'done' ? '✓ ' : (t.status === 'error' ? '✕ ' : '');
-        chip.textContent = mark + (t.label || t.name || 'инструмент');
-        if (t.detail) chip.title = t.detail;
-        row.appendChild(chip);
-      }
-      bubble.appendChild(row);
+    if (isBot) {
+      const trace = renderTrace(m);
+      if (trace) bubble.appendChild(trace);
     }
     if (m.pending && !m.text) {
       const t = el('div', 'typing');
@@ -1041,7 +1102,8 @@
     const tools = (m.tools || []).map((t) => (t.status || '') + ':' + (t.label || t.name || '')).join('|');
     return [settings.showReasoning ? 1 : 0, m.pending ? 1 : 0, tools,
       (m.images || []).length, (m.sources || []).length,
-      m.error || '', m.note || '', m.indexPending || 0, m.gen ? 1 : 0].join('~');
+      m.error || '', m.note || '', m.indexPending || 0, m.gen ? 1 : 0,
+      JSON.stringify(m.todos || []), JSON.stringify(m.trace || null)].join('~');
   }
 
   // Во время стриминга перерисовываем только текст: так выделение и прокрутка
@@ -1120,13 +1182,14 @@
     foot.appendChild(el('span', 'time', fmtTime(m.time)));
     const stats = statsNode(m);
     if (stats) foot.appendChild(stats);
+    if (!isUser && m.text && m.pending) {
+      foot.appendChild(actButton('Озвучивать по ходу генерации', ICON_SPEAK, (b) => toggleSpeak(m, b)));
+    }
     if (m.text && !m.pending) {
       foot.appendChild(actButton('Копировать', ICON_COPY, () => copyText(m.text)));
       if (!isUser) {
         foot.appendChild(actButton('Другой ответ', ICON_REFRESH, () => regenerate(idx)));
-        if ('speechSynthesis' in window) {
-          foot.appendChild(actButton('Озвучить ответ', ICON_SPEAK, (b) => toggleSpeak(m.text, b)));
-        }
+        foot.appendChild(actButton('Озвучить ответ', ICON_SPEAK, (b) => toggleSpeak(m, b)));
       }
     }
     body.appendChild(foot);
@@ -1138,6 +1201,8 @@
   function renderMessages(opts) {
     opts = opts || {};
     const wasAtBottom = isNearBottom();
+    // Перерисовка пересобирает ленту; без сохранения позиции браузер сбрасывает прокрутку в начало.
+    const savedTop = els.messages.scrollTop;
     els.inner.innerHTML = '';
     const s = currentSession();
     const list = s ? (messages[s.id] || []) : [];
@@ -1147,8 +1212,9 @@
       list.forEach((m, i) => els.inner.appendChild(buildMessage(m, i)));
     }
     updateActions();
-    updateScrollButton();
     if (opts.force || (wasAtBottom && settings.autoScroll)) scrollEnd();
+    else els.messages.scrollTop = savedTop;
+    updateScrollButton();
   }
 
   function updateCounter() {
@@ -1182,12 +1248,196 @@
       const bubble = els.inner.querySelector('.msg[data-idx="' + idx + '"] .bubble');
       if (!bubble) return;
       const atBottom = isNearBottom();
+      const savedTop = els.messages.scrollTop;
       updateLiveBubble(bubble, bot);
+      feedTts(bot, false);
       if (atBottom && settings.autoScroll) scrollEnd();
+      else els.messages.scrollTop = savedTop;
     }, 60);
   }
 
   // ---------- инструменты и источники в ответе ----------
+
+  // ---------- трасса работы агента: шаги, карточки инструментов, план ----------
+
+  const openTraceCards = new Set();
+  const TRACE_BADGE = { web: 'веб', mem: 'память', img: 'картинка', skill: 'навык', note: 'заметка', plan: 'план', tool: 'инструмент' };
+  const TRACE_GROUP = {
+    web: ['web_search', 'web_fetch'],
+    mem: ['memory_search', 'memory_remember', 'triplex_search', 'triplex_ingest'],
+    img: ['image_generate'],
+    skill: ['skill_list', 'skill_read', 'skill_write', 'skill_patch'],
+    note: ['note_write', 'note_append', 'note_read', 'note_list'],
+    plan: ['todo_write'],
+  };
+  const STOP_LABEL = {
+    model_done: 'ответ готов', round_limit: 'лимит шагов', call_limit: 'лимит вызовов',
+    failures: 'ошибки инструментов', no_progress: 'нет прогресса', cancelled: 'остановлено',
+  };
+  const STEP_PHASE_LABEL = { start: 'начало', end: 'итоги', final: 'финал', note: 'заметка' };
+  const STEP_STATE_LABEL = { running: 'выполняется', done: 'готово', error: 'ошибка', warning: 'внимание' };
+  const STEP_CALL_STATUS = { ok: 'готово', done: 'готово', success: 'готово', error: 'ошибка',
+                             fail: 'ошибка', running: 'выполняется', warning: 'внимание', skipped: 'пропущено' };
+  function traceKind(name) {
+    for (const [kind, names] of Object.entries(TRACE_GROUP)) if (names.includes(name)) return kind;
+    return 'tool';
+  }
+  function fmtMs(ms) {
+    return ms < 1000 ? ms + ' мс' : (ms / 1000).toFixed(1) + ' с';
+  }
+  function renderPlan(todos) {
+    const done = todos.filter((x) => x.status === 'done').length;
+    const box = el('div', 'trace-plan');
+    box.append(el('div', 'plan-title', 'План · ' + done + ' из ' + todos.length));
+    const ul = el('ul', 'plan-list');
+    for (const it of todos) {
+      const st = it.status || 'pending';
+      const li = el('li', 'plan-item ' + st);
+      li.append(el('span', 'plan-mark', st === 'done' ? '●' : (st === 'in_progress' ? '◐' : '○')));
+      li.append(el('span', 'plan-text', it.text || ''));
+      ul.append(li);
+    }
+    box.append(ul);
+    return box;
+  }
+  function renderCard(t) {
+    const st = t.status || 'running';
+    const kind = traceKind(t.name);
+    const card = el('details', 'trace-card ' + st);
+    if (t.sub) card.classList.add('nested');
+    const id = t.id || (t.name + ':' + (t.label || ''));
+    card.open = st === 'error' || openTraceCards.has(id);
+    card.addEventListener('toggle', () => {
+      if (card.open) openTraceCards.add(id); else openTraceCards.delete(id);
+    });
+    const sum = el('summary', 'card-sum');
+    sum.append(el('span', 'card-kind', TRACE_BADGE[kind]));
+    sum.append(el('span', 'card-label', t.label || t.name || 'инструмент'));
+    sum.append(el('span', 'card-status', st === 'done' ? '✓' : (st === 'error' ? '✕' : '')));
+    if (t.ms) sum.append(el('span', 'card-ms', fmtMs(t.ms)));
+    card.append(sum);
+    const body = el('div', 'card-body');
+    if (t.detail) body.append(el('div', 'card-detail', t.detail));
+    if (t.preview) body.append(el('pre', 'card-preview', t.preview));
+    if (!t.detail && !t.preview) {
+      body.append(el('div', 'card-detail muted', st === 'running' ? 'выполняется…' : 'подробностей нет'));
+    }
+    card.append(body);
+    return card;
+  }
+  function stepBudgetText(b) {
+    if (!b || typeof b !== 'object') return '';
+    const parts = [];
+    if (b.round || b.max_rounds) parts.push('шаг ' + (b.round || 0) + '/' + (b.max_rounds || '—'));
+    if (b.calls || b.max_calls) parts.push('вызовов ' + (b.calls || 0) + '/' + (b.max_calls || '—'));
+    return parts.join(' · ');
+  }
+  function renderStepCall(c) {
+    const st = String(c.status || '');
+    const row = el('div', 'step-call ' + st);
+    const head = el('div', 'step-call-head');
+    head.append(el('span', 'step-call-name', c.name || 'инструмент'));
+    if (st) head.append(el('span', 'step-call-status', STEP_CALL_STATUS[st] || st));
+    if (c.chars !== undefined && c.chars !== null) {
+      head.append(el('span', 'step-call-size', c.chars + ' симв.'));
+    }
+    if (c.truncated) head.append(el('span', 'step-call-truncated', 'обрезано'));
+    row.append(head);
+    if (c.args) row.append(el('pre', 'step-call-args', String(c.args)));
+    if (c.error) row.append(el('div', 'step-call-error', String(c.error)));
+    return row;
+  }
+  function renderStepCard(s) {
+    const phase = s.phase || 'start';
+    const state = s.state || 'running';
+    const card = el('details', 'trace-step-card ' + state + ' step-phase-' + phase);
+    const id = 'step:' + (s.id || ((s.round || 0) + ':' + phase));
+    card.open = state === 'error' || openTraceCards.has(id);
+    card.addEventListener('toggle', () => {
+      if (card.open) openTraceCards.add(id); else openTraceCards.delete(id);
+    });
+    const sum = el('summary', 'card-sum');
+    sum.append(el('span', 'step-phase', STEP_PHASE_LABEL[phase] || phase));
+    sum.append(el('span', 'card-label', s.label || 'Шаг ' + (s.round || '')));
+    sum.append(el('span', 'step-state', state === 'done' ? '✓' : (state === 'error' ? '✕' :
+      (state === 'warning' ? '!' : ''))));
+    if (s.ms) sum.append(el('span', 'card-ms', fmtMs(s.ms)));
+    if (state === 'running') sum.title = STEP_STATE_LABEL[state];
+    card.append(sum);
+    const body = el('div', 'card-body');
+    if (s.detail) body.append(el('div', 'card-detail', s.detail));
+    else if (state === 'running') body.append(el('div', 'card-detail muted', 'выполняется…'));
+    if (s.budget) {
+      const budget = stepBudgetText(s.budget);
+      if (budget) body.append(el('div', 'step-budget', budget));
+    }
+    if (phase === 'final') {
+      const reason = s.stop ? (STOP_LABEL[s.stop] || s.stop) : (s.detail || 'не указана');
+      body.append(el('div', 'step-final-note', 'Причина останова: ' + reason));
+    }
+    if (Array.isArray(s.calls) && s.calls.length) {
+      const calls = el('div', 'step-calls');
+      for (const c of s.calls) if (c) calls.append(renderStepCall(c));
+      body.append(calls);
+    }
+    card.append(body);
+    return card;
+  }
+  function renderTrace(m) {
+    const tools = Array.isArray(m.tools) ? m.tools : [];
+    const todos = Array.isArray(m.todos) ? m.todos : [];
+    const stepMsgs = Array.isArray(m.steps) ? m.steps : [];
+    if (!tools.length && !todos.length && !stepMsgs.length) return null;
+    const trace = m.trace || {};
+    const wrap = el('div', 'trace' + (m.pending ? ' live' : ''));
+    const totalMs = tools.reduce((a, t) => a + (t.ms || 0), 0);
+    const stepCount = Math.max(trace.round || 0,
+      ...stepMsgs.map((s) => (s && s.round) || 0), ...tools.map((t) => t.step || 0));
+    const head = el('div', 'trace-head');
+    head.append(el('span', 'trace-title', 'Ход работы'));
+    const meta = [];
+    if (stepCount) meta.push('шагов ' + stepCount);
+    meta.push('инструментов ' + tools.length);
+    if (totalMs) meta.push(fmtMs(totalMs));
+    head.append(el('span', 'trace-meta', meta.join(' · ')));
+    const budget = stepBudgetText(trace.budget);
+    if (budget) head.append(el('span', 'step-budget', budget));
+    if (trace.stop) head.append(el('span', 'trace-stop stop-' + trace.stop, STOP_LABEL[trace.stop] || trace.stop));
+    else if (m.pending) head.append(el('span', 'trace-stop running', 'выполняется'));
+    if (trace.reason) head.append(el('span', 'step-reason', trace.reason));
+    wrap.append(head);
+    if (todos.length) wrap.append(renderPlan(todos));
+    const groups = new Map();
+    function groupOf(key) {
+      if (!groups.has(key)) groups.set(key, []);
+      return groups.get(key);
+    }
+    // Шаги идут первыми в своём раунде: сначала карточка шага, затем вызовы.
+    for (const s of stepMsgs) {
+      if (s) groupOf(s.round || 0).push({ step: s });
+    }
+    for (const t of tools) {
+      groupOf(t.step || 0).push({ tool: t });
+    }
+    if (groups.size) {
+      const list = el('ol', 'trace-steps');
+      for (const [key, items] of groups) {
+        const li = el('li', 'trace-step');
+        li.append(el('span', 'step-dot'));
+        const body = el('div', 'step-body');
+        body.append(el('div', 'step-label', key ? 'Шаг ' + key : (stepMsgs.length ? 'Служебные' : 'Инструменты')));
+        const cards = el('div', 'trace-cards');
+        for (const item of items) {
+          cards.append(item.step ? renderStepCard(item.step) : renderCard(item.tool));
+        }
+        body.append(cards);
+        li.append(body);
+        list.append(li);
+      }
+      wrap.append(list);
+    }
+    return wrap;
+  }
 
   function upsertTool(bot, t) {
     if (!t || !t.id) return;
@@ -1195,6 +1445,14 @@
     const cur = bot.tools.find((x) => x.id === t.id);
     if (cur) Object.assign(cur, t);
     else bot.tools.push({ ...t });
+  }
+  function upsertStep(bot, s) {
+    if (!s || !s.id) return;
+    if (!Array.isArray(bot.steps)) bot.steps = [];
+    const cur = bot.steps.find((x) => x && x.id === s.id);
+    if (cur) Object.assign(cur, s);
+    else bot.steps.push({ ...s });
+    if (bot.steps.length > MAX_TRACE_STEPS) bot.steps.splice(0, bot.steps.length - MAX_TRACE_STEPS);
   }
   function addSources(bot, list) {
     if (!Array.isArray(bot.sources)) bot.sources = [];
@@ -1283,11 +1541,11 @@
       s.title = text.replace(/\s+/g, ' ').slice(0, 48);
     }
     const user = reuse ? reuse.user : { id: newId(), role: 'user', text, time: Date.now() };
-    const bot = reuse ? reuse.bot : { id: newId(), role: 'assistant', text: '', reasoning: '', time: Date.now(), pending: true, tools: [], sources: [], images: [] };
+    const bot = reuse ? reuse.bot : { id: newId(), role: 'assistant', text: '', reasoning: '', time: Date.now(), pending: true, tools: [], steps: [], sources: [], images: [] };
     if (reuse) {
       // Перегенерация переиспользует id: сервер перезапишет прежний ответ,
       // а не сохранит его второй копией.
-      bot.text = ''; bot.reasoning = ''; bot.tools = []; bot.sources = [];
+      bot.text = ''; bot.reasoning = ''; bot.tools = []; bot.steps = []; bot.trace = null; bot.sources = [];
       bot.pending = true; bot.error = null; bot.note = ''; bot.indexPending = 0;
       bot.time = Date.now();
       delete bot.gen;
@@ -1324,6 +1582,9 @@
         if (typeof ev.token === 'string') { bot.text += ev.token; addMetricsText(ev.token); schedulePaint(bot, botIdx); }
         if (typeof ev.reasoning === 'string') { bot.reasoning += ev.reasoning; schedulePaint(bot, botIdx); }
         if (ev.tool) { upsertTool(bot, ev.tool); schedulePaint(bot, botIdx); }
+        if (ev.step) { upsertStep(bot, ev.step); schedulePaint(bot, botIdx); }
+        if (Array.isArray(ev.todo)) { bot.todos = ev.todo; schedulePaint(bot, botIdx); }
+        if (ev.trace) { bot.trace = { ...(bot.trace || {}), ...ev.trace }; schedulePaint(bot, botIdx); }
         if (Array.isArray(ev.sources)) { addSources(bot, ev.sources); schedulePaint(bot, botIdx); }
         if (ev.image) { addImage(bot, ev.image); schedulePaint(bot, botIdx); }
         if (ev.error) { bot.error = String(ev.error); bot.pending = false; }
@@ -1332,6 +1593,7 @@
           bot.pending = false;
           bot.gen = captureMetrics();
           bot.indexPending = Number(ev.done.index_pending) || 0;
+        feedTts(bot, true);
           finished = true;
         }
       }, abortCtl.signal);
@@ -1349,6 +1611,9 @@
       if (bot.pending) bot.pending = false;
       for (const t of bot.tools || []) {
         if (t.status === 'running') t.status = finished ? 'done' : 'error';
+      }
+      for (const s of bot.steps || []) {
+        if (s.state === 'running') s.state = finished ? 'done' : 'error';
       }
       if (!finished && !bot.error && !bot.note) bot.note = 'Поток завершён';
       if (!bot.text && !bot.error && !bot.note) bot.note = 'Пустой ответ';
@@ -1407,15 +1672,234 @@
   }
 
   let speakingBtn = null;
+  let ttsServer = false;                 // сервер озвучки (Silero) включён И готов
+  let ttsError = '';                     // причина, по которой сервер озвучки недоступен
+  let ttsToken = 0;                      // номер текущей озвучки: остановка отменяет предыдущую
+  let ttsAudio = null;                   // проигрываемый фрагмент
+  let ttsQueue = [];                     // фразы, которые ждут озвучки
+  let ttsLive = null;                    // { id, pos } — ответ, озвучиваемый по мере генерации
+  let ttsDone = true;                    // ответ полностью получен, новых фраз не будет
+  let ttsFeeding = 0;                    // сколько фрагментов ещё режутся на фразы на сервере
+  let ttsChain = Promise.resolve();      // фрагменты режутся по порядку
+  let ttsRunToken = -1;                  // для какой очереди уже запущен проигрыватель
+  let ttsVoices = [];                    // список голосов с примерами от сервера
+  let ttsDefaultVoice = '';              // голос по умолчанию из .env, если пользователь не выбирал
+  let previewAudio = null;               // сейчас играет пример голоса
+  let previewToken = 0;
+  async function loadTtsStatus(retry) {
+    try {
+      const st = await api('GET', '/api/tts/status' + (retry ? '?retry=1' : ''));
+      // ready=false до первого синтеза (модель грузится лениво), поэтому смотрим available
+      const available = st && (st.available !== undefined ? st.available : (st.enabled && st.ready));
+      ttsServer = !!available;
+      ttsError = ttsServer ? '' : ((st && st.error) ||
+        (st && st.enabled && !st.model_exists && !st.autodownload ? 'модель не найдена' : ''));
+      if (st && Array.isArray(st.voices) && st.voices.length) ttsVoices = st.voices;
+      if (st && st.speaker) ttsDefaultVoice = st.speaker;
+      applyVoiceButton();
+    } catch (e) {
+      ttsServer = false;
+      ttsError = '';
+    }
+    return ttsServer;
+  }
+  function voiceById(id) {
+    return ttsVoices.find((v) => v.id === id) ||
+      { id: id || '', label: id || 'Голос', description: '', preview: '' };
+  }
+  function applyVoiceButton() {
+    if (!els.voiceBtn) return;
+    const v = voiceById(currentVoice());
+    if (els.voiceBtnLabel) els.voiceBtnLabel.textContent = v.label;
+    els.voiceBtn.setAttribute('aria-label', 'Голос озвучки: ' + v.label + '. Выбрать или прослушать');
+    els.voiceBtn.classList.toggle('on', !!settings.ttsVoice);
+  }
+  function currentVoice() {
+    return settings.ttsVoice || ttsDefaultVoice || (ttsVoices[0] && ttsVoices[0].id) || '';
+  }
+  function setVoice(id) {
+    if (!id || settings.ttsVoice === id) return;
+    stopSpeech();                        // сменить голос можно только на новую озвучку
+    settings.ttsVoice = id;
+    saveSettings();
+    applyVoiceButton();
+    toast('Голос: ' + voiceById(id).label);
+  }
+  const ttsSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
   function stopSpeech() {
+    ttsToken++;
+    ttsQueue = [];
+    ttsLive = null;
+    ttsDone = true;
+    if (ttsAudio) {
+      ttsAudio.pause();
+      if (ttsAudio._stop) ttsAudio._stop();
+      ttsAudio = null;
+    }
+    if (previewAudio) { previewToken++; previewAudio.pause(); previewAudio = null; }
     if ('speechSynthesis' in window) window.speechSynthesis.cancel();
     if (speakingBtn) { speakingBtn.classList.remove('on'); speakingBtn = null; }
   }
-  function toggleSpeak(text, btn) {
-    if (!('speechSynthesis' in window)) return;
+
+  // Нажатие «Озвучить»: во время генерации озвучиваем уже готовые фразы и дальше — по мере появления.
+  async function toggleSpeak(msg, btn) {
     const wasThis = speakingBtn && speakingBtn === btn;
     stopSpeech();
     if (wasThis) return;
+    const text = (msg && msg.text) || '';
+    if (!text.trim()) return;
+    if (await loadTtsStatus(true)) { startTts(msg, btn); return; }
+    if (ttsError) toast('Silero не готов: ' + ttsError + '. Использую голос браузера');
+    legacySpeak(text, btn);
+  }
+
+  function startTts(msg, btn) {
+    const token = ttsToken;
+    ttsQueue = [];
+    ttsLive = { id: msg.id, pos: 0 };
+    ttsDone = false;
+    speakingBtn = btn;
+    if (btn) btn.classList.add('on');
+    feedTts(msg, !msg.pending);
+    runTts(token, btn, currentVoice());
+  }
+
+  // Режем новый кусок ответа на фразы и ставим в очередь. Только законченные предложения:
+  // хвост без точки ждёт продолжения, а при final — озвучивается целиком.
+  function feedTts(msg, final) {
+    if (!ttsLive || !msg || ttsLive.id !== msg.id) return;
+    const text = msg.text || '';
+    let cut = text.length;
+    if (!final) {
+      const re = /[.!?…]+(\s|$)/g;
+      const rest = text.slice(ttsLive.pos);
+      let end = -1;
+      let m;
+      while ((m = re.exec(rest))) end = m.index + m[0].length;
+      if (end < 0) return;
+      cut = ttsLive.pos + end;
+    }
+    const chunk = text.slice(ttsLive.pos, cut);
+    ttsLive.pos = cut;
+    if (!chunk.trim()) { if (final) ttsDone = true; return; }
+    const token = ttsToken;
+    ttsFeeding++;
+    ttsChain = ttsChain.then(async () => {
+      try {
+        const r = await api('POST', '/api/tts/segments', { text: chunk });
+        if (token === ttsToken && Array.isArray(r.segments)) ttsQueue.push(...r.segments);
+      } catch (e) {
+        // фрагмент не разрезался: пропускаем, ответ всё равно озвучится дальше
+      } finally {
+        ttsFeeding--;
+        if (final) ttsDone = true;
+      }
+    });
+  }
+
+  function fetchTtsSegment(seg, voice) {
+    return fetch('/api/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ text: seg, speaker: voice || currentVoice() }),
+    }).then(async (r) => {
+      if (!r.ok) {
+        let msg = '';
+        try { msg = (await r.json()).message || ''; } catch (e) { /* не JSON */ }
+        throw new Error(msg || ('tts ' + r.status));
+      }
+      return r.blob();
+    }).then((blob) => URL.createObjectURL(blob));
+  }
+
+  // Короткий пример голоса из списка. Не трогает очередь основного озвучивания.
+  async function previewVoice(id) {
+    const token = ++previewToken;
+    if (previewAudio) { previewAudio.pause(); previewAudio = null; }
+    document.querySelectorAll('.voice-play.playing').forEach((b) => b.classList.remove('playing'));
+    if (!(await loadTtsStatus(true))) {
+      toast('Silero недоступен' + (ttsError ? ': ' + ttsError : ''));
+      return;
+    }
+    const v = voiceById(id);
+    const text = v.preview || 'Привет! Это пример озвучки.';
+    try {
+      const url = await fetchTtsSegment(text, id);
+      if (token !== previewToken) { URL.revokeObjectURL(url); return; }
+      const a = new Audio(url);
+      previewAudio = a;
+      const done = () => {
+        if (previewAudio === a) previewAudio = null;
+        URL.revokeObjectURL(url);
+        document.querySelectorAll('.voice-play.playing').forEach((b) => b.classList.remove('playing'));
+      };
+      a.onended = done;
+      a.onerror = done;
+      a.play().catch(done);
+    } catch (e) {
+      toast('Не удалось прослушать голос: ' + ((e && e.message) || e));
+    }
+  }
+
+  // Проигрыватель: берёт фразы из очереди, следующую качает, пока играет текущая.
+  async function runTts(token, btn, voice) {
+    if (ttsRunToken === token) return;
+    ttsRunToken = token;
+    let prefetched = null;
+    const finish = () => {
+      if (token !== ttsToken) return;
+      if (btn) btn.classList.remove('on');
+      if (speakingBtn === btn) speakingBtn = null;
+      ttsLive = null;
+      ttsAudio = null;
+      ttsRunToken = -1;
+    };
+    for (;;) {
+      if (token !== ttsToken) return;
+      if (!ttsQueue.length) {
+        if (ttsDone && ttsFeeding === 0) break;
+        await ttsSleep(120);
+        continue;
+      }
+      const seg = ttsQueue.shift();
+      const ready = prefetched && prefetched.seg === seg ? prefetched.p : fetchTtsSegment(seg, voice);
+      prefetched = null;
+      let url;
+      try {
+        url = await ready;
+      } catch (e) {
+        // сервер озвучки не ответил: остаток ответа — голосом браузера
+        ttsServer = false;
+        const why = (e && e.message) ? ': ' + String(e.message).slice(0, 120) : '';
+        toast('Озвучка сервера недоступна' + why + '. Использую голос браузера');
+        const rest = [seg, ...ttsQueue].join(' ');
+        ttsQueue = [];
+        finish();
+        legacySpeak(rest, btn);
+        return;
+      }
+      if (ttsQueue.length) {
+        const nxt = ttsQueue[0];
+        prefetched = { seg: nxt, p: fetchTtsSegment(nxt, voice) };
+        prefetched.p.catch(() => {});
+      }
+      await new Promise((resolve) => {
+        const a = new Audio(url);
+        a._stop = resolve;
+        ttsAudio = a;
+        a.onended = resolve;
+        a.onerror = resolve;
+        a.play().catch(resolve);
+      });
+      URL.revokeObjectURL(url);
+    }
+    finish();
+  }
+
+  function legacySpeak(text, btn) {
+    if (!('speechSynthesis' in window)) return;
     const plain = speechPlainText(text);
     if (!plain) return;
     const u = new SpeechSynthesisUtterance(plain);
@@ -1460,7 +1944,24 @@
 
   let menuEl = null;
   function closeMenu() {
-    if (menuEl) { menuEl.remove(); menuEl = null; }
+    if (menuEl) {
+      menuEl.remove();
+      menuEl = null;
+      document.dispatchEvent(new Event('pulsenet:menu-close'));
+    }
+  }
+  function placeMenu(m, x, y) {
+    document.body.appendChild(m);
+    const r = m.getBoundingClientRect();
+    // visualViewport учитывает клавиатуру iOS; window.innerHeight — нет.
+    const vv = window.visualViewport;
+    const vLeft = vv ? vv.offsetLeft : 0;
+    const vTop = vv ? vv.offsetTop : 0;
+    const vw = vv ? vv.width : window.innerWidth;
+    const vh = vv ? vv.height : window.innerHeight;
+    m.style.left = Math.max(vLeft + 8, Math.min(x, vLeft + vw - r.width - 8)) + 'px';
+    m.style.top = Math.max(vTop + 8, Math.min(y, vTop + vh - r.height - 8)) + 'px';
+    menuEl = m;
   }
   function showMenu(x, y, items) {
     closeMenu();
@@ -1475,17 +1976,45 @@
       b.addEventListener('click', () => { closeMenu(); if (it.onClick) it.onClick(); });
       m.appendChild(b);
     }
-    document.body.appendChild(m);
-    const r = m.getBoundingClientRect();
-    // visualViewport учитывает клавиатуру iOS; window.innerHeight — нет.
-    const vv = window.visualViewport;
-    const vLeft = vv ? vv.offsetLeft : 0;
-    const vTop = vv ? vv.offsetTop : 0;
-    const vw = vv ? vv.width : window.innerWidth;
-    const vh = vv ? vv.height : window.innerHeight;
-    m.style.left = Math.max(vLeft + 8, Math.min(x, vLeft + vw - r.width - 8)) + 'px';
-    m.style.top = Math.max(vTop + 8, Math.min(y, vTop + vh - r.height - 8)) + 'px';
-    menuEl = m;
+    placeMenu(m, x, y);
+  }
+  function showVoiceMenu(anchor) {
+    closeMenu();
+    if (!ttsVoices.length) ttsVoices = [
+      { id: 'aidar', label: 'Айдар', description: 'низкий мужской' },
+      { id: 'baya', label: 'Бая', description: 'мягкий женский' },
+      { id: 'kseniya', label: 'Ксения', description: 'ровный женский' },
+      { id: 'xenia', label: 'Ксения 2', description: 'живой женский' },
+      { id: 'eugene', label: 'Евгений', description: 'мужской' },
+    ];
+    const m = el('div', 'ui-menu voice-menu');
+    m.setAttribute('role', 'menu');
+    m.appendChild(el('div', 'voice-menu-title', 'Голос озвучки · ▶ — пример'));
+    const activeVoice = currentVoice();
+    for (const v of ttsVoices) {
+      const row = el('div', 'voice-item' + (activeVoice === v.id ? ' selected' : ''));
+      row.setAttribute('role', 'menuitem');
+      const meta = el('div', 'voice-meta');
+      meta.appendChild(el('div', 'voice-name', v.label || v.id));
+      if (v.description) meta.appendChild(el('div', 'voice-desc', v.description));
+      const play = el('button', 'voice-play', '▶');
+      play.type = 'button';
+      play.title = 'Прослушать: ' + (v.label || v.id);
+      play.setAttribute('aria-label', play.title);
+      play.addEventListener('click', (e) => { e.stopPropagation(); previewVoice(v.id); });
+      row.appendChild(meta);
+      row.appendChild(play);
+      row.addEventListener('click', () => { setVoice(v.id); closeMenu(); });
+      m.appendChild(row);
+    }
+    const r = anchor.getBoundingClientRect();
+    placeMenu(m, Math.max(8, r.left), r.bottom + 6);
+    els.voiceBtn.setAttribute('aria-expanded', 'true');
+    const off = () => {
+      els.voiceBtn.setAttribute('aria-expanded', 'false');
+      document.removeEventListener('pulsenet:menu-close', off);
+    };
+    document.addEventListener('pulsenet:menu-close', off);
   }
   function showMessageMenu(x, y, idx) {
     const s = currentSession();
@@ -1501,8 +2030,8 @@
       { label: 'Копировать', disabled: !m.text, onClick: () => copyText(m.text || '') },
       { label: 'Другой ответ', disabled: !isBot || busy, onClick: () => regenerate(idx) },
       { label: speakingBtn && isBot ? 'Остановить озвучивание' : 'Озвучить',
-        disabled: (!speakingBtn || !isBot) && (!isBot || !m.text || !('speechSynthesis' in window)),
-        onClick: () => { if (speakingBtn) stopSpeech(); else toggleSpeak(m.text, null); } },
+        disabled: (!speakingBtn || !isBot) && (!isBot || !m.text),
+        onClick: () => { if (speakingBtn) stopSpeech(); else toggleSpeak(m, null); } },
       { sep: true },
       { label: 'Метрики: ' + stat, disabled: true },
     ]);
@@ -1561,26 +2090,65 @@
     return out;
   }
 
+  function selectedFactIds(nodes) {
+    const ids = [];
+    for (const n of nodes || []) {
+      for (const fid of nodeFactIds(n)) if (!ids.includes(fid)) ids.push(fid);
+    }
+    return ids;
+  }
+
+  async function autoRecombineSelected(nodes) {
+    const sel = (nodes && nodes.length ? nodes : selectedNodes()).filter(Boolean);
+    if (sel.length < 2) { toast('Выберите минимум два нейрона (Ctrl+клик)'); return; }
+    const ids = selectedFactIds(sel);
+    if (ids.length < 2) { toast('У выбранных нейронов недостаточно фактов для слияния'); return; }
+    const label = sel.map((n) => shorten(n.label, 24)).join(', ');
+    if (!(await ask('Авто-рекомбинация нейронов?',
+      'LLM объединит факты выбранных нейронов (' + sel.length + '): ' + label, 'Объединить'))) return;
+    try {
+      toast('LLM объединяет нейроны…');
+      const out = await api('POST', '/api/memory/recombine', {
+        fact_ids: ids, model: settings.model || '', apply: true,
+      });
+      const p = out.preview || {};
+      toast('Нейроны объединены: ' + [p.s, p.r, p.o].filter(Boolean).join(' '));
+      clearSelection();
+      await refreshMemoryViews();
+    } catch (err) {
+      toast('Ошибка авто-рекомбинации: ' + (err.message || err));
+    }
+  }
+
   function showNodeMenu(x, y, n) {
+    if (n && !graph.selectedIds.has(n.id)) setSelectedNodes([n], n);
     const ids = nodeFactIds(n);
+    const sel = selectedNodes();
+    const multi = sel.length > 1;
+    const selIds = selectedFactIds(sel);
     showMenu(x, y, [
-      { label: 'Копировать название', onClick: () => copyText(n.label) },
-      { label: n.fixed ? 'Открепить позицию' : 'Закрепить позицию', onClick: () => {
+      { label: multi ? 'Выбрано: ' + sel.length + ' нейронов' : 'Копировать название', disabled: multi,
+        onClick: () => copyText(n.label) },
+      { label: n.fixed ? 'Открепить позицию' : 'Закрепить позицию', disabled: multi, onClick: () => {
           n.fixed = !n.fixed; toast(n.fixed ? 'Нейрон закреплён' : 'Позиция свободна'); draw();
         } },
       { sep: true },
-      { label: 'Править вручную', disabled: !ids.length, onClick: () => openEditDialog(n, ids) },
-      { label: 'Дистилляция LLM', disabled: !ids.length, onClick: () => openDistillDialog(n, ids) },
-      { label: 'Поиск дублей LLM', disabled: !ids.length, onClick: () => openDedupeDialog(ids) },
-      { label: 'Рекомбинация с нейроном…', disabled: !ids.length, onClick: () => openMergeDialog(n, ids) },
+      { label: 'Авто-рекомбинация выбранных (LLM)', disabled: sel.length < 2 || selIds.length < 2,
+        onClick: () => autoRecombineSelected(sel) },
+      { label: 'Снять выделение', disabled: !multi, onClick: clearSelection },
+      { sep: true },
+      { label: 'Править вручную', disabled: multi || !ids.length, onClick: () => openEditDialog(n, ids) },
+      { label: 'Дистилляция LLM', disabled: multi || !ids.length, onClick: () => openDistillDialog(n, ids) },
+      { label: 'Поиск дублей LLM', disabled: multi || !ids.length, onClick: () => openDedupeDialog(ids) },
+      { label: 'Рекомбинация с нейроном…', disabled: multi || !ids.length, onClick: () => openMergeDialog(n, ids) },
       { sep: true },
       { label: 'Раскладка заново', onClick: relayoutGraph },
-      { label: 'Удалить нейрон из памяти', danger: true, disabled: !ids.length, onClick: async () => {
+      { label: 'Удалить нейрон из памяти', danger: true, disabled: multi || !ids.length, onClick: async () => {
           const ok = await ask('Удалить нейрон?',
             'Все его факты будут отозваны. История изменений останется в журнале.', 'Удалить');
           if (!ok) return;
           await memoryAction('/api/memory/forget', { node_id: n.id }, 'Нейрон удалён из памяти');
-          if (graph.selected === n) selectNode(null);
+          if (graph.selected === n) clearSelection();
         } },
     ]);
   }
@@ -1799,6 +2367,7 @@
     statusBusy = true;
     try {
       const s = await api('GET', '/api/status');
+      pullSettings();  // подхватить настройки, изменённые на другом устройстве
       const m = s.memory || {};
       els.statusDot.className = 'status ok';
       els.modelChip.classList.remove('bad');
@@ -1824,12 +2393,12 @@
 
   const graph = {
     nodes: [], edges: [], byId: {}, W: 0, H: 0, dpr: 1, temp: 0, frames: 0, raf: 0,
-    hover: null, selected: null, busy: false, typeColors: {}, relColors: {}, pulses: [],
-    anim: [], nodeDrag: null,
+    hover: null, selected: null, selectedIds: new Set(), busy: false, typeColors: {}, relColors: {}, pulses: [],
+    anim: [], nodeDrag: null, pointers: new Map(), pinch: null,
     view: { scale: 1, ox: 0, oy: 0 }, drag: null, press: null, fullscreen: false,
     sessionStart: Date.now(),
   };
-  const LAYOUT_FRAMES = 300;
+  const LAYOUT_FRAMES = 420;
   const LONG_PRESS_MS = 450;
 
   function typeColor(type) {
@@ -1879,50 +2448,94 @@
     if (graph.pulses.length > 24) graph.pulses.shift();
   }
 
+  function edgeKey(e) {
+    return e.source + '->' + e.target + ':' + (e.label || '');
+  }
+
+  function nodeRadius(degree) {
+    return 6 + Math.min(12, Math.sqrt(Math.max(1, degree || 1)) * 2.8);
+  }
+
   function buildGraph(data) {
     const prev = graph.byId;
-    const prevEdges = new Set(graph.edges.map((e) => e.source + '->' + e.target + ':' + (e.label || '')));
-    const W = graph.W || 300;
-    const H = graph.H || 340;
-    const nodes = (data.nodes || []).map((n) => {
+    const prevEdges = new Set(graph.edges.map(edgeKey));
+    const W = graph.W || 600;
+    const H = graph.H || 420;
+    const rawNodes = data.nodes || [];
+    const rawEdges = data.edges || [];
+
+    // Предварительно считаем степень по входящим ребрам, чтобы новые узлы
+    // появлялись рядом с соседями, а не случайной "пылью" по углам.
+    const deg = {};
+    for (const e of rawEdges) {
+      deg[e.source] = (deg[e.source] || 0) + 1;
+      deg[e.target] = (deg[e.target] || 0) + 1;
+    }
+
+    const nodes = rawNodes.map((n, i) => {
       const old = prev[n.id];
       const created = parseIso(n.created);
+      const degree = n.degree || deg[n.id] || 0;
+      let x = old ? old.x : NaN;
+      let y = old ? old.y : NaN;
+      if (!old) {
+        // Ищем уже размещённого соседа для естественного появления.
+        const nb = rawEdges.find((e) => (e.source === n.id && prev[e.target]) || (e.target === n.id && prev[e.source]));
+        if (nb) {
+          const ref = prev[nb.source === n.id ? nb.target : nb.source];
+          const ang = (i / Math.max(1, rawNodes.length)) * Math.PI * 2;
+          x = ref.x + Math.cos(ang) * 56;
+          y = ref.y + Math.sin(ang) * 56;
+        } else {
+          const ang = (i / Math.max(1, rawNodes.length)) * Math.PI * 2;
+          const rad = Math.min(W, H) * 0.22 + (i % 5) * 18;
+          x = W / 2 + Math.cos(ang) * rad;
+          y = H / 2 + Math.sin(ang) * rad;
+        }
+      }
       return {
-        id: n.id, label: n.label || n.id, type: n.type || null, degree: n.degree || 0,
+        id: n.id, label: n.label || n.id, type: n.type || null, degree,
         created, isNew: created >= graph.sessionStart, linked: !!n.linked,
-        r: 4 + Math.min(10, Math.sqrt(n.degree || 1) * 2.6),
-        x: old ? old.x : W / 2 + (Math.random() - 0.5) * W * 0.6,
-        y: old ? old.y : H / 2 + (Math.random() - 0.5) * H * 0.6,
+        r: nodeRadius(degree),
+        x, y,
+        vx: old && Number.isFinite(old.vx) ? old.vx * 0.35 : 0,
+        vy: old && Number.isFinite(old.vy) ? old.vy * 0.35 : 0,
         dx: 0, dy: 0, color: typeColor(n.type), fixed: old ? !!old.fixed : false,
       };
     });
+
     const byId = {};
     for (const n of nodes) byId[n.id] = n;
     const edges = [];
-    for (const e of data.edges || []) {
+    for (const e of rawEdges) {
       const a = byId[e.source];
       const b = byId[e.target];
       if (a && b) edges.push({ ...e, a, b, created: parseIso(e.recorded_at), color: relColor(e.label) });
     }
-    const changed = nodes.length !== Object.keys(prev).length || nodes.some((n) => !prev[n.id]);
+
+    const changed = nodes.length !== Object.keys(prev).length || nodes.some((n) => !prev[n.id]) ||
+      edges.length !== graph.edges.length;
+    const hasNew = nodes.some((n) => !prev[n.id]);
     graph.nodes = nodes;
     graph.edges = edges;
     graph.byId = byId;
     if (changed) {
-      graph.temp = W / 8;
-      graph.frames = 0;
+      graph.temp = hasNew ? Math.max(graph.temp, 1.2) : Math.max(graph.temp, 0.45);
+      graph.frames = Math.min(graph.frames, LAYOUT_FRAMES - 120);
     }
-    // Те связи, которых не было раньше, «просыпаются» бегущим импульсом.
+
     if (changed && graphVisible()) {
       let n = 0;
       for (const e of edges) {
-        const key = e.source + '->' + e.target + ':' + (e.label || '');
-        if (!prevEdges.has(key)) spawnPulse(e, n++ * 90);
+        if (!prevEdges.has(edgeKey(e))) spawnPulse(e, n++ * 90);
       }
     }
     renderGraphMeta(data, nodes, edges);
+    const kept = [...graph.selectedIds].filter((id) => byId[id]);
+    graph.selectedIds = new Set(kept);
     const sel = graph.selected && byId[graph.selected.id];
-    selectNode(sel || null);
+    syncSelection(sel || null);
+    selectNode(graph.selected, { silent: true });
     kick();
   }
 
@@ -1963,7 +2576,7 @@
   function kick() {
     if (!graph.raf) graph.raf = requestAnimationFrame(frame);
   }
-  // Плавный переход узла в новую позицию (после слияния/перекладки/сброса).
+
   function animateTo(node, x, y, dur) {
     if (!node) return;
     graph.anim = graph.anim.filter((a) => a.node !== node);
@@ -1971,88 +2584,139 @@
                       t0: performance.now(), dur: dur || 620 });
     kick();
   }
+
   function stepAnims(now) {
     if (!graph.anim.length) return;
     graph.anim = graph.anim.filter((a) => {
       const p = Math.max(0, Math.min(1, (now - a.t0) / a.dur));
-      const e = 1 - Math.pow(1 - p, 3);   // ease-out
+      const e = 1 - Math.pow(1 - p, 3);
       a.node.x = a.fx + (a.tx - a.fx) * e;
       a.node.y = a.fy + (a.ty - a.fy) * e;
+      if (p >= 1) { a.node.vx = 0; a.node.vy = 0; }
       return p < 1;
     });
   }
+
   function relayoutGraph() {
-    const W = graph.W || 300;
-    const H = graph.H || 340;
-    for (const n of graph.nodes) {
+    const W = graph.W || 600;
+    const H = graph.H || 420;
+    const nodes = graph.nodes;
+    if (!nodes.length) return;
+    const cx = W / 2;
+    const cy = H / 2;
+    const radius = Math.max(60, Math.min(W, H) * 0.32);
+    nodes.forEach((n, i) => {
       n.fixed = false;
-      const ang = (Object.keys(graph.byId).indexOf(n.id) / Math.max(1, graph.nodes.length)) * Math.PI * 2;
-      const rad = Math.min(W, H) * 0.28;
-      animateTo(n, W / 2 + Math.cos(ang) * rad, H / 2 + Math.sin(ang) * rad, 700);
-    }
-    graph.temp = W / 8;
+      n.vx = 0;
+      n.vy = 0;
+      const ang = (i / nodes.length) * Math.PI * 2 - Math.PI / 2;
+      const jitter = (i % 3 - 1) * 10;
+      animateTo(n, cx + Math.cos(ang) * (radius + jitter), cy + Math.sin(ang) * (radius + jitter), 700);
+    });
+    graph.temp = 1.6;
     graph.frames = 0;
     toast('Раскладка нейронов обновлена');
   }
+
   function frame() {
     graph.raf = 0;
     const now = performance.now();
     stepAnims(now);
-    const laying = graph.frames < LAYOUT_FRAMES && graph.nodes.length > 0 && !graph.anim.length;
-    if (laying) {
-      layoutStep();
-      graph.frames++;
-    }
+    const hasMotion = layoutStep();
     draw();
-    if (laying || graph.anim.length || graph.pulses.length ||
-        ((graph.selected || graph.hover) && graphVisible())) kick();
+    const active = hasMotion || graph.anim.length || graph.pulses.length ||
+      graph.nodeDrag || graph.drag || graph.pinch ||
+      ((graph.selected || graph.hover) && graphVisible());
+    if (active) kick();
   }
 
   function layoutStep() {
     const { nodes, edges, W, H } = graph;
     const n = nodes.length;
-    const k = Math.sqrt((W * H) / n) * 0.9;
-    for (const a of nodes) { a.dx = 0; a.dy = 0; }
+    if (!n) return false;
+    if (n === 1) {
+      const only = nodes[0];
+      if (!only.fixed && !graph.anim.some((a) => a.node === only)) {
+        only.x += (W / 2 - only.x) * 0.08;
+        only.y += (H / 2 - only.y) * 0.08;
+        only.vx *= 0.7; only.vy *= 0.7;
+      }
+      return Math.abs(W / 2 - only.x) + Math.abs(H / 2 - only.y) > 0.5;
+    }
+
+    const area = Math.max(1, W * H);
+    const k = Math.sqrt(area / n) * 0.95;
+    const repel = k * k * 1.25;
+    const centerX = W / 2;
+    const centerY = H / 2;
+    const temp = Math.max(0, graph.temp || 0);
+    let motion = 0;
+
+    for (const a of nodes) { a.fx = 0; a.fy = 0; }
+
+    // Отталкивание: O(n^2), но граф памяти обычно небольшой.
     for (let i = 0; i < n; i++) {
       const a = nodes[i];
       for (let j = i + 1; j < n; j++) {
         const b = nodes[j];
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
-        const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
-        const f = (k * k) / d;
-        a.dx += (dx / d) * f;
-        a.dy += (dy / d) * f;
-        b.dx -= (dx / d) * f;
-        b.dy -= (dy / d) * f;
+        let dx = a.x - b.x;
+        let dy = a.y - b.y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 0.01) { dx = (i + 1) * 0.01; dy = (j + 1) * 0.01; d2 = dx * dx + dy * dy; }
+        const d = Math.sqrt(d2);
+        const minDist = a.r + b.r + 22;
+        let f = repel / d2;
+        if (d < minDist) f += (minDist - d) / d * 2.2;
+        const nx = (dx / d) * f;
+        const ny = (dy / d) * f;
+        a.fx += nx; a.fy += ny;
+        b.fx -= nx; b.fy -= ny;
       }
     }
+
+    // Пружины по фактам: более уверенные/сильные связи тянут ближе.
     for (const e of edges) {
-      const dx = e.a.x - e.b.x;
-      const dy = e.a.y - e.b.y;
-      const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
-      const f = (d * d) / k;
-      e.a.dx -= (dx / d) * f;
-      e.a.dy -= (dy / d) * f;
-      e.b.dx += (dx / d) * f;
-      e.b.dy += (dy / d) * f;
+      const a = e.a;
+      const b = e.b;
+      let dx = b.x - a.x;
+      let dy = b.y - a.y;
+      let d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const conf = Math.max(0.25, Math.min(1, e.confidence || 0.6));
+      const target = Math.max(a.r + b.r + 26, k * (1.35 - conf * 0.45));
+      const strength = (0.015 + conf * 0.02) * (1 + temp * 0.25);
+      const f = (d - target) * strength;
+      const nx = (dx / d) * f;
+      const ny = (dy / d) * f;
+      a.fx += nx; a.fy += ny;
+      b.fx -= nx; b.fy -= ny;
     }
-    const cx = W / 2;
-    const cy = H / 2;
-    const t = graph.temp;
+
     for (const a of nodes) {
-      if (a.fixed) continue;   // перетащенный пользователем узел не тянем обратно
-      a.dx += (cx - a.x) * 0.01;
-      a.dy += (cy - a.y) * 0.01;
-      const len = Math.sqrt(a.dx * a.dx + a.dy * a.dy) || 0.01;
-      // Плавное движение: ограничение скорости, чтобы узлы не «дёргались» между кадрами.
-      const lim = Math.min(len, t, 6);
-      a.x += (a.dx / len) * lim;
-      a.y += (a.dy / len) * lim;
-      a.x = Math.max(a.r + 4, Math.min(W - a.r - 4, a.x));
-      a.y = Math.max(a.r + 4, Math.min(H - a.r - 4, a.y));
+      if (a.fixed || graph.nodeDrag && graph.nodeDrag.node === a) {
+        a.vx = 0; a.vy = 0;
+        continue;
+      }
+      // Мягкое притяжение к центру, чтобы граф не расползался бесконечно, но без жёстких границ.
+      a.fx += (centerX - a.x) * (0.0022 + temp * 0.0008);
+      a.fy += (centerY - a.y) * (0.0022 + temp * 0.0008);
+
+      a.vx = (a.vx + a.fx) * 0.86;
+      a.vy = (a.vy + a.fy) * 0.86;
+      const speed = Math.sqrt(a.vx * a.vx + a.vy * a.vy);
+      const maxSpeed = 2.2 + temp * 3.2;
+      if (speed > maxSpeed) {
+        a.vx = (a.vx / speed) * maxSpeed;
+        a.vy = (a.vy / speed) * maxSpeed;
+      }
+      if (speed < 0.015 && temp < 0.08) { a.vx = 0; a.vy = 0; }
+      a.x += a.vx;
+      a.y += a.vy;
+      motion += Math.abs(a.vx) + Math.abs(a.vy);
     }
-    graph.temp = Math.max(0.5, t * 0.985);
+
+    if (graph.frames < LAYOUT_FRAMES) graph.frames++;
+    graph.temp = temp > 0.02 ? temp * 0.985 : 0;
+    return motion > 0.08 || temp > 0.03;
   }
 
   function isNeighbor(n, hi) {
@@ -2060,10 +2724,129 @@
   }
 
   function withAlpha(hex, alpha) {
-    let h = String(hex || '#8ea2ff').replace('#', '');
+    let h = String(hex || '#a6bfe0').replace('#', '');
     if (h.length === 3) h = h.split('').map((x) => x + x).join('');
-    const v = parseInt(h, 16) || 0x8ea2ff;
+    const v = parseInt(h, 16) || 0xa6bfe0;
     return 'rgba(' + ((v >> 16) & 255) + ',' + ((v >> 8) & 255) + ',' + (v & 255) + ',' + alpha + ')';
+  }
+
+  function drawEdgeLabel(ctx, e, inv) {
+    const text = shorten(e.label || 'связь', 24);
+    const mx = (e.a.x + e.b.x) / 2;
+    const my = (e.a.y + e.b.y) / 2;
+    ctx.font = Math.round(10.5 * inv) + 'px system-ui, -apple-system, Segoe UI, sans-serif';
+    const padX = 5 * inv;
+    const h = 16 * inv;
+    const w = ctx.measureText(text).width + padX * 2;
+    const r = 5 * inv;
+    const x = mx - w / 2;
+    const y = my - h / 2;
+    ctx.fillStyle = 'rgba(10, 13, 19, 0.82)';
+    ctx.strokeStyle = withAlpha(e.color || '#a6bfe0', 0.45);
+    ctx.lineWidth = 1 * inv;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(x, y, w, h, r);
+    else {
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+    }
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = withAlpha('#eceef1', 0.92);
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, x + padX, my + 0.5 * inv);
+  }
+
+  function edgeCurve(e) {
+    const dx = e.b.x - e.a.x;
+    const dy = e.b.y - e.a.y;
+    const d = Math.sqrt(dx * dx + dy * dy) || 1;
+    const bend = Math.min(28, d * 0.08);
+    const nx = -dy / d;
+    const ny = dx / d;
+    // Deterministic bend direction so edges don't jitter between frames.
+    const sign = ((e.source || '').length + (e.target || '').length + (e.label || '').length) % 2 ? 1 : -1;
+    return { cx: (e.a.x + e.b.x) / 2 + nx * bend * sign, cy: (e.a.y + e.b.y) / 2 + ny * bend * sign };
+  }
+
+  function drawNeuronShape(ctx, n, inv, opts) {
+    const { dim, lifted, related, phase } = opts;
+    const r = n.r;
+    // Outer glow / membrane.
+    ctx.globalAlpha = dim ? 0.16 : 1;
+    const glow = ctx.createRadialGradient(n.x, n.y, r * 0.2, n.x, n.y, r * 4.6);
+    glow.addColorStop(0, withAlpha(n.color, lifted ? 0.28 : 0.16));
+    glow.addColorStop(1, withAlpha(n.color, 0));
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, r * 4.6, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Dendrite-like processes.
+    const seed = (n.id || n.label || '').split('').reduce((a, ch) => a + ch.charCodeAt(0), 0);
+    const count = 5 + (seed % 4);
+    ctx.save();
+    ctx.lineCap = 'round';
+    for (let i = 0; i < count; i++) {
+      const ang = (i / count) * Math.PI * 2 + (seed % 17) * 0.13;
+      const len = r * (1.8 + ((seed >> i) % 5) * 0.35) + (lifted ? 3 : 0);
+      const wob = Math.sin(phase * Math.PI * 2 + i + seed) * r * 0.18;
+      const x1 = n.x + Math.cos(ang) * r * 0.85;
+      const y1 = n.y + Math.sin(ang) * r * 0.85;
+      const x2 = n.x + Math.cos(ang + 0.18) * (r + len * 0.55) + Math.cos(ang + Math.PI / 2) * wob;
+      const y2 = n.y + Math.sin(ang + 0.18) * (r + len * 0.55) + Math.sin(ang + Math.PI / 2) * wob;
+      const x3 = n.x + Math.cos(ang) * (r + len);
+      const y3 = n.y + Math.sin(ang) * (r + len);
+      ctx.strokeStyle = withAlpha(n.color, dim ? 0.08 : (related ? 0.42 : 0.22));
+      ctx.lineWidth = (1.3 - i * 0.05) * inv;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.quadraticCurveTo(x2, y2, x3, y3);
+      ctx.stroke();
+      // synaptic tip
+      ctx.fillStyle = withAlpha(n.color, dim ? 0.08 : 0.28);
+      ctx.beginPath();
+      ctx.arc(x3, y3, 1.2 * inv, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // Soma body.
+    const body = ctx.createRadialGradient(n.x - r * 0.35, n.y - r * 0.4, r * 0.15, n.x, n.y, r * 1.3);
+    body.addColorStop(0, withAlpha('#ffffff', 0.92));
+    body.addColorStop(0.18, withAlpha(n.color, 1));
+    body.addColorStop(0.65, withAlpha(n.color, 0.95));
+    body.addColorStop(1, withAlpha(n.color, 0.38));
+    ctx.fillStyle = body;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Membrane ring.
+    ctx.strokeStyle = withAlpha('#ffffff', lifted ? 0.75 : 0.26);
+    ctx.lineWidth = (lifted ? 1.2 : 0.8) * inv;
+    ctx.stroke();
+
+    // Nucleus.
+    ctx.fillStyle = withAlpha('#fff', dim ? 0.08 : 0.16);
+    ctx.beginPath();
+    ctx.arc(n.x - r * 0.12, n.y - r * 0.12, r * 0.38, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (related) {
+      for (let ring = 0; ring < 2; ring++) {
+        const p = (phase + ring * 0.5) % 1;
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, r + 4 + p * 14, 0, Math.PI * 2);
+        ctx.strokeStyle = withAlpha(n.color, (1 - p) * 0.35);
+        ctx.lineWidth = 1.3 * inv;
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
   }
 
   function draw() {
@@ -2074,37 +2857,62 @@
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, c.width, c.height);
     ctx.setTransform(dpr * view.scale, 0, 0, dpr * view.scale, dpr * view.ox, dpr * view.oy);
-    const hi = graph.selected || graph.hover;
+    const hi = graph.hover || graph.selected;
+    const selIds = graph.selectedIds || new Set();
     const now = performance.now();
     const phase = (now % 1600) / 1600;
     const inv = 1 / view.scale;
 
+    // Тонкая сетка помогает читать масштаб и движение.
+    const grid = 80;
+    const topLeftX = -view.ox / view.scale;
+    const topLeftY = -view.oy / view.scale;
+    const visW = c.width / (dpr * view.scale);
+    const visH = c.height / (dpr * view.scale);
+    const startX = Math.floor(topLeftX / grid) * grid;
+    const startY = Math.floor(topLeftY / grid) * grid;
+    ctx.strokeStyle = 'rgba(255,255,255,0.025)';
+    ctx.lineWidth = 1 * inv;
+    ctx.beginPath();
+    for (let x = startX; x < topLeftX + visW + grid; x += grid) { ctx.moveTo(x, topLeftY); ctx.lineTo(x, topLeftY + visH); }
+    for (let y = startY; y < topLeftY + visH + grid; y += grid) { ctx.moveTo(topLeftX, y); ctx.lineTo(topLeftX + visW, y); }
+    ctx.stroke();
+
+    const focusedEdges = [];
     for (const e of graph.edges) {
       const focus = hi && (e.a === hi || e.b === hi);
       const pulse = graph.pulses.find((p) => p.edge === e);
-      const conf = Math.max(0, Math.min(1, e.confidence || 0));
+      const conf = Math.max(0, Math.min(1, e.confidence || 0.55));
+      if (focus) focusedEdges.push(e);
+      const c1 = edgeCurve(e);
       ctx.strokeStyle = focus ? withAlpha(e.color || '#eceef1', 0.9)
-        : withAlpha(e.color || '#9aa3b2', 0.14 + 0.45 * conf);
-      ctx.lineWidth = focus ? 1.8 * inv : (0.6 + conf) * inv;
+        : withAlpha(e.color || '#9aa3b2', hi ? 0.04 : 0.1 + 0.2 * conf);
+      ctx.lineWidth = (focus ? 2.1 : (0.7 + conf * 0.7)) * inv;
       if (focus || pulse) {
         ctx.setLineDash([7 * inv, 8 * inv]);
-        ctx.lineDashOffset = -(now / 40) * inv;   // бегущий импульс по связи
+        ctx.lineDashOffset = -(now / 40) * inv;
       } else {
         ctx.setLineDash([]);
       }
       ctx.beginPath();
       ctx.moveTo(e.a.x, e.a.y);
-      ctx.lineTo(e.b.x, e.b.y);
+      ctx.quadraticCurveTo(c1.cx, c1.cy, e.b.x, e.b.y);
       ctx.stroke();
+      e._curve = c1;
     }
     ctx.setLineDash([]);
 
-    // Волна активации: импульс бежит по синапсу от нейрона к нейрону.
+    if (hi) {
+      for (const e of focusedEdges.slice(0, 18)) drawEdgeLabel(ctx, e, inv);
+    }
+
     graph.pulses = graph.pulses.filter((p) => p.until > now);
     for (const p of graph.pulses) {
       const t = Math.max(0, Math.min(1, (now - p.t0) / (p.until - p.t0)));
-      const x = p.edge.a.x + (p.edge.b.x - p.edge.a.x) * t;
-      const y = p.edge.a.y + (p.edge.b.y - p.edge.a.y) * t;
+      const c1 = p.edge._curve || edgeCurve(p.edge);
+      const mt = 1 - t;
+      const x = mt * mt * p.edge.a.x + 2 * mt * t * c1.cx + t * t * p.edge.b.x;
+      const y = mt * mt * p.edge.a.y + 2 * mt * t * c1.cy + t * t * p.edge.b.y;
       const color = p.edge.color || '#eceef1';
       ctx.beginPath();
       ctx.arc(x, y, 3.2 * inv, 0, Math.PI * 2);
@@ -2117,43 +2925,11 @@
     }
 
     for (const n of graph.nodes) {
-      const related = hi && (n === hi || isNeighbor(n, hi));
+      const related = hi && (n === hi || isNeighbor(n, hi) || selIds.has(n.id));
       const dim = hi && !related;
-      const lifted = n === graph.hover || n === graph.selected ||
-        (graph.nodeDrag && graph.nodeDrag.node === n);
-      ctx.globalAlpha = dim ? 0.28 : 0.96;
-      // Мягкое свечение нейрона — «живой» узел, а не плоская точка.
-      const halo = ctx.createRadialGradient(n.x, n.y, n.r * 0.4, n.x, n.y, n.r * (lifted ? 4.2 : 2.8));
-      halo.addColorStop(0, withAlpha(n.color, lifted ? 0.38 : 0.22));
-      halo.addColorStop(1, withAlpha(n.color, 0));
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, n.r * (lifted ? 4.2 : 2.8), 0, Math.PI * 2);
-      ctx.fillStyle = halo;
-      ctx.fill();
-      if (related) {
-        for (let ring = 0; ring < 2; ring++) {
-          const p = (phase + ring * 0.5) % 1;
-          ctx.beginPath();
-          ctx.arc(n.x, n.y, n.r + 4 + p * 22, 0, Math.PI * 2);
-          ctx.strokeStyle = withAlpha(n.color, (1 - p) * 0.55);
-          ctx.lineWidth = 1.4 * inv;
-          ctx.stroke();
-        }
-      }
-      // Объём: градиент от светлого верхнего полюса к насыщенному краю.
-      const body = ctx.createRadialGradient(n.x - n.r * 0.35, n.y - n.r * 0.4, n.r * 0.1,
-                                            n.x, n.y, n.r * 1.15);
-      body.addColorStop(0, withAlpha(n.color, 1));
-      body.addColorStop(0.55, n.color);
-      body.addColorStop(1, withAlpha(n.color, 0.55));
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
-      ctx.fillStyle = body;
-      ctx.fill();
-      ctx.strokeStyle = withAlpha('#ffffff', lifted ? 0.75 : 0.28);
-      ctx.lineWidth = (lifted ? 1.1 : 0.7) * inv;
-      ctx.stroke();
-      ctx.globalAlpha = 1;
+      const lifted = n === graph.hover || selIds.has(n.id) || (graph.nodeDrag && graph.nodeDrag.node === n);
+      drawNeuronShape(ctx, n, inv, { dim, lifted, related, phase });
+
       if (n.isNew) {
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r + 3.5, 0, Math.PI * 2);
@@ -2161,36 +2937,49 @@
         ctx.lineWidth = 1.5 * inv;
         ctx.stroke();
       }
-      if (n.fixed) {   // нейрон закреплён перетаскиванием
+      if (n.fixed) {
         ctx.beginPath();
-        ctx.arc(n.x + n.r * 0.8, n.y - n.r * 0.8, 2.2 * inv, 0, Math.PI * 2);
-        ctx.fillStyle = '#a9cdff';
+        ctx.arc(n.x + n.r * 0.75, n.y - n.r * 0.75, 2.4 * inv, 0, Math.PI * 2);
+        ctx.fillStyle = '#c3d7f7';
         ctx.fill();
       }
-      if (n === graph.selected) {
+      if (selIds.has(n.id)) {
         ctx.beginPath();
-        ctx.arc(n.x, n.y, n.r + 6, 0, Math.PI * 2);
-        ctx.strokeStyle = '#eceef1';
-        ctx.lineWidth = 1.5 * inv;
+        ctx.arc(n.x, n.y, n.r + 6.5, 0, Math.PI * 2);
+        ctx.strokeStyle = n === graph.selected ? '#eceef1' : 'rgba(236,238,241,0.65)';
+        ctx.lineWidth = (n === graph.selected ? 1.8 : 1.2) * inv;
         ctx.stroke();
       }
       if (graph.press && graph.press.node === n && !graph.press.longFired) {
         const p = Math.min(1, (now - graph.press.t0) / LONG_PRESS_MS);
         ctx.beginPath();
-        ctx.arc(n.x, n.y, n.r + 9, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2);
+        ctx.arc(n.x, n.y, n.r + 10, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2);
         ctx.strokeStyle = '#eceef1';
         ctx.lineWidth = 2 * inv;
         ctx.stroke();
       }
     }
 
-    const labelled = new Set([...graph.nodes].sort((a, b) => b.degree - a.degree).slice(0, 14));
-    if (hi) labelled.add(hi);
+    // Подписи: показываем выбранный/hover + самые связанные, но избегаем наложений.
+    const labels = [];
+    const candidates = [...graph.nodes].sort((a, b) => b.degree - a.degree).slice(0, 18);
+    for (const n of selectedNodes()) if (!candidates.includes(n)) candidates.unshift(n);
+    if (hi && !candidates.includes(hi)) candidates.unshift(hi);
     ctx.font = Math.round(12 * inv) + 'px system-ui, -apple-system, Segoe UI, sans-serif';
     ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#eceef1';
-    for (const n of labelled) {
-      ctx.fillText(shorten(n.label, 26), n.x + n.r + 5, n.y);
+    for (const n of candidates) {
+      const text = shorten(n.label, 28);
+      const x = n.x + n.r + 7 * inv;
+      const y = n.y;
+      const w = ctx.measureText(text).width;
+      const h = 14 * inv;
+      const box = { x, y: y - h / 2, w, h };
+      const hit = labels.some((b) => box.x < b.x + b.w + 6 * inv && box.x + box.w + 6 * inv > b.x && box.y < b.y + b.h + 4 * inv && box.y + box.h + 4 * inv > b.y);
+      if (hit && n !== hi && !selIds.has(n.id)) continue;
+      labels.push(box);
+      const dim = hi && !(n === hi || isNeighbor(n, hi) || selIds.has(n.id));
+      ctx.fillStyle = dim ? 'rgba(236,238,241,0.32)' : 'rgba(236,238,241,0.95)';
+      ctx.fillText(text, x, y);
     }
   }
 
@@ -2235,34 +3024,99 @@
     kick();
   }
 
-  function selectNode(n) {
-    graph.selected = n;
-    draw();
+  function selectedNodes() {
+    return graph.nodes.filter((n) => graph.selectedIds.has(n.id));
+  }
+
+  function syncSelection(primary) {
+    const ids = graph.selectedIds;
+    if (primary && ids.has(primary.id)) graph.selected = primary;
+    else if (graph.selected && ids.has(graph.selected.id)) { /* keep */ }
+    else graph.selected = selectedNodes()[0] || null;
+  }
+
+  function toggleNodeSelection(n) {
+    if (!n) return;
+    if (graph.selectedIds.has(n.id)) graph.selectedIds.delete(n.id);
+    else graph.selectedIds.add(n.id);
+    syncSelection(n);
+    selectNode(graph.selected, { silent: true });
+  }
+
+  function setSelectedNodes(nodes, primary) {
+    graph.selectedIds = new Set(nodes.filter(Boolean).map((n) => n.id));
+    syncSelection(primary || nodes[0] || null);
+    selectNode(graph.selected, { silent: true });
+  }
+
+  function clearSelection() {
+    graph.selectedIds.clear();
+    graph.selected = null;
+    selectNode(null, { silent: true });
+  }
+
+  function renderSelectionDetail(nodes) {
     const box = els.graphDetail;
     box.innerHTML = '';
-    if (!n) {
-      box.appendChild(el('div', 'empty', 'Нажмите на узел на карте.'));
+    if (!nodes.length) {
+      box.appendChild(el('div', 'empty', 'Нажмите на узел на карте. Ctrl+клик — выбрать несколько.'));
       return;
     }
+    if (nodes.length === 1) {
+      const n = nodes[0];
+      const head = el('div', 'card');
+      head.appendChild(el('div', 'fact-text', n.label));
+      const meta = [n.type, 'связей: ' + n.degree];
+      if (n.created) meta.push('с ' + new Date(n.created).toLocaleDateString('ru-RU'));
+      if (n.isNew) meta.push('новый в этой сессии');
+      if (!n.linked) meta.push('без сущности');
+      head.appendChild(el('div', 'fact-meta', meta.filter(Boolean).join(' · ')));
+      box.appendChild(head);
+      const related = graph.edges.filter((e) => e.a === n || e.b === n).slice(0, 30);
+      for (const e of related) {
+        const card = el('div', 'card');
+        card.appendChild(el('div', 'fact-text', e.a.label + ' — ' + e.label + ' → ' + e.b.label));
+        const when = e.created ? ' · ' + new Date(e.created).toLocaleString('ru-RU') : '';
+        card.appendChild(el('div', 'fact-meta', 'уверенность ' + e.confidence + when));
+        const factId = e.id || e.fact_id;
+        factActions(factId, card);
+        attachMenu(card, (x, y) => showFactMenu(x, y, factId, e.a.label + ' — ' + e.label + ' → ' + e.b.label));
+        box.appendChild(card);
+      }
+      return;
+    }
+
     const head = el('div', 'card');
-    head.appendChild(el('div', 'fact-text', n.label));
-    const meta = [n.type, 'связей: ' + n.degree];
-    if (n.created) meta.push('с ' + new Date(n.created).toLocaleDateString('ru-RU'));
-    if (n.isNew) meta.push('новый в этой сессии');
-    if (!n.linked) meta.push('без сущности');
-    head.appendChild(el('div', 'fact-meta', meta.filter(Boolean).join(' · ')));
+    head.appendChild(el('div', 'fact-text', 'Выбрано нейронов: ' + nodes.length));
+    head.appendChild(el('div', 'fact-meta', nodes.map((n) => shorten(n.label, 28)).join(' · ')));
+    const row = el('div', 'card-row');
+    const mergeBtn = el('button', 'btn-primary', 'Авто-рекомбинация LLM');
+    mergeBtn.type = 'button';
+    mergeBtn.addEventListener('click', () => autoRecombineSelected(nodes));
+    const clearBtn = el('button', 'btn-ghost', 'Снять выделение');
+    clearBtn.type = 'button';
+    clearBtn.addEventListener('click', clearSelection);
+    row.append(mergeBtn, clearBtn);
+    head.appendChild(row);
     box.appendChild(head);
-    const related = graph.edges.filter((e) => e.a === n || e.b === n).slice(0, 30);
-    for (const e of related) {
+
+    for (const n of nodes.slice(0, 12)) {
       const card = el('div', 'card');
-      card.appendChild(el('div', 'fact-text', e.a.label + ' — ' + e.label + ' → ' + e.b.label));
-      const when = e.created ? ' · ' + new Date(e.created).toLocaleString('ru-RU') : '';
-      card.appendChild(el('div', 'fact-meta', 'уверенность ' + e.confidence + when));
-      const factId = e.id || e.fact_id;
-      factActions(factId, card);
-      attachMenu(card, (x, y) => showFactMenu(x, y, factId, e.a.label + ' — ' + e.label + ' → ' + e.b.label));
+      card.appendChild(el('div', 'fact-text', n.label));
+      card.appendChild(el('div', 'fact-meta', [n.type, 'связей: ' + n.degree].filter(Boolean).join(' · ')));
       box.appendChild(card);
     }
+  }
+
+  function selectNode(n, opts) {
+    const silent = opts && opts.silent;
+    if (!silent) {
+      if (n) graph.selectedIds = new Set([n.id]);
+      else graph.selectedIds.clear();
+    }
+    graph.selected = n || null;
+    draw();
+    renderSelectionDetail(selectedNodes());
   }
 
   function factActions(fid, card) {
@@ -2932,79 +3786,181 @@
     }
   });
 
+  function pointerScreen(ev) {
+    const r = els.graphCanvas.getBoundingClientRect();
+    return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  }
+  function clearPress() {
+    if (graph.press && graph.press.timer) clearTimeout(graph.press.timer);
+    graph.press = null;
+  }
+  function beginPinch() {
+    const pts = [...graph.pointers.values()];
+    if (pts.length < 2) return;
+    const [a, b] = pts;
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    graph.pinch = {
+      dist: Math.hypot(dx, dy) || 1,
+      mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+      view: { ...graph.view },
+    };
+    clearPress();
+    graph.nodeDrag = null;
+    graph.drag = null;
+  }
+
   els.graphCanvas.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0 && ev.pointerType !== 'touch') return;
     if (ev.button !== 0) return;
-    const s = screenPoint(ev);
+    ev.preventDefault();
+    els.graphCanvas.setPointerCapture(ev.pointerId);
+    const s = pointerScreen(ev);
+    graph.pointers.set(ev.pointerId, s);
+    if (graph.pointers.size >= 2) {
+      beginPinch();
+      return;
+    }
     const p = canvasPoint(ev);
     const node = nodeAt(p.x, p.y);
     if (node) {
-      graph.press = { node, sx: s.x, sy: s.y, t0: performance.now(), moved: false, longFired: false };
+      clearPress();
+      graph.press = { pointerId: ev.pointerId, node, sx: s.x, sy: s.y, t0: performance.now(), moved: false, longFired: false, multi: ev.ctrlKey || ev.metaKey };
       graph.press.timer = setTimeout(() => {
-        if (!graph.press || graph.press.moved) return;
+        if (!graph.press || graph.press.moved || graph.press.pointerId !== ev.pointerId) return;
         graph.press.longFired = true;
-        selectNode(graph.press.node);
+        if (!graph.selectedIds.has(graph.press.node.id)) setSelectedNodes([graph.press.node], graph.press.node);
         const at = nodeScreenPoint(graph.press.node);
         showNodeMenu(at.x, at.y, graph.press.node);
       }, LONG_PRESS_MS);
+      els.graphCanvas.style.cursor = 'grabbing';
     } else {
-      graph.drag = { sx: s.x, sy: s.y, ox: graph.view.ox, oy: graph.view.oy };
+      clearPress();
+      if (!ev.shiftKey) clearSelection();
+      graph.drag = { pointerId: ev.pointerId, sx: s.x, sy: s.y, ox: graph.view.ox, oy: graph.view.oy };
       els.graphCanvas.style.cursor = 'grabbing';
     }
   });
+
   els.graphCanvas.addEventListener('pointermove', (ev) => {
-    const s = screenPoint(ev);
-    if (graph.drag) {
+    if (!graph.pointers.has(ev.pointerId)) {
+      const p = canvasPoint(ev);
+      const n = nodeAt(p.x, p.y);
+      if (n !== graph.hover) { graph.hover = n; draw(); }
+      els.graphCanvas.style.cursor = n ? 'grab' : 'default';
+      return;
+    }
+    const s = pointerScreen(ev);
+    graph.pointers.set(ev.pointerId, s);
+
+    if (graph.pinch && graph.pointers.size >= 2) {
+      const pts = [...graph.pointers.values()];
+      const [a, b] = pts;
+      const dist = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      const base = graph.pinch.view;
+      const factor = dist / graph.pinch.dist;
+      const scale = Math.max(0.35, Math.min(4, base.scale * factor));
+      const wx = (graph.pinch.mid.x - base.ox) / base.scale;
+      const wy = (graph.pinch.mid.y - base.oy) / base.scale;
+      graph.view.scale = scale;
+      graph.view.ox = mid.x - wx * scale;
+      graph.view.oy = mid.y - wy * scale;
+      kick();
+      return;
+    }
+
+    if (graph.drag && graph.drag.pointerId === ev.pointerId) {
       graph.view.ox = graph.drag.ox + (s.x - graph.drag.sx);
       graph.view.oy = graph.drag.oy + (s.y - graph.drag.sy);
       kick();
       return;
     }
+
     const p = canvasPoint(ev);
-    if (graph.nodeDrag) {
+    if (graph.nodeDrag && graph.nodeDrag.pointerId === ev.pointerId) {
       const d = graph.nodeDrag;
-      d.node.x = Math.max(d.node.r + 4, Math.min(graph.W - d.node.r - 4, p.x - d.offX));
-      d.node.y = Math.max(d.node.r + 4, Math.min(graph.H - d.node.r - 4, p.y - d.offY));
+      d.node.x = p.x - d.offX;
+      d.node.y = p.y - d.offY;
+      d.node.vx = 0; d.node.vy = 0;
       d.node.fixed = true;
       kick();
       return;
     }
+
     const n = nodeAt(p.x, p.y);
-    if (graph.press && !graph.press.moved &&
+    if (graph.press && graph.press.pointerId === ev.pointerId && !graph.press.moved &&
         Math.hypot(s.x - graph.press.sx, s.y - graph.press.sy) > 6) {
       graph.press.moved = true;
       clearTimeout(graph.press.timer);
-      // Короткое движение = перетаскивание узла, долгое удержание = меню.
-      graph.nodeDrag = { node: graph.press.node, offX: p.x - graph.press.node.x,
-                         offY: p.y - graph.press.node.y };
-      selectNode(graph.press.node);
+      if (graph.press.multi) {
+        if (!graph.selectedIds.has(graph.press.node.id)) toggleNodeSelection(graph.press.node);
+      } else if (!graph.selectedIds.has(graph.press.node.id)) {
+        setSelectedNodes([graph.press.node], graph.press.node);
+      }
+      graph.nodeDrag = { pointerId: ev.pointerId, node: graph.press.node, offX: p.x - graph.press.node.x, offY: p.y - graph.press.node.y };
+      els.graphCanvas.style.cursor = 'grabbing';
     }
     if (n !== graph.hover) {
       graph.hover = n;
-      els.graphCanvas.style.cursor = n ? 'grab' : 'default';
+      if (!graph.nodeDrag && !graph.drag) els.graphCanvas.style.cursor = n ? 'grab' : 'default';
       draw();
     }
   });
-  function endPointer() {
-    const press = graph.press;
-    if (press) {
-      clearTimeout(press.timer);
-      if (!press.moved && !press.longFired) selectNode(graph.selected === press.node ? null : press.node);
+
+  function endPointer(ev) {
+    const id = ev && ev.pointerId;
+    if (id != null) graph.pointers.delete(id);
+    if (graph.pinch) {
+      if (graph.pointers.size < 2) {
+        graph.pinch = null;
+        const rem = [...graph.pointers.entries()][0];
+        if (rem) {
+          const [pid, s] = rem;
+          graph.drag = { pointerId: pid, sx: s.x, sy: s.y, ox: graph.view.ox, oy: graph.view.oy };
+        }
+      }
     }
-    graph.press = null;
-    graph.nodeDrag = null;
-    graph.drag = null;
+    if (graph.press && (id == null || graph.press.pointerId === id)) {
+      const press = graph.press;
+      clearPress();
+      if (!press.moved && !press.longFired) {
+        if (press.multi) toggleNodeSelection(press.node);
+        else selectNode(graph.selected === press.node && graph.selectedIds.size === 1 ? null : press.node);
+      }
+    }
+    if (graph.nodeDrag && (id == null || graph.nodeDrag.pointerId === id)) {
+      graph.nodeDrag.node.vx = 0;
+      graph.nodeDrag.node.vy = 0;
+      graph.nodeDrag = null;
+      graph.temp = Math.max(graph.temp, 0.12);
+    }
+    if (graph.drag && (id == null || graph.drag.pointerId === id)) {
+      graph.drag = null;
+    }
+    if (!graph.pointers.size) {
+      clearPress();
+      graph.nodeDrag = null;
+      graph.drag = null;
+      graph.pinch = null;
+    }
     els.graphCanvas.style.cursor = graph.hover ? 'grab' : 'default';
     draw();
+    kick();
   }
+
   els.graphCanvas.addEventListener('pointerup', endPointer);
   els.graphCanvas.addEventListener('pointercancel', endPointer);
-  els.graphCanvas.addEventListener('pointerleave', () => { graph.hover = null; draw(); });
+  els.graphCanvas.addEventListener('pointerleave', (ev) => {
+    if (graph.pointers.has(ev.pointerId)) return;
+    if (!graph.nodeDrag && !graph.drag && !graph.pinch) { graph.hover = null; draw(); }
+  });
   els.graphCanvas.addEventListener('contextmenu', (ev) => {
     ev.preventDefault();
     const p = canvasPoint(ev);
     const n = nodeAt(p.x, p.y);
     if (n) {
-      selectNode(n);
+      if (!graph.selectedIds.has(n.id)) setSelectedNodes([n], n);
       showNodeMenu(ev.clientX, ev.clientY, n);
     } else {
       showBlankMenu(ev.clientX, ev.clientY);
@@ -3013,7 +3969,8 @@
   els.graphCanvas.addEventListener('wheel', (ev) => {
     ev.preventDefault();
     const s = screenPoint(ev);
-    zoomAt(s.x, s.y, ev.deltaY < 0 ? 1.12 : 1 / 1.12);
+    const factor = Math.pow(1.0015, -ev.deltaY);
+    zoomAt(s.x, s.y, Math.max(0.8, Math.min(1.25, factor)));
   }, { passive: false });
   window.addEventListener('resize', () => { if (graphVisible()) resizeGraph(); });
   // Факты появляются фоном (очередь индексации) — карта обновляется сама, пока открыта.
@@ -3138,6 +4095,13 @@
     applySettings();
     toast(settings.webSearch ? 'Интернет включён: модель может искать и читать страницы' : 'Интернет выключен');
   });
+  if (els.voiceBtn) {
+    els.voiceBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (menuEl && menuEl.classList.contains('voice-menu')) closeMenu();
+      else showVoiceMenu(els.voiceBtn);
+    });
+  }
   els.scrollBottomBtn.addEventListener('click', scrollEnd);
   els.messages.addEventListener('scroll', updateScrollButton, { passive: true });
 
@@ -3253,6 +4217,7 @@
   loadState();
   SYNC.ready = true;   // только теперь локальные изменения уходят на сервер
   applySettings();
+  pullSettings();      // серверная копия настроек (если свежее локальной)
   updateComposer();
   updateCounter();
   renderMetrics();
@@ -3260,6 +4225,7 @@
   renderSessions();
   updateTitle();
   renderMessages({ force: true });
+  loadTtsStatus();
   refreshStatus();
   setInterval(refreshStatus, 10000);
   // Подтягиваем чаты с сервера и подписываемся на изменения других устройств.

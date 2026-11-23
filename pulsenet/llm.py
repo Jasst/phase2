@@ -7,6 +7,7 @@
 
 Оба говорят по OpenAI-совместимому API: /v1/models и /v1/chat/completions со стримингом.
 """
+import http.client
 import json
 import os
 import subprocess
@@ -65,6 +66,15 @@ def _error_detail(exc):
     return body.strip()[:300] or str(exc.reason)
 
 
+_OVERFLOW_MARKERS = ("context", "too long", "exceed", "n_ctx", "token")
+
+
+def _is_overflow(detail: str) -> bool:
+    """400 из-за переполнения контекста — не признак того, что сервер не умеет function calling."""
+    low = (detail or "").lower()
+    return any(marker in low for marker in _OVERFLOW_MARKERS)
+
+
 class ThinkSplitter:
     """Отделяет <think>…</think> от ответа в потоке (теги могут приходить по частям)."""
 
@@ -116,51 +126,69 @@ class OpenAICompat:
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
+            self.last_native_unsupported = False
         req = urllib.request.Request(self.base_url + "/chat/completions",
                                      data=json.dumps(body).encode("utf-8"),
                                      headers={"Content-Type": "application/json"}, method="POST")
         try:
             resp = urllib.request.urlopen(req, timeout=600)
         except urllib.error.HTTPError as exc:        # сервер ответил, но с ошибкой
-            if exc.code == 400 and tools:
+            detail = _error_detail(exc)
+            # 400 из-за переполнения контекста не означает «нет tools»: откат на текстовый
+            # протокол тогда только скрыл бы настоящую причину.
+            if exc.code == 400 and tools and not _is_overflow(detail):
+                # Флаг вместо on_delta: слушатель потока ждёт только токены и
+                # native_tool_calls, а лишнее событие ломало бы подписчиков.
+                self.last_native_unsupported = True
                 return self.stream(model, messages, on_delta, cancelled,
                                    temperature, max_tokens, tools=None)
-            raise BackendError(f"{self.name} ответил ошибкой {exc.code}: {_error_detail(exc)}") from exc
+            raise BackendError(f"{self.name} ответил ошибкой {exc.code}: {detail}") from exc
         except OSError as exc:                       # сервер не отвечает вовсе
             raise BackendError(f"нет связи с LLM ({self.name}): {exc}") from exc
         splitter = ThinkSplitter()
         calls: Dict[int, dict] = {}
-        with resp:
-            for raw in resp:
-                if cancelled():
-                    break
-                line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    ev = json.loads(data)
-                except ValueError:
-                    continue
-                choice = (ev.get("choices") or [{}])[0]
-                delta = choice.get("delta") or {}
-                if delta.get("reasoning_content"):
-                    on_delta("reasoning", delta["reasoning_content"])
-                if delta.get("content"):
-                    for kind, text in splitter.feed(delta["content"]):
-                        on_delta(kind, text)
-                for tc in (delta.get("tool_calls") or []):
-                    i = int(tc.get("index") or 0)
-                    cur = calls.setdefault(i, {"id": "", "name": "", "arguments": ""})
-                    if tc.get("id"):
-                        cur["id"] = tc["id"]
-                    fn = tc.get("function") or {}
-                    if fn.get("name"):
-                        cur["name"] += fn["name"]
-                    if fn.get("arguments"):
-                        cur["arguments"] += fn["arguments"]
+        try:
+            with resp:
+                for raw in resp:
+                    if cancelled():
+                        break
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        ev = json.loads(data)
+                    except ValueError:
+                        continue
+                    choice = (ev.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    if delta.get("reasoning_content"):
+                        on_delta("reasoning", delta["reasoning_content"])
+                    if delta.get("content"):
+                        for kind, text in splitter.feed(delta["content"]):
+                            on_delta(kind, text)
+                    for tc in (delta.get("tool_calls") or []):
+                        i = int(tc.get("index") or 0)
+                        cur = calls.setdefault(i, {"id": "", "name": "", "arguments": ""})
+                        if tc.get("id"):
+                            cur["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        name_part = fn.get("name") or ""
+                        # Одни серверы шлют имя целиком, другие кусками: полный повтор не склеиваем.
+                        if name_part and not cur["name"]:
+                            cur["name"] = name_part
+                        elif name_part and name_part != cur["name"]:
+                            cur["name"] += name_part
+                        if fn.get("arguments"):
+                            cur["arguments"] += fn["arguments"]
+        except (OSError, http.client.HTTPException) as exc:
+            # Обрыв или таймаут посреди ответа. Уже показанный текст остаётся у пользователя,
+            # а ход получает ошибку модели, а не необработанное исключение.
+            for kind, text in splitter.flush():
+                on_delta(kind, text)
+            raise BackendError(f"обрыв ответа от {self.name}: {exc}") from exc
         for kind, text in splitter.flush():
             on_delta(kind, text)
         if calls:
@@ -211,12 +239,11 @@ class LMStudioBackend(OpenAICompat):
         return ids
 
     def refresh_loaded(self, force: bool = False):
-        """Обновить `loaded` по фактическому состоянию LM Studio.
+        """Диагностика: обновить `loaded` по фактическому состоянию LM Studio.
 
-        Не полагаемся на сохранённый выбор модели: он мог остаться от другого
-        бэкенда (например, путь .gguf), и запрос к LM Studio загрузил бы
-        совсем не ту модель, что уже находится в памяти. Опрос API кэшируется
-        на 15 с: статус и экстракция не должны дёргать LM Studio на каждом шаге.
+        НЕ используется для выбора модели: метод оставлен только для ручной
+        проверки состояния. Выбор идёт из аргумента пользователя, `active_model`
+        или статичного `default_model`; «первая загруженная» модель в чат не попадает.
         """
         now = time.time()
         if not force and self._loaded_at and now - self._loaded_at < 15:
@@ -250,7 +277,8 @@ class LMStudioBackend(OpenAICompat):
             data = http_json(self.base_url + "/models", timeout=5)
         except (OSError, ValueError) as exc:
             raise BackendError(f"LM Studio недоступен по адресу {self.base_url}: {exc}") from exc
-        self.refresh_loaded()
+        # Список моделей — только чтение: раньше refresh_loaded() менял self.loaded
+        # на первую попавшуюся загруженную модель, и «выбор» прыгал без пользователя.
         skip = self._embedding_ids()
         return [m["id"] for m in data.get("data", []) if "id" in m and m["id"] not in skip]
 
@@ -263,18 +291,18 @@ class LMStudioBackend(OpenAICompat):
         return [m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
 
     def ensure(self, model, params=None):
-        target = (model or "").strip()
-        if target:
-            # Модель из настроек другого бэкенда (например, путь .gguf из llama.cpp)
-            # LM Studio не знает: без проверки запрос упал бы с непонятной ошибкой.
-            if target not in self._known_ids():
-                raise BackendError(f"модель {target!r} не найдена в LM Studio: выберите модель "
-                                   f"из списка или загрузите её в LM Studio")
-            self.loaded = target
-            return target
-        loaded = self.refresh_loaded()
-        target = loaded or self.default_model
-        self.loaded = target or None
+        # Только явный выбор пользователя или статичный default из .env.
+        # Раньше пустой аргумент подхватывал «первую загруженную в LM Studio» модель
+        # через refresh_loaded(): выбор менялся без участия пользователя.
+        target = (model or "").strip() or self.default_model
+        if not target:
+            raise BackendError("модель не выбрана: задайте LMSTUDIO_MODEL или выберите модель в интерфейсе")
+        # Модель из настроек другого бэкенда (например, путь .gguf из llama.cpp)
+        # LM Studio не знает: без проверки запрос упал бы с непонятной ошибкой.
+        if target not in self._known_ids():
+            raise BackendError(f"модель {target!r} не найдена в LM Studio: выберите модель "
+                               f"из списка или загрузите её в LM Studio")
+        self.loaded = target
         return target
 
     def stop(self):
@@ -385,11 +413,15 @@ class LlamaCppBackend(OpenAICompat):
     def ensure(self, rel, params=None):
         """Гарантирует, что нужная модель отвечает. Перезапускает сервер при смене модели."""
         rel = (rel or self.default_rel).replace("\\", "/")
+        if not rel:
+            raise BackendError("модель не выбрана: задайте LLAMACPP_DEFAULT_MODEL или выберите модель в интерфейсе")
         if self.healthy():
             if self.proc is None and self.loaded is None:
                 self.external = True     # сервер поднят вручную (например, вашим приложением)
-                self.loaded = rel if rel else "(внешний сервер)"
-                return self.loaded
+                # Не «назначаем» модель сами: заглушка "(внешний сервер)"
+                # попадала в active_model и отравляла все вызовы памяти.
+                self.loaded = rel
+                return rel
             if self.loaded == rel:
                 return rel
             if self.external:
