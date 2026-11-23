@@ -176,6 +176,7 @@ class ToolCallFilter:
         self.names = {str(n) for n in (names or ()) if n}
         self.primary = dict(primary or {})
         self.calls_raw: List[str] = []
+        self.fake_results = 0        # сколько поддельных <tool_result> модель написала сама
 
     def feed(self, text: str) -> str:
         self.buf += text or ""
@@ -210,7 +211,7 @@ class ToolCallFilter:
                 self.buf = self.buf[i:]
             j = self.buf.find(">")
             if j < 0:
-                if self._possible_tag(self.buf):
+                if self._possible_tag(self.buf) or self._possible_tool_result(self.buf):
                     return False
                 out.append(self.buf[0])          # не тег инструмента — обычный текст
                 self.buf = self.buf[1:]
@@ -221,6 +222,12 @@ class ToolCallFilter:
                 self.buf = self.buf[j + 1:]
                 continue
             name = _tag_name(tag)
+            if name == "tool_result":
+                consumed = self._consume_tool_result()
+                if consumed is None:
+                    return False
+                if consumed:
+                    continue
             if name == "tool_call" or name in self.names:
                 self._open_tag = tag
                 self.open_name = "" if name == "tool_call" else name
@@ -250,6 +257,25 @@ class ToolCallFilter:
                                       ensure_ascii=False)
             self.calls_raw.append(body)
         return True
+
+    def _consume_tool_result(self) -> Optional[bool]:
+        """Убирает поддельный <tool_result>...</tool_result>, написанный моделью.
+        Возвращает True — тег проглочен, False — не tool_result, None — ждём конец тега/блока."""
+        m = re.match(r"<\s*tool_result\b[^>]*>", self.buf, re.I)
+        if not m:
+            return False
+        end = self.buf.lower().find("</tool_result>", m.end())
+        if end < 0:
+            return None
+        self.buf = self.buf[end + len("</tool_result>"):]
+        self.fake_results += 1
+        return True
+
+    def _possible_tool_result(self, tail: str) -> bool:
+        m = re.match(r"^<\s*/?\s*([A-Za-z_][\w-]*)", tail)
+        if m:
+            return "tool_result".startswith(m.group(1).lower())
+        return bool(re.match(r"^<\s*/?\s*$", tail))
 
     def _possible_tag(self, tail: str) -> bool:
         """Похож ли хвост на начало тега известного инструмента (теги приходят по частям)."""

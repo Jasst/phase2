@@ -1012,6 +1012,18 @@ class App:
 
             if not raw_calls:
                 raw_step = "".join(step)
+                if getattr(flt, "fake_results", 0):
+                    emit_step(current, "note", "warning", "Поддельный результат",
+                              "Модель написала <tool_result> сама — игнорирую и прошу сделать настоящий <tool_call>")
+                    messages.append({"role": "assistant", "content": raw_step})
+                    messages.append({"role": "user", "content":
+                                     "Нельзя писать <tool_result> самому. "
+                                     "Чтобы выполнить действие, напиши только <tool_call>{\"name\": ..., \"arguments\": {...}}</tool_call> "
+                                     "и остановись. Если действие уже не нужно — ответь обычным текстом без тегов инструментов."})
+                    bad_streak += 1
+                    emit_step(current, "end", "error", f"Шаг {current} · результаты",
+                              "поддельный <tool_result> без реального вызова")
+                    continue
                 found = find_bare_call_span(raw_step, names)
                 if found is not None:
                     # Голый или обёрнутый в ```json вызов — полноценный вызов инструмента.
@@ -1190,6 +1202,14 @@ class App:
                           "дальше только финальный текстовый ответ — новые вызовы не исполняются")
 
         answer = "".join(parts).strip()
+        # Защита от галлюцинаций протокола: модель написала <tool_result> как текст,
+        # но реальных инструментов в этом ходу не было. Не сохраняем такой ответ.
+        if stop_reason == "model_done" and "<tool_result" in answer.lower() and not trace:
+            stop_reason = "bad_calls"
+            emit_step(1, "note", "warning", "Поддельный результат",
+                      "Модель написала <tool_result> без реального вызова инструмента")
+            parts[:] = []
+            answer = ""
         if stop_reason == "model_done":
             # Причина в трассе должна совпадать с реальным ответом: раньше при любом
             # нормальном финале писалось «без текста», хотя текст уже был показан.
