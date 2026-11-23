@@ -180,6 +180,33 @@
     }
     return out;
   }
+  const MAX_TRACE_STEPS = 40;
+  function mergeStepLists(a, b) {
+    const listA = Array.isArray(a) ? a : [];
+    const listB = Array.isArray(b) ? b : [];
+    if (!listA.length && !listB.length) return null;
+    const out = listA.slice();
+    for (const s of listB) {
+      if (!s || !s.id) continue;
+      const i = out.findIndex((x) => x && x.id === s.id);
+      if (i < 0) out.push({ ...s });
+      else out[i] = { ...out[i], ...s };
+    }
+    return out.length > MAX_TRACE_STEPS ? out.slice(-MAX_TRACE_STEPS) : out;
+  }
+  // Копии одного ответа могут прийти с сервера, из черновика другой вкладки и из
+  // localStorage. Трасса и шаги не должны теряться, если «короткая» копия побеждает
+  // при склейке по тексту — собираем их из обеих версий.
+  function mergeMessageCopies(prev, next, preferNext) {
+    const out = { ...(preferNext ? next : prev) };
+    const steps = mergeStepLists(prev.steps, next.steps);
+    if (steps) out.steps = steps;
+    const trace = { ...(prev.trace || {}), ...(next.trace || {}) };
+    if (Object.keys(trace).length) out.trace = trace;
+    const imgs = mergeImages(prev.images, next.images);
+    if (imgs.length) out.images = imgs;
+    return out;
+  }
   function dedupeMessages(list) {
     if (!Array.isArray(list)) return list;
     const seen = new Map(); // ключ → индекс в out, чтобы обновить готовое сообщение картинкой
@@ -188,20 +215,19 @@
       if (!m || typeof m !== 'object') continue;
       // Пустой ответ-артефакт от старого параллельного стрима: только метка очереди.
       if (m.role === 'assistant' && !m.pending && !m.text && !m.reasoning &&
-          !(m.tools || []).length && !(m.sources || []).length && !(m.images || []).length &&
+          !(m.tools || []).length && !(m.steps || []).length && !m.trace &&
+          !(m.sources || []).length && !(m.images || []).length &&
           (m.indexPending || (!m.error && !m.note))) continue;
       m.time = normalizeTime(m.time);
       const key = m.id ? 'id:' + m.id
         : 'ct:' + (m.role || '') + '|' + m.time + '|' + String(m.text || '');
       const known = seen.get(key);
       if (known !== undefined) {
-        // Тот же id, но сообщение могло позже заполниться текстом/картинкой.
+        // Тот же id, но сообщение могло позже заполниться текстом/картинкой/трассой.
         const prev = out[known];
-        const imgs = mergeImages(prev.images, m.images);
         const longer = String(m.text || '').length > String(prev.text || '').length ||
           (!prev.text && m.text);
-        if (imgs.length) out[known] = { ...(longer ? m : prev), images: imgs };
-        else if (longer) out[known] = m;
+        out[known] = mergeMessageCopies(prev, m, longer);
         continue;
       }
       // Следствие старого реаттача: один и тот же ответ под разными id, созданными
@@ -214,14 +240,9 @@
           Math.abs(p.time - m.time) < 600000);
         if (twin) {
           const idx = out.indexOf(twin);
-          const imgs = mergeImages(twin.images, m.images);
           const longer = String(m.text || '').length > String(twin.text || '').length ||
             (!twin.text && m.text);
-          if (imgs.length) {
-            out[idx] = { ...(longer ? m : twin), images: imgs };
-          } else if (longer) {
-            out[idx] = m;
-          }
+          out[idx] = mergeMessageCopies(twin, m, longer);
           continue;
         }
       }
@@ -513,7 +534,8 @@
           cur.push({ ...rm });
           changed = true;
         } else if (!rm.pending && (cur[i].pending || (rm.time || 0) >= normalizeTime(cur[i].time || 0))) {
-          cur[i] = { ...rm };
+          // Сервер мог прислать ответ без steps/trace — сохранённую трассу не выбрасываем.
+          cur[i] = mergeMessageCopies(cur[i], rm, true);
           changed = true;
         }
       }
@@ -597,7 +619,7 @@
       }
       if (!bot) {
         bot = { id: j.assistant_msg_id || newId(), role: 'assistant', text: '', reasoning: '',
-                time: Date.now(), pending: true, tools: [], sources: [], images: [] };
+                time: Date.now(), pending: true, tools: [], steps: [], sources: [], images: [] };
         const userIdx = j.user_msg_id ? list.findIndex((m) => m && m.id === j.user_msg_id) : -1;
         if (userIdx >= 0) { list.splice(userIdx + 1, 0, bot); idx = userIdx + 1; }
         else { list.push(bot); idx = list.length - 1; }
@@ -612,6 +634,7 @@
         if (typeof ev.token === 'string') { bot.text += ev.token; addMetricsText(ev.token); schedulePaint(bot, idx); }
         if (typeof ev.reasoning === 'string') { bot.reasoning += ev.reasoning; schedulePaint(bot, idx); }
         if (ev.tool) { upsertTool(bot, ev.tool); schedulePaint(bot, idx); }
+        if (ev.step) { upsertStep(bot, ev.step); schedulePaint(bot, idx); }
         if (Array.isArray(ev.todo)) { bot.todos = ev.todo; schedulePaint(bot, idx); }
         if (ev.trace) { bot.trace = { ...(bot.trace || {}), ...ev.trace }; schedulePaint(bot, idx); }
         if (Array.isArray(ev.sources)) { addSources(bot, ev.sources); schedulePaint(bot, idx); }
@@ -1251,6 +1274,10 @@
     model_done: 'ответ готов', round_limit: 'лимит шагов', call_limit: 'лимит вызовов',
     failures: 'ошибки инструментов', no_progress: 'нет прогресса', cancelled: 'остановлено',
   };
+  const STEP_PHASE_LABEL = { start: 'начало', end: 'итоги', final: 'финал', note: 'заметка' };
+  const STEP_STATE_LABEL = { running: 'выполняется', done: 'готово', error: 'ошибка', warning: 'внимание' };
+  const STEP_CALL_STATUS = { ok: 'готово', done: 'готово', success: 'готово', error: 'ошибка',
+                             fail: 'ошибка', running: 'выполняется', warning: 'внимание', skipped: 'пропущено' };
   function traceKind(name) {
     for (const [kind, names] of Object.entries(TRACE_GROUP)) if (names.includes(name)) return kind;
     return 'tool';
@@ -1298,30 +1325,99 @@
     card.append(body);
     return card;
   }
+  function stepBudgetText(b) {
+    if (!b || typeof b !== 'object') return '';
+    const parts = [];
+    if (b.round || b.max_rounds) parts.push('шаг ' + (b.round || 0) + '/' + (b.max_rounds || '—'));
+    if (b.calls || b.max_calls) parts.push('вызовов ' + (b.calls || 0) + '/' + (b.max_calls || '—'));
+    return parts.join(' · ');
+  }
+  function renderStepCall(c) {
+    const st = String(c.status || '');
+    const row = el('div', 'step-call ' + st);
+    const head = el('div', 'step-call-head');
+    head.append(el('span', 'step-call-name', c.name || 'инструмент'));
+    if (st) head.append(el('span', 'step-call-status', STEP_CALL_STATUS[st] || st));
+    if (c.chars !== undefined && c.chars !== null) {
+      head.append(el('span', 'step-call-size', c.chars + ' симв.'));
+    }
+    if (c.truncated) head.append(el('span', 'step-call-truncated', 'обрезано'));
+    row.append(head);
+    if (c.args) row.append(el('pre', 'step-call-args', String(c.args)));
+    if (c.error) row.append(el('div', 'step-call-error', String(c.error)));
+    return row;
+  }
+  function renderStepCard(s) {
+    const phase = s.phase || 'start';
+    const state = s.state || 'running';
+    const card = el('details', 'trace-step-card ' + state + ' step-phase-' + phase);
+    const id = 'step:' + (s.id || ((s.round || 0) + ':' + phase));
+    card.open = state === 'error' || openTraceCards.has(id);
+    card.addEventListener('toggle', () => {
+      if (card.open) openTraceCards.add(id); else openTraceCards.delete(id);
+    });
+    const sum = el('summary', 'card-sum');
+    sum.append(el('span', 'step-phase', STEP_PHASE_LABEL[phase] || phase));
+    sum.append(el('span', 'card-label', s.label || 'Шаг ' + (s.round || '')));
+    sum.append(el('span', 'step-state', state === 'done' ? '✓' : (state === 'error' ? '✕' :
+      (state === 'warning' ? '!' : ''))));
+    if (s.ms) sum.append(el('span', 'card-ms', fmtMs(s.ms)));
+    if (state === 'running') sum.title = STEP_STATE_LABEL[state];
+    card.append(sum);
+    const body = el('div', 'card-body');
+    if (s.detail) body.append(el('div', 'card-detail', s.detail));
+    else if (state === 'running') body.append(el('div', 'card-detail muted', 'выполняется…'));
+    if (s.budget) {
+      const budget = stepBudgetText(s.budget);
+      if (budget) body.append(el('div', 'step-budget', budget));
+    }
+    if (phase === 'final') {
+      const reason = s.stop ? (STOP_LABEL[s.stop] || s.stop) : (s.detail || 'не указана');
+      body.append(el('div', 'step-final-note', 'Причина останова: ' + reason));
+    }
+    if (Array.isArray(s.calls) && s.calls.length) {
+      const calls = el('div', 'step-calls');
+      for (const c of s.calls) if (c) calls.append(renderStepCall(c));
+      body.append(calls);
+    }
+    card.append(body);
+    return card;
+  }
   function renderTrace(m) {
     const tools = Array.isArray(m.tools) ? m.tools : [];
     const todos = Array.isArray(m.todos) ? m.todos : [];
-    if (!tools.length && !todos.length) return null;
+    const stepMsgs = Array.isArray(m.steps) ? m.steps : [];
+    if (!tools.length && !todos.length && !stepMsgs.length) return null;
     const trace = m.trace || {};
     const wrap = el('div', 'trace' + (m.pending ? ' live' : ''));
     const totalMs = tools.reduce((a, t) => a + (t.ms || 0), 0);
-    const steps = Math.max(trace.round || 0, ...tools.map((t) => t.step || 0));
+    const stepCount = Math.max(trace.round || 0,
+      ...stepMsgs.map((s) => (s && s.round) || 0), ...tools.map((t) => t.step || 0));
     const head = el('div', 'trace-head');
     head.append(el('span', 'trace-title', 'Ход работы'));
     const meta = [];
-    if (steps) meta.push('шагов ' + steps);
+    if (stepCount) meta.push('шагов ' + stepCount);
     meta.push('инструментов ' + tools.length);
     if (totalMs) meta.push(fmtMs(totalMs));
     head.append(el('span', 'trace-meta', meta.join(' · ')));
+    const budget = stepBudgetText(trace.budget);
+    if (budget) head.append(el('span', 'step-budget', budget));
     if (trace.stop) head.append(el('span', 'trace-stop stop-' + trace.stop, STOP_LABEL[trace.stop] || trace.stop));
     else if (m.pending) head.append(el('span', 'trace-stop running', 'выполняется'));
+    if (trace.reason) head.append(el('span', 'step-reason', trace.reason));
     wrap.append(head);
     if (todos.length) wrap.append(renderPlan(todos));
     const groups = new Map();
-    for (const t of tools) {
-      const key = t.step || 0;
+    function groupOf(key) {
       if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(t);
+      return groups.get(key);
+    }
+    // Шаги идут первыми в своём раунде: сначала карточка шага, затем вызовы.
+    for (const s of stepMsgs) {
+      if (s) groupOf(s.round || 0).push({ step: s });
+    }
+    for (const t of tools) {
+      groupOf(t.step || 0).push({ tool: t });
     }
     if (groups.size) {
       const list = el('ol', 'trace-steps');
@@ -1329,9 +1425,11 @@
         const li = el('li', 'trace-step');
         li.append(el('span', 'step-dot'));
         const body = el('div', 'step-body');
-        body.append(el('div', 'step-label', key ? 'Шаг ' + key : 'Инструменты'));
+        body.append(el('div', 'step-label', key ? 'Шаг ' + key : (stepMsgs.length ? 'Служебные' : 'Инструменты')));
         const cards = el('div', 'trace-cards');
-        for (const t of items) cards.append(renderCard(t));
+        for (const item of items) {
+          cards.append(item.step ? renderStepCard(item.step) : renderCard(item.tool));
+        }
         body.append(cards);
         li.append(body);
         list.append(li);
@@ -1347,6 +1445,14 @@
     const cur = bot.tools.find((x) => x.id === t.id);
     if (cur) Object.assign(cur, t);
     else bot.tools.push({ ...t });
+  }
+  function upsertStep(bot, s) {
+    if (!s || !s.id) return;
+    if (!Array.isArray(bot.steps)) bot.steps = [];
+    const cur = bot.steps.find((x) => x && x.id === s.id);
+    if (cur) Object.assign(cur, s);
+    else bot.steps.push({ ...s });
+    if (bot.steps.length > MAX_TRACE_STEPS) bot.steps.splice(0, bot.steps.length - MAX_TRACE_STEPS);
   }
   function addSources(bot, list) {
     if (!Array.isArray(bot.sources)) bot.sources = [];
@@ -1435,11 +1541,11 @@
       s.title = text.replace(/\s+/g, ' ').slice(0, 48);
     }
     const user = reuse ? reuse.user : { id: newId(), role: 'user', text, time: Date.now() };
-    const bot = reuse ? reuse.bot : { id: newId(), role: 'assistant', text: '', reasoning: '', time: Date.now(), pending: true, tools: [], sources: [], images: [] };
+    const bot = reuse ? reuse.bot : { id: newId(), role: 'assistant', text: '', reasoning: '', time: Date.now(), pending: true, tools: [], steps: [], sources: [], images: [] };
     if (reuse) {
       // Перегенерация переиспользует id: сервер перезапишет прежний ответ,
       // а не сохранит его второй копией.
-      bot.text = ''; bot.reasoning = ''; bot.tools = []; bot.sources = [];
+      bot.text = ''; bot.reasoning = ''; bot.tools = []; bot.steps = []; bot.trace = null; bot.sources = [];
       bot.pending = true; bot.error = null; bot.note = ''; bot.indexPending = 0;
       bot.time = Date.now();
       delete bot.gen;
@@ -1476,6 +1582,7 @@
         if (typeof ev.token === 'string') { bot.text += ev.token; addMetricsText(ev.token); schedulePaint(bot, botIdx); }
         if (typeof ev.reasoning === 'string') { bot.reasoning += ev.reasoning; schedulePaint(bot, botIdx); }
         if (ev.tool) { upsertTool(bot, ev.tool); schedulePaint(bot, botIdx); }
+        if (ev.step) { upsertStep(bot, ev.step); schedulePaint(bot, botIdx); }
         if (Array.isArray(ev.todo)) { bot.todos = ev.todo; schedulePaint(bot, botIdx); }
         if (ev.trace) { bot.trace = { ...(bot.trace || {}), ...ev.trace }; schedulePaint(bot, botIdx); }
         if (Array.isArray(ev.sources)) { addSources(bot, ev.sources); schedulePaint(bot, botIdx); }
@@ -1504,6 +1611,9 @@
       if (bot.pending) bot.pending = false;
       for (const t of bot.tools || []) {
         if (t.status === 'running') t.status = finished ? 'done' : 'error';
+      }
+      for (const s of bot.steps || []) {
+        if (s.state === 'running') s.state = finished ? 'done' : 'error';
       }
       if (!finished && !bot.error && !bot.note) bot.note = 'Поток завершён';
       if (!bot.text && !bot.error && !bot.note) bot.note = 'Пустой ответ';

@@ -256,12 +256,16 @@ def test_neuron_tools_dedupe_recombine_edit_and_forget(tmp_path, monkeypatch):
     assert not any(f["s"] == "Нел" or f["o"] == "Нел" for f in app.memory.list_facts(50))
 
 
-def test_model_choice_follows_loaded_and_active_model(tmp_path, monkeypatch):
+def test_model_choice_is_stable_and_only_explicit(tmp_path, monkeypatch):
     app = _app(tmp_path, monkeypatch, [["ok"]])
+    # Даже если в LM Studio загружена другая модель, приложение не «подхватывает» её.
     app.backend.refresh_loaded = lambda: "loaded-in-lmstudio"
-    assert app.default_rel() == "loaded-in-lmstudio"   # не дёргаем модель из .env
+    assert app.default_rel() == ""
+    assert app.model_id() == "local"
     app.active_model = "explicit/model"
     assert app.model_id() == "explicit/model"          # экстракция идёт моделью чата
+    assert app.resolve_model("user/choice") == "user/choice"
+    assert app.model_id() == "explicit/model"          # явная модель для операции не меняет глобальный выбор
 
 
 def _run(app, message, web=False, chat_id="c1"):

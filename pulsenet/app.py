@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import queue
@@ -25,7 +26,7 @@ from .memory_service import build_encoder
 from .triplex import TriplexMemory, make_extractor, openai_chat_caller
 from .triplex import sleep
 from .toolcalls import (COMMANDS, MAX_CALLS_PER_STEP, ToolCallFilter, agent_limits,
-                         parse_calls, parse_command, tool_result_block)
+                         compact_model_text, parse_calls, parse_command, tool_result_block)
 from .tools import SEQUENTIAL_TOOLS, SUBAGENT_DENY, ChatTools, Outcome, catalog, instructions
 from .unified_mcp.store import IdentityStore
 from .tts import SileroTTS
@@ -95,6 +96,24 @@ def _preview(text: str, limit: int = 600) -> str:
     """Короткий кусок результата инструмента для раскрытия карточки в интерфейсе."""
     text = str(text or "").strip()
     return text if len(text) <= limit else text[:limit] + " …"
+
+
+def _fit_text(text: str, cap: int) -> str:
+    """Сократить длинный системный блок, сохранив начало (персону) и конец (протокол)."""
+    text = str(text or "")
+    if len(text) <= cap or cap < 120:
+        return text
+    head = cap // 3
+    tail = cap - head - 48
+    return text[:head] + "\n…(сокращено для контекста)…\n" + text[-tail:]
+
+
+def _args_preview(args: dict, limit: int = 140) -> str:
+    try:
+        raw = json.dumps(args or {}, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        raw = str(args or "")
+    return _preview(raw, limit)
 
 
 def _parse_json_loose(raw: str) -> dict:
@@ -184,30 +203,33 @@ class App:
     # ---------- память ----------
 
     def default_rel(self) -> str:
+        """Статичный default из настроек — НЕ «первая загруженная модель» в LM Studio.
+
+        Опрос LM Studio здесь запрещён: другой процесс/агент может загрузить свою модель,
+        и выбор в чате начал бы «прыгать» без участия пользователя. Модель меняется только
+        явным выбором в интерфейсе (поле model) или значением в .env.
+        """
         if self.backend.name == "llamacpp":
             return self.env.get("LLAMACPP_DEFAULT_MODEL", "").strip()
-        # LM Studio: если пользователь выбрал модель в интерфейсе LM Studio, не дёргаем
-        # модель из .env — лишняя загрузка вытесняет из памяти эмбеддинги.
-        refresh = getattr(self.backend, "refresh_loaded", None)
-        if callable(refresh):
-            try:
-                loaded = refresh()
-                if loaded:
-                    return loaded
-            except Exception:                # noqa: BLE001 — LM Studio может быть недоступен
-                pass
         return self.env.get("LMSTUDIO_MODEL", "").strip()
 
+    def resolve_model(self, model: str = "") -> str:
+        """Приоритет: явный выбор пользователя → модель последнего чата → default из .env."""
+        return ((model or "").strip() or (self.active_model or "").strip()
+                or self.default_rel())
+
     def model_id(self) -> str:
-        """Идентификатор модели для запроса. Запускает бэкенд при необходимости."""
-        with self.backend_lock:
-            target = (self.active_model or "").strip() or self.default_rel()
-            return self.backend.ensure(target) or target or "local"
+        """Идентификатор выбранной модели без смены выбора и без ensure.
+
+        Загрузку/перезапуск бэкенда делает только chat(): фоновые операции с памятью
+        не должны перезагружать модель и вытеснять эмбеддинги.
+        """
+        return self.resolve_model() or "local"
 
     def extraction_model(self) -> str:
         """Модель для записи фактов/дистилляции: без ensure — память не должна падать,
         если модель временно недоступна (документ всё равно сохраняется)."""
-        return (self.active_model or "").strip() or self.default_rel() or "local"
+        return self.resolve_model() or "local"
 
     def _make_encoder(self, data_dir: str):
         """Эмбеддер — см. memory_service.build_encoder (общий с MCP-сервером)."""
@@ -335,14 +357,10 @@ class App:
                model: str = "") -> dict:
         """Единая точка записи: сбой экстракции не исключение, а статус — и он попадает в журнал ошибок.
 
-        model — модель чата, которой извлекаются факты. Явно указанная (например, из веба)
-        становится active_model; иначе берётся последняя использованная / загруженная в LM Studio.
+        model — модель чата, которой извлекаются факты. Явно указанная действует только
+        на эту запись: глобальный выбор модели меняется исключительно в chat().
         """
-        target = (model or "").strip()
-        if target:
-            with self.backend_lock:
-                self.active_model = target
-        resolved = self.extraction_model()
+        resolved = self.resolve_model(model)
         # Локальная память уже вызывает model_id() в своём экстракторе; MCP — отдельный процесс,
         # ему модель надо передать явно.
         extra = {"model": resolved} if self.memory_backend == "mcp" else {}
@@ -412,16 +430,30 @@ class App:
         if ins:
             system += "\n\n" + ins
         messages: List[dict] = [{"role": "system", "content": system}, {"role": "user", "content": task}]
-        target = self.active_model or self.default_rel()
+        target = self.resolve_model()
+        # Кастомные бэкенды в тестах могут не принимать max_tokens — не ломаем их.
+        try:
+            sp = inspect.signature(self.backend.stream).parameters
+        except (TypeError, ValueError):
+            sp = {}
+        stream_kwargs = ({"max_tokens": lim["agent_max_tokens"]}
+                         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sp.values())
+                         or "max_tokens" in sp else {})
 
         def sub_delta(kind, payload):
             if kind == "tool" and isinstance(payload, dict):
                 payload = {**payload, "sub": sid}
             on_delta(kind, payload)
 
+        def emit_sub_step(phase: str, state: str, label: str, detail: str) -> None:
+            on_delta("step", {"id": f"{sid}-r{rnd + 1}", "round": 0, "phase": phase,
+                              "state": state, "label": label, "detail": detail, "sub": sid})
+
         calls = 0
         final = ""
         for rnd in range(lim["sub_rounds"] + 1):
+            emit_sub_step("start", "running", f"Субагент · шаг {rnd + 1}",
+                          f"подзадача: {_preview(task, 120)}")
             flt = ToolCallFilter()
             visible: List[str] = []
 
@@ -430,11 +462,13 @@ class App:
                     visible.append(flt.feed(text))
 
             with self._llm_slot:
-                self.backend.stream(target, messages, tok, cancelled=cancelled)
+                self.backend.stream(target, messages, tok, cancelled=cancelled, **stream_kwargs)
             visible.append(flt.finish())
             text = "".join(visible).strip()
             raw = flt.calls_raw[: lim["calls_per_step"]]
             if not raw or rnd == lim["sub_rounds"] or cancelled():
+                emit_sub_step("end", "done", f"Субагент · шаг {rnd + 1}",
+                              f"итог: {_preview(text, 140) or 'без текста'}")
                 final = text
                 break
             messages.append({"role": "assistant",
@@ -451,13 +485,15 @@ class App:
                                          f"Доступны: {', '.join(allowed) or 'нет'}.",
                                   label="Инструмент", detail=name)
                     sub_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "error",
-                                       "step": getattr(self, "_agent_step", 0),
+                                       "step": rnd + 1,
                                        "label": f"Нет доступа у субагента: {name}",
                                        "detail": "субагенту не разрешено", "preview": ""})
                 else:
-                    out = self._call_tool(tools, name, args, sub_delta)
+                    out = self._call_tool(tools, name, args, sub_delta, step=rnd + 1)
                 blocks.append(tool_result_block(name, out.text, lim["result_chars"]))
             messages.append({"role": "user", "content": "\n".join(blocks)})
+            emit_sub_step("end", "done", f"Субагент · шаг {rnd + 1}",
+                          f"вызовов: {len(raw)}, результатов: {len(blocks)}")
         return Outcome(True, final or "Субагент не дал ответа.", label=f"Субагент: «{_preview(task, 60)}»",
                        detail=f"вызовов: {calls}")
 
@@ -533,11 +569,11 @@ class App:
         with self.history_lock:
             self.history.setdefault(chat_id or "default", []).append({"role": role, "content": content})
 
-    def _call_tool(self, tools: ChatTools, name: str, args: dict, on_delta) -> Outcome:
+    def _call_tool(self, tools: ChatTools, name: str, args: dict, on_delta, step: int = 0) -> Outcome:
         """Исполняет инструмент и сообщает интерфейсу о ходе: running → done/error, источники.
-        step — номер раунда агента; ms — длительность; preview — что вернулось (для раскрытия в UI)."""
+        step — номер раунда конкретного хода (не глобальный атрибут приложения);
+        ms — длительность; preview — что вернулось (для раскрытия в UI)."""
         cid = "t" + uuid.uuid4().hex[:8]
-        step = getattr(self, "_agent_step", 0)     # номер раунда ставит цикл chat()
         started = time.monotonic()
         on_delta("tool", {"id": cid, "name": name, "status": "running", "step": step,
                           "label": tools.describe(name, args)})
@@ -553,24 +589,25 @@ class App:
             on_delta("image", out.image)
         return out
 
-    def _run_command(self, name: str, arg: str, tools: ChatTools, on_delta, chat_id: str) -> dict:
+    def _run_command(self, name: str, arg: str, tools: ChatTools, on_delta, chat_id: str,
+                     step: int = 0) -> dict:
         """Команды выполняются приложением: модели передаётся готовый результат."""
         if not arg:
             return {"reply": COMMANDS[name]["usage"]}
         if name == "search":
-            out = self._call_tool(tools, "web_search", {"queries": [arg]}, on_delta)
+            out = self._call_tool(tools, "web_search", {"queries": [arg]}, on_delta, step=step)
             return {"user": f"Найди в интернете и ответь по источникам: {arg}",
                     "note": tool_result_block("web_search", out.text)}
         if name == "fetch":
-            out = self._call_tool(tools, "web_fetch", {"url": arg}, on_delta)
+            out = self._call_tool(tools, "web_fetch", {"url": arg}, on_delta, step=step)
             return {"user": f"Что на странице {arg}? Ответь по её содержимому.",
                     "note": tool_result_block("web_fetch", out.text)}
         if name == "memory":
-            out = self._call_tool(tools, "memory_search", {"query": arg}, on_delta)
+            out = self._call_tool(tools, "memory_search", {"query": arg}, on_delta, step=step)
             return {"user": f"Что известно из памяти по теме: {arg}",
                     "note": tool_result_block("memory_search", out.text)}
         if name == "remember":
-            out = self._call_tool(tools, "memory_remember", {"text": arg}, on_delta)
+            out = self._call_tool(tools, "memory_remember", {"text": arg}, on_delta, step=step)
             return {"user": f"Запомни: {arg}", "note": tool_result_block("memory_remember", out.text)}
         return {"reply": COMMANDS[name]["usage"]}
 
@@ -596,14 +633,54 @@ class App:
         on_delta(kind, payload):
           'token' / 'reasoning' — текст ответа и рассуждений (str);
           'tool'    — ход инструмента (dict: id, name, status, label, detail);
-          'sources' — найденные источники (list: n, title, url, snippet).
+          'step'    — шаг агента (start/end/final/note) с бюджетом и пояснением;
+          'trace'   — сводка хода: раунды, вызовы, ошибки, причина останова.
         web — разрешить веб-инструменты в этом ходе; model — модель для этого ответа
         (пусто — модель по умолчанию из настроек). Возвращает итоговый текст ответа.
         """
-        self.stop_flag = False
-
+        # stop_flag — глобальный аварийный выключатель; пер-чатовая отмена приходит
+        # через cancelled(). Раньше флаг сбрасывался в начале каждого хода и мог
+        # отменить соседний чат.
         def is_cancelled() -> bool:
             return bool(cancelled and cancelled()) or self.stop_flag
+
+        lim = self.limits
+        per_step = lim["calls_per_step"]
+        max_rounds = lim["max_rounds"]
+        max_calls = lim["max_calls"]
+        reflection = lim["reflection_budget"]
+        rounds = calls_used = failures = stuck = dup_stuck = 0
+        seen_calls: Dict[str, str] = {}
+        trace: List[str] = []
+        stop_reason = "model_done"
+        fit_notes: List[str] = []
+        run_id = uuid.uuid4().hex[:6]
+        step_id = [""]
+
+        def budget() -> dict:
+            return {"round": rounds, "max_rounds": max_rounds,
+                    "calls": calls_used, "max_calls": max_calls,
+                    "remaining_rounds": max(0, max_rounds - rounds),
+                    "remaining_calls": max(0, max_calls - calls_used)}
+
+        def emit_step(round_no: int, phase: str, state: str, label: str, detail: str,
+                      sid: str = "", **extra) -> None:
+            if phase == "start":
+                step_id[0] = sid or f"s{run_id}-{round_no}"
+            payload = {"id": sid or step_id[0] or f"s{run_id}-{round_no}", "round": round_no,
+                       "phase": phase, "state": state, "label": label, "detail": detail,
+                       "budget": budget()}
+            payload.update(extra)
+            on_delta("step", payload)
+
+        def emit_trace(state: str, stop: str = "", reason: str = "") -> None:
+            payload = {"round": rounds, "calls": calls_used, "failures": failures,
+                       "state": state, "budget": budget()}
+            if stop:
+                payload["stop"] = stop
+            if reason:
+                payload["reason"] = reason
+            on_delta("trace", payload)
 
         # Инструменты: локальные + динамический каталог MCP (image_generate, triplex_*, ...).
         mcp_specs = self._mcp_tool_specs()
@@ -648,28 +725,33 @@ class App:
             system.append(mem)
         if names:
             system.append(instructions(names, specs))
-        messages: List[dict] = [{"role": "system", "content": "\n\n".join(system)}] if system else []
+        system_text = "\n\n".join(system)
+        if len(system_text) > lim["system_max"]:
+            before = len(system_text)
+            system_text = _fit_text(system_text, lim["system_max"])
+            fit_notes.append(f"системный контекст сокращён: {before} → {len(system_text)} симв.")
+        messages: List[dict] = [{"role": "system", "content": system_text}] if system_text else []
         messages += self._history(chat_id)
         content = user_text + ("\n\n" + note if note else "")
         messages.append({"role": "user", "content": content})
+        # История — самое дешёвое, что можно убрать без потери текущего вопроса.
+        size = sum(len(str(m.get("content") or "")) for m in messages)
+        while size > lim["context_max"] and len(messages) > 2:
+            dropped = messages.pop(1)
+            size -= len(str(dropped.get("content") or ""))
+            fit_notes.append("самая старая реплика истории убрана из запроса")
+        for notice in fit_notes:
+            emit_step(0, "note", "warning", "Контекст", notice)
 
-        target = (model or "").strip() or self.default_rel()
+        # Единственное место, где выбор модели меняется: явный model из запроса
+        # (пользователь выбрал в интерфейсе) или стабильный default из настроек.
+        target = self.resolve_model(model)
         with self.backend_lock:
             rel = self.backend.ensure(target) or target or "local"
-            self.active_model = rel      # экстрактор/индексация используют ту же модель, не грузят вторую
+            if target:                   # пустой выбор не «залипает» как псевдомодель
+                self.active_model = rel  # экстрактор/индексация используют ту же модель, не грузят вторую
 
         # 3) агентный цикл: запрос → инструменты → реакт → инструменты → ... → ответ.
-        # Лимиты из env; один вызов инструмента не занимает больше result_chars контекста.
-        lim = self.limits
-        per_step = lim["calls_per_step"]
-        max_rounds = lim["max_rounds"]
-        hard_cap = lim["hard_cap"]
-        max_calls = lim["max_calls"]
-        reflection = lim["reflection_budget"]
-        rounds = calls_used = failures = stuck = 0
-        seen_calls: Dict[str, str] = {}
-        trace: List[str] = []
-        stop_reason = "model_done"
         # Нативный function calling — опция (TOOL_NATIVE=1). По умолчанию текстовый протокол:
         # локальные 26B-модели часто не умеют tool_calls, а llm.py при HTTP 400 откатывается.
         native_tools = None
@@ -680,90 +762,207 @@ class App:
                 "parameters": (specs.get(n) or {}).get("parameters") or {"type": "object", "properties": {}},
             }} for n in names[:lim["native_max"]]]
 
+        FINAL_REASONS = {
+            "round_limit": "Достигнут лимит шагов — отвечаю по собранным результатам.",
+            "call_limit": "Достигнут лимит вызовов инструментов — отвечаю по собранным результатам.",
+            "no_progress": "Инструменты повторяются без прогресса — отвечаю по собранным результатам.",
+            "failures": "Инструменты вернули несколько ошибок — отвечаю по собранным результатам.",
+            "cancelled": "Ответ остановлен.",
+            "llm_error": "Модель не ответила: проверь, что LM Studio или llama.cpp запущены и модель загружена.",
+            "model_done": "Модель завершила ход без текста — показываю собранные результаты.",
+        }
+
+        def make_sink(flt: ToolCallFilter, buf: List[str], native_buf: List[dict], flags: dict):
+            def sink(kind, payload):
+                if kind == "token":
+                    visible = flt.feed(payload)
+                    if visible:
+                        buf.append(visible)
+                        emit_text(visible)
+                elif kind == "native_tool_calls":
+                    native_buf.extend(payload)
+                elif kind == "native_unsupported":
+                    flags["native_unsupported"] = True
+                else:
+                    on_delta(kind, payload)
+            return sink
+
+        # Тестовые/кастомные бэкенды могут иметь более узкую сигнатуру stream(),
+        # чем OpenAICompat. Не ломаем их: передаём только поддерживаемые аргументы.
+        try:
+            stream_params = inspect.signature(self.backend.stream).parameters
+        except (TypeError, ValueError):
+            stream_params = {}
+        has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in stream_params.values())
+
+        def supported(name: str) -> bool:
+            return has_kwargs or name in stream_params
+
+        def tool_accepts_step() -> bool:
+            # _call_tool могут подменить в тестах более узкой сигнатурой.
+            try:
+                params = inspect.signature(self._call_tool).parameters
+            except (TypeError, ValueError):
+                return True
+            return ("step" in params or
+                    any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()))
+
+        def stream_once(msgs, tool_list, sink, flt, buf, native_buf, flags) -> Optional[llm.BackendError]:
+            err: Optional[llm.BackendError] = None
+            for attempt in range(LLM_RETRIES + 1):
+                try:
+                    kwargs = {"cancelled": is_cancelled}
+                    if supported("max_tokens"):
+                        kwargs["max_tokens"] = lim["agent_max_tokens"]
+                    if tool_list and supported("tools"):
+                        kwargs["tools"] = tool_list
+                    self.backend.stream(rel, msgs, sink, **kwargs)
+                    if getattr(self.backend, "last_native_unsupported", False):
+                        flags["native_unsupported"] = True
+                    err = None
+                    break
+                except llm.BackendError as exc:
+                    err = exc
+                    # Повторяем, только если пользователь ещё ничего не увидел.
+                    if buf or native_buf or flt.calls_raw or is_cancelled() or attempt == LLM_RETRIES:
+                        break
+                    time.sleep(LLM_RETRY_DELAY * (attempt + 1))
+            return err
+
         while True:
+            if is_cancelled():
+                stop_reason = "cancelled"
+                break
+
+            # Причина финала определяется ДО запроса к модели: последний вызов
+            # всегда делается с явной просьбой дать текст, а не с выбрасыванием tool_call.
+            force_stop = ""
+            if failures >= 4:
+                force_stop = "failures"
+            elif dup_stuck >= 2:
+                # Дубли внутри одного шага — чистая трата бюджета: останавливаемся сразу.
+                force_stop = "no_progress"
+            elif rounds >= max_rounds:
+                # Повтор одного и того же вызова из раунда в раунд не обрываем досрочно:
+                # модель может getDifferentText и закончить. Но причину останова уточняем.
+                force_stop = "no_progress" if stuck >= 2 else "round_limit"
+            elif calls_used >= max_calls:
+                force_stop = "no_progress" if stuck >= 2 else "call_limit"
+
+            if force_stop:
+                stop_reason = force_stop
+                reason = FINAL_REASONS[force_stop]
+                emit_step(rounds + 1, "start", "running", "Финальный ответ", reason,
+                          sid=f"s{run_id}-final")
+                final_messages = list(messages)
+                final_messages.append({"role": "user", "content":
+                                       reason + " Ответь ТОЛЬКО текстом, без вызовов инструментов."})
+                flt = ToolCallFilter()
+                buf: List[str] = []
+                native: List[dict] = []
+                flags: dict = {}
+                err = stream_once(final_messages, None, make_sink(flt, buf, native, flags),
+                                  flt, buf, native, flags)
+                tail = flt.finish()
+                if tail:
+                    buf.append(tail)
+                    emit_text(tail)
+                if err is not None:
+                    self.log_error("модель", err)
+                    stop_reason = "llm_error"
+                    emit_step(rounds + 1, "end", "error", "Финальный ответ", str(err)[:300])
+                    break
+                if flt.calls_raw or native:
+                    emit_step(rounds + 1, "note", "warning", "Финальный ответ",
+                              "Модель предложила инструменты на финальном шаге — они не выполнялись")
+                emit_step(rounds + 1, "final", "done", "Финальный ответ",
+                          f"итог: {_preview(''.join(buf), 140) or 'пусто'}",
+                          stop=stop_reason, reason=FINAL_REASONS.get(stop_reason, ""))
+                break
+
+            current = rounds + 1
+            started = time.monotonic()
+            ctx_size = sum(len(str(m.get("content") or "")) for m in messages)
+            emit_step(current, "start", "running", f"Шаг {current} · модель",
+                      f"контекст ~{ctx_size} симв.; лимит генерации {lim['agent_max_tokens']} токенов")
             flt = ToolCallFilter()
             step: List[str] = []
             native: List[dict] = []
-
-            def delta(kind, text, flt=flt, step=step, native=native):
-                if kind == "token":
-                    visible = flt.feed(text)
-                    if visible:
-                        step.append(visible)
-                        emit_text(visible)
-                elif kind == "native_tool_calls":
-                    native.extend(text)
-                else:
-                    on_delta(kind, text)
-
-            stream_err = None
-            for attempt in range(LLM_RETRIES + 1):
-                try:
-                    if native_tools:
-                        self.backend.stream(rel, messages, delta, cancelled=is_cancelled, tools=native_tools)
-                    else:
-                        self.backend.stream(rel, messages, delta, cancelled=is_cancelled)
-                    stream_err = None
-                    break
-                except llm.BackendError as exc:
-                    stream_err = exc
-                    # повторяем, только если пользователь ещё ничего не увидел и ход не отменён
-                    if step or native or flt.calls_raw or is_cancelled() or attempt == LLM_RETRIES:
-                        break
-                    time.sleep(LLM_RETRY_DELAY * (attempt + 1))
-            if stream_err is not None:
-                self.log_error("модель", stream_err)
-                stop_reason = "llm_error"
-                break
+            flags: dict = {}
+            err = stream_once(messages, native_tools, make_sink(flt, step, native, flags),
+                              flt, step, native, flags)
+            if flags.get("native_unsupported") and native_tools:
+                native_tools = None       # sticky на весь ход: не шлём tools каждый раунд
+                emit_step(current, "note", "warning", "Function calling",
+                          "Сервер отклонил схемы tools — перешли на текстовый протокол <tool_call>")
             tail = flt.finish()
             if tail:
                 step.append(tail)
                 emit_text(tail)
-            native_mode = bool(native and not flt.calls_raw)
-            raw_calls = flt.calls_raw[:per_step]
-            if native_mode:
-                raw_calls = [json.dumps({"name": c["name"], "arguments": c["arguments"]},
-                                        ensure_ascii=False) for c in native[:per_step]]
 
+            if err is not None:
+                self.log_error("модель", err)
+                stop_reason = "llm_error"
+                emit_step(current, "end", "error", f"Шаг {current} · модель", str(err)[:300])
+                break
             if is_cancelled():
                 stop_reason = "cancelled"
                 break
+
+            # Смешанные вызовы не теряем: текстовые <tool_call> добавляем к нативным.
+            native_mode = bool(native)
+            if native and flt.calls_raw:
+                emit_step(current, "note", "warning", "Смешанные вызовы",
+                          "Модель выдала и native tool_calls, и <tool_call> — объединяем их")
+                for raw in flt.calls_raw:
+                    parsed = parse_calls([raw])[0]
+                    native.append({"id": "call_" + uuid.uuid4().hex[:8],
+                                   "name": parsed.get("name") or "?",
+                                   "arguments": parsed.get("arguments") or {}})
+            total_calls = len(native) if native_mode else len(flt.calls_raw)
+            if total_calls > per_step:
+                emit_step(current, "note", "warning", "Лимит вызовов шага",
+                          f"принято {per_step} из {total_calls} вызовов этого шага")
+            if native_mode:
+                accepted = native[:per_step]
+                raw_calls = [json.dumps({"name": c.get("name") or "?", "arguments": c.get("arguments") or {}},
+                                        ensure_ascii=False) for c in accepted]
+            else:
+                raw_calls = flt.calls_raw[:per_step]
+
             if not raw_calls:
                 stop_reason = "model_done"
-                break
-            # Проверяем лимит ПОСЛЕ стриминга: модель уже успела дать видимый текст,
-            # поэтому на последнем раунде пользователь всё равно получит ответ.
-            if rounds >= min(max_rounds, hard_cap) or calls_used >= max_calls:
-                if stuck >= 2:
-                    stop_reason = "no_progress"
-                else:
-                    stop_reason = "round_limit" if rounds >= min(max_rounds, hard_cap) else "call_limit"
+                emit_step(current, "end", "done", f"Шаг {current} · результаты",
+                          "инструменты не нужны — модель ответила текстом")
                 break
 
-            rounds += 1
+            rounds = current
             assistant = {"role": "assistant",
                          "content": "".join(step) + "".join(f"<tool_call>{r}</tool_call>" for r in raw_calls)}
             if native_mode:
                 assistant["tool_calls"] = []
-                for i, c in enumerate(native[:per_step]):
+                for c in native[:per_step]:
                     tid = c.get("id") or ("call_" + uuid.uuid4().hex[:8])
                     c["id"] = tid
                     assistant["tool_calls"].append({"id": tid, "type": "function", "function": {
-                        "name": c["name"], "arguments": json.dumps(c["arguments"], ensure_ascii=False)}})
+                        "name": c.get("name") or "?",
+                        "arguments": json.dumps(c.get("arguments") or {}, ensure_ascii=False)}})
             messages.append(assistant)
-            blocks: List[str] = []
-            native_msgs: List[dict] = []
-            had_error = False
-            # 1) разбор по порядку: повторы, ошибки, недоступные инструменты — без исполнения;
+            # 1) разбор по порядку: повторы, ошибки, недоступные и пропущенные вызовы — без исполнения;
             # 2) исполнение: независимые вызовы — параллельно, инструменты записи — по очереди;
-            # 3) результаты возвращаются модели в исходном порядке.
+            # 3) результаты возвращаются модели в исходном порядке (в т.ч. для native tool_call_id).
             items: List[dict] = []
             batch_sigs: Dict[str, int] = {}
             for idx, call in enumerate(parse_calls(raw_calls)):
-                if calls_used >= max_calls:
-                    break
                 name = call.get("name") or "?"
                 args = call.get("arguments") or {}
+                if calls_used >= max_calls:
+                    # Не break: каждое объявленное tool_calls обязано получить свой role:tool,
+                    # иначе следующий запрос к OpenAI-совместимому серверу упадёт с HTTP 400.
+                    out = Outcome(False, "Лимит вызовов инструментов исчерпан — вызов пропущен.",
+                                  label="Лимит вызовов", detail="пропущен")
+                    items.append({"idx": idx, "name": name, "args": args, "out": out, "skipped": True})
+                    continue
                 signature = name + ":" + json.dumps(args, sort_keys=True, ensure_ascii=False)
                 calls_used += 1
                 if signature in seen_calls:
@@ -772,32 +971,33 @@ class App:
                     out = Outcome(True, seen_calls[signature], label=tools.describe(name, args),
                                   detail="результат из кэша")
                     on_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "done",
-                                      "label": out.label, "detail": out.detail})
-                    items.append({"idx": idx, "name": name, "out": out})
+                                      "step": current, "label": out.label, "detail": out.detail})
+                    items.append({"idx": idx, "name": name, "args": args, "out": out, "cache": True})
                 elif signature in batch_sigs:
-                    stuck += 1
-                    items.append({"idx": idx, "name": name, "dup": batch_sigs[signature]})
+                    dup_stuck += 1
+                    items.append({"idx": idx, "name": name, "args": args,
+                                  "dup": batch_sigs[signature]})
                 elif call.get("error"):
                     out = Outcome(False, call["error"], label="Инструмент", detail=call["error"])
                     on_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "error",
-                                      "label": "Ошибка вызова", "detail": call["error"]})
-                    items.append({"idx": idx, "name": name, "out": out})
+                                      "step": current, "label": "Ошибка вызова", "detail": call["error"]})
+                    items.append({"idx": idx, "name": name, "args": args, "out": out})
                 elif name not in names:
                     out = Outcome(False, f"Инструмент {name} недоступен. Доступны: {', '.join(names) or 'нет'}.",
                                   label="Инструмент", detail=name)
                     on_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "error",
-                                      "label": f"Нет инструмента: {name}", "detail": ""})
-                    items.append({"idx": idx, "name": name, "out": out})
+                                      "step": current, "label": f"Нет инструмента: {name}", "detail": ""})
+                    items.append({"idx": idx, "name": name, "args": args, "out": out})
                 else:
                     batch_sigs[signature] = len(items)
                     items.append({"idx": idx, "name": name, "args": args, "sig": signature, "run": True})
 
             to_run = [it for it in items if it.get("run")]
-            self._agent_step = rounds
+            step_kw = {"step": current} if tool_accepts_step() else {}
             if len(to_run) > 1 and not any(it["name"] in SEQUENTIAL_TOOLS for it in to_run):
                 with ThreadPoolExecutor(max_workers=min(len(to_run), lim["parallel"])) as pool:
-                    futures = [pool.submit(self._call_tool, tools, it["name"], it["args"], on_delta)
-                               for it in to_run]
+                    futures = [pool.submit(self._call_tool, tools, it["name"], it["args"], on_delta,
+                                           **step_kw) for it in to_run]
                     for it, fut in zip(to_run, futures):
                         try:
                             it["out"] = fut.result()
@@ -806,7 +1006,7 @@ class App:
                                                 label="Инструмент", detail=_preview(str(exc), 120))
             else:
                 for it in to_run:
-                    it["out"] = self._call_tool(tools, it["name"], it["args"], on_delta)
+                    it["out"] = self._call_tool(tools, it["name"], it["args"], on_delta, **step_kw)
             for it in items:
                 if "dup" in it:
                     it["out"] = items[it["dup"]]["out"]
@@ -815,44 +1015,66 @@ class App:
 
             blocks: List[str] = []
             native_msgs: List[dict] = []
+            calls_meta: List[dict] = []
             had_error = False
             for it in items:
                 out = it["out"]
                 name = it["name"]
                 idx = it["idx"]
-                if not out.ok:
+                skipped = bool(it.get("skipped"))
+                if not out.ok and not skipped:
                     failures += 1
                     had_error = True
-                trace.append(f"{name}{'✓' if out.ok else '✕'}")
-                blocks.append(tool_result_block(name, out.text, lim["result_chars"]))
+                body, truncated, _ = compact_model_text(out.text, lim["result_chars"])
+                blocks.append(tool_result_block(name, body, lim["result_chars"]))
+                if "dup" in it:
+                    status = "dup"
+                elif it.get("cache"):
+                    status = "cache"
+                elif skipped:
+                    status = "skip"
+                elif out.ok:
+                    status = "ok"
+                else:
+                    status = "error"
+                calls_meta.append({"name": name, "args": _args_preview(it.get("args") or {}),
+                                   "status": status, "chars": len(body), "truncated": truncated,
+                                   "error": "" if out.ok else _preview(out.text, 180)})
+                trace.append(f"{name}({_args_preview(it.get('args') or {}, 60)})→"
+                             f"{_preview(out.text, 70)}{'✕' if not out.ok else '✓'}")
                 if native_mode and idx < len(native):
                     native_msgs.append({"role": "tool", "tool_call_id": native[idx].get("id") or "",
-                                        "content": out.text[:lim["result_chars"]]})
+                                        "content": body})
 
             if had_error and reflection > 0:
                 reflection -= 1
                 messages.append({"role": "system", "content": (
                     "Инструмент вернул ошибку. Измени аргументы, выбери другой инструмент "
                     "или ответь по уже собранным данным — не выдумывай результат.")})
-            final_hint = "Это последний раунд вызовов: дай итоговый ответ по собранным результатам."
+            next_is_final = (rounds >= max_rounds or calls_used >= max_calls or
+                             failures >= 4 or dup_stuck >= 2)
+            final_hint = ("Следующий ответ должен быть итоговым: ответь текстом по собранным "
+                          "результатам, без новых вызовов инструментов.")
             if native_mode:
-                messages.extend(native_msgs)
-                if rounds >= max_rounds or calls_used >= max_calls:
+                messages.extend(native_msgs)          # по одному на каждый tool_call — без дыр
+                if next_is_final:
                     messages.append({"role": "user", "content": final_hint})
             else:
                 last = "\n".join(blocks)
-                if rounds >= max_rounds or calls_used >= max_calls:
+                if next_is_final:
                     last += "\n\n" + final_hint
                 messages.append({"role": "user", "content": last})
 
-            on_delta("trace", {"round": rounds, "calls": len(blocks), "failures": failures,
-                               "state": "running"})
-            if failures >= 4:
-                stop_reason = "failures"
-                break
+            emit_step(current, "end", "error" if had_error else "done", f"Шаг {current} · результаты",
+                      f"вызовов: {len(items)}, ошибок: {failures}, символов результата: "
+                      f"{sum(len(b) for b in blocks)}",
+                      calls=calls_meta, ms=int((time.monotonic() - started) * 1000))
+            emit_trace("running")
+            if next_is_final:
+                emit_step(current, "note", "warning", "Бюджет шагов",
+                          "дальше только финальный текстовый ответ — новые вызовы не исполняются")
 
-        on_delta("trace", {"round": rounds, "calls": calls_used, "failures": failures,
-                           "state": "done", "stop": stop_reason})
+        emit_trace("done", stop_reason, FINAL_REASONS.get(stop_reason, "Ход завершён."))
         answer = "".join(parts).strip()
         if not answer:
             fallback = {"round_limit": "Достигнут лимит шагов — отвечаю по собранным данным.",
@@ -860,6 +1082,7 @@ class App:
                         "failures": "Инструменты не справились — отвечаю по собранным данным.",
                         "no_progress": "Отвечаю по собранным данным.",
                         "cancelled": "Ответ остановлен.",
+                        "model_done": "Модель не дала итогового текста — показываю собранные результаты.",
                         "llm_error": "Модель не ответила: проверь, что LM Studio или llama.cpp запущены и модель загружена."}.get(stop_reason)
             if fallback:
                 emit_text(fallback)
@@ -905,8 +1128,10 @@ class App:
                 online = False
         return {
             "backend": self.backend.name,
-            "model": getattr(self.backend, "loaded", None),
-            "fact_model": self.active_model or self.default_rel(),   # модель экстракции фактов
+            # Показываем модель, выбранную пользователем/чатом, а не «первую попавшуюся»
+            # загруженную в LM Studio: статус не должен меняться от чужих загрузок.
+            "model": self.resolve_model() or None,
+            "fact_model": self.extraction_model(),   # модель экстракции фактов
             "memory_enabled": self.memory_enabled,
             "memory_backend": self.memory_backend,
             "memory_online": online,
@@ -926,10 +1151,7 @@ class App:
         fid = str(fact_id or "").strip()
         if not fid:
             raise ValueError("не указан fact_id")
-        target_model = (model or "").strip()
-        if target_model:
-            with self.backend_lock:
-                self.active_model = target_model
+        target_model = self.resolve_model(model)   # только для этого вызова, выбор не меняем
         facts = self.memory.list_facts(500)
         target = next((f for f in facts if f.get("fact_id") == fid), None)
         if target is None:
@@ -956,7 +1178,7 @@ class App:
             "Не выдумывай данные: опирайся только на факты и фрагменты ниже.\n\n"
             + json.dumps(evidence, ensure_ascii=False)[:6000]
         )
-        llm_call = openai_chat_caller(self.backend.base_url, self.extraction_model(), max_tokens=512)
+        llm_call = openai_chat_caller(self.backend.base_url, target_model, max_tokens=512)
         payload = _parse_json_loose(llm_call(prompt))
         verdict = str(payload.get("verdict") or "keep").strip().lower()
         if verdict not in ("keep", "update", "retract"):
@@ -978,7 +1200,7 @@ class App:
             if s and r and o:
                 doc = self.ingest(reason or f"Пересборка факта {fid}",
                                   session_id="temporal-distill", role="assistant",
-                                  model=self.extraction_model())
+                                  model=target_model)
                 doc_id = doc.get("doc_id") or (doc.get("result") or {}).get("doc_id") or "manual-distill"
                 source = {"doc_id": doc_id, "span": [0, max(1, len(reason))]}
                 out = self.memory.supersede(
@@ -994,11 +1216,8 @@ class App:
 
     def _llm_json(self, prompt: str, model: str = "", max_tokens: int = 768) -> dict:
         """Один LLM-вызов с моделью чата и «рыхлым» JSON (модели любят обёртки ```json)."""
-        target = (model or "").strip()
-        if target:
-            with self.backend_lock:
-                self.active_model = target
-        call = openai_chat_caller(self.backend.base_url, self.extraction_model(), max_tokens=max_tokens)
+        target = self.resolve_model(model)       # только для этого вызова, выбор не меняем
+        call = openai_chat_caller(self.backend.base_url, target, max_tokens=max_tokens)
         return _parse_json_loose(call(prompt))
 
     @staticmethod

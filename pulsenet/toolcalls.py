@@ -37,6 +37,11 @@ def agent_limits(env: Optional[dict] = None) -> dict:
         "max_calls": _env_int(env, "AGENT_MAX_CALLS", 12, 1, 40),
         "reflection_budget": _env_int(env, "AGENT_REFLECTION_BUDGET", 2, 0, 10),
         "result_chars": _env_int(env, "TOOL_RESULT_CONTEXT_CHARS", 1200, 200, 20000),
+        # Отдельный лимит генерации на шаг агента: 1024 не хватало на JSON <tool_call>
+        "agent_max_tokens": _env_int(env, "AGENT_MAX_TOKENS", 2048, 512, 8192),
+        # Потолки системного промпта и всего запроса, чтобы локальная модель не обрезалась
+        "system_max": _env_int(env, "AGENT_SYSTEM_MAX_CHARS", 6000, 1000, 30000),
+        "context_max": _env_int(env, "AGENT_CONTEXT_MAX_CHARS", 20000, 4000, 60000),
         "native_max": _env_int(env, "TOOL_NATIVE_MAX", 10, 3, 30),
         "image_timeout": _env_int(env, "MCP_TOOL_TIMEOUT_IMAGE", 300, 30, 900),
         # параллельные вызовы в одном шаге: сколько принимаем и сколько выполняем одновременно
@@ -159,10 +164,65 @@ def parse_calls(raw_bodies: List[str]) -> List[dict]:
     return calls
 
 
+def _shrink_json(value, left: int):
+    """Сжать структуру так, чтобы json.dumps всё ещё давал валидный JSON."""
+    if isinstance(value, str):
+        if len(value) <= left:
+            return value
+        keep = max(0, left - len("…(обрезано)"))
+        return value[:keep] + "…(обрезано)"
+    if isinstance(value, dict):
+        out: Dict[str, object] = {}
+        for key, item in value.items():
+            k = str(key)[:80]
+            out[k] = _shrink_json(item, max(40, left // max(1, len(value))))
+            if len(json.dumps(out, ensure_ascii=False)) > left:
+                out.pop(k, None)
+                out["_truncated"] = True
+                break
+        return out
+    if isinstance(value, list):
+        out_list: List[object] = []
+        room = min(len(value), 20)
+        for item in value[:room]:
+            out_list.append(_shrink_json(item, max(40, left // max(1, room))))
+            if len(json.dumps(out_list, ensure_ascii=False)) > left:
+                out_list.append("…(обрезано)")
+                break
+        return out_list
+    return value
+
+
+def compact_model_text(text: str, limit: Optional[int] = None) -> Tuple[str, bool, bool]:
+    """Уложить результат инструмента в лимит контекста, сохранив валидный JSON.
+
+    Возвращает (текст, было_ли_обрезание, был_ли_JSON). Простое «отрезали хвост»
+    превращало ответ MCP в битый JSON и модель тратила раунд на разбор ошибки.
+    """
+    cap = max(40, int(limit or MAX_RESULT_CHARS))
+    body = str(text or "")
+    if len(body) <= cap:
+        stripped = body.strip()
+        is_json = stripped[:1] in ("{", "[")
+        return body, False, is_json
+    stripped = body.strip()
+    if stripped[:1] in ("{", "["):
+        try:
+            data = json.loads(stripped)
+        except ValueError:
+            pass
+        else:
+            shrunk = _shrink_json(data, max(80, cap - 40))
+            compact = json.dumps(shrunk, ensure_ascii=False)
+            if len(compact) <= cap:
+                return compact, True, True
+    return body[:cap] + "\n…(обрезано)", True, False
+
+
 def tool_result_block(name: str, text: str, limit: Optional[int] = None) -> str:
     """Текст результата в том виде, в котором модель его получает.
 
     limit — пер-вызов потолок контекста (AGENT_* настройки); по умолчанию MAX_RESULT_CHARS."""
     cap = int(limit or MAX_RESULT_CHARS)
-    body = text if len(text) <= cap else text[:cap] + "\n…(обрезано)"
+    body, _, _ = compact_model_text(text, cap)
     return f'<tool_result name="{name}">\n{body}\n</tool_result>'

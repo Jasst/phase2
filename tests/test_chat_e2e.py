@@ -51,7 +51,7 @@ class _FakeLLM(BaseHTTPRequestHandler):
         if has_result:
             pieces = ["По источнику ", "[1] ответ готов."]
         else:
-            pieces = ["Ищу. ", '<tool_call>{"name": "web_search", ',
+            pieces = ["<think>надо поискать</think>Ищу. ", '<tool_call>{"name": "web_search", ',
                       '"arguments": {"queries": ["курс"]}}</tool_call>']
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -127,12 +127,15 @@ def test_chat_with_web_streams_tool_then_sources_then_answer(stack):
 
     kinds = []
     for ev in events:
-        for k in ("token", "tool", "sources", "done", "error"):
+        for k in ("token", "reasoning", "step", "tool", "trace", "sources", "done", "error"):
             if k in ev:
                 kinds.append(k)
                 break
     assert kinds[-1] == "done", kinds
     assert "tool" in kinds and "sources" in kinds
+    assert "reasoning" in kinds and "step" in kinds and "trace" in kinds
+    assert kinds.index("reasoning") < kinds.index("token")   # <think> до самого ответа
+    assert any(isinstance(ev.get("step"), dict) and ev["step"].get("budget") for ev in events)
     first_tool = kinds.index("tool")
     assert "token" in kinds[:first_tool]                  # «Ищу. » пришёл до вызова инструмента
     assert kinds.index("sources") > first_tool

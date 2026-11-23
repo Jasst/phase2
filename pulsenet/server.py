@@ -18,7 +18,7 @@
        /auth/reset/confirm     восстановление пароля по коду из письма
   GET  /api/status             бэкенд, память, журнал ошибок (требует входа)
   GET  /api/models             модели бэкенда
-  POST /api/chat               чат, поток SSE: token | reasoning | tool | sources | image | done | error
+  POST /api/chat               чат, поток SSE: token | reasoning | step | tool | sources | image | trace | done | error
                                тело: {message, chat_id, web, model} — web разрешает веб-инструменты,
                                model выбирает модель для ответа (пусто — по умолчанию)
   GET  /api/chat/stream        продолжить поток после перезагрузки / с другого устройства
@@ -54,6 +54,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Dict, List
 from urllib.parse import parse_qs, urlparse
 
 from .auth_config import AuthConfig
@@ -93,6 +94,7 @@ class ChatJob:
         self.assistant_msg_id = assistant_msg_id
         self.text = ""
         self.reasoning = ""
+        self.reasoning_events = []       # куски <think> с позицией в тексте на момент появления
         self.answer = ""
         self.error = ""
         self.status = "running"          # running | done | stopped | error
@@ -105,7 +107,8 @@ class ChatJob:
         with self._lock:
             if kind == "reasoning":
                 self.reasoning += payload
-            elif kind in ("tool", "sources", "image", "todo", "trace"):
+                self.reasoning_events.append({"text": payload, "at": len(self.text)})
+            elif kind in ("tool", "sources", "image", "todo", "trace", "step"):
                 self.events.append({"kind": kind, "data": payload, "at": len(self.text)})
             else:
                 self.text += payload
@@ -127,6 +130,7 @@ class ChatJob:
             return {
                 "text": self.text,
                 "reasoning": self.reasoning,
+                "reasoning_events": list(self.reasoning_events),
                 "events": list(self.events),
                 "answer": self.answer,
                 "error": self.error,
@@ -211,18 +215,32 @@ class ChatJobs:
             snap = job.snapshot()
             tools = [ev["data"] for ev in snap["events"] if ev["kind"] == "tool"]
             sources, images = [], []
-            # План и трасса: последнее состояние. Полная лента шагов остаётся в tools (поле step).
+            # План и трасса: последнее состояние. Полная лента шагов — отдельным массивом:
+            # start/end одного шага склеиваются по id, чтобы не терять детали при реаттаче.
             todos = next((ev["data"] for ev in reversed(snap["events"]) if ev["kind"] == "todo"), [])
             trace = next((ev["data"] for ev in reversed(snap["events"]) if ev["kind"] == "trace"), None)
+            steps: List[dict] = []
+            step_index: Dict[str, dict] = {}
             for ev in snap["events"]:
                 if ev["kind"] == "sources" and isinstance(ev["data"], list):
                     sources.extend(ev["data"])
                 elif ev["kind"] == "image" and isinstance(ev["data"], dict):
                     images.append(ev["data"])
+                elif ev["kind"] == "step" and isinstance(ev["data"], dict):
+                    data = ev["data"]
+                    sid = str(data.get("id") or "")
+                    existing = step_index.get(sid) if sid else None
+                    if existing is not None and data.get("phase") != "start":
+                        existing.update(data)
+                    else:
+                        item = dict(data)
+                        steps.append(item)
+                        if sid:
+                            step_index[sid] = item
             msg = {"id": job.assistant_msg_id, "role": "assistant",
                    "text": snap["answer"] or snap["text"], "reasoning": snap["reasoning"],
                    "time": time.time(), "tools": tools, "sources": sources, "images": images,
-                   "todos": todos or [], "trace": trace,
+                   "todos": todos or [], "trace": trace, "steps": steps,
                    "indexPending": snap["index_pending"]}
             if snap["error"]:
                 msg["error"] = snap["error"]
@@ -387,25 +405,37 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
         text_pos = 0
-        reasoning_pos = 0
+        reason_pos = 0
         event_pos = 0
         try:
             while True:
                 snap = job.snapshot()
                 text = snap["text"]
-                reasoning = snap["reasoning"]
-                for ev in snap["events"][event_pos:]:
-                    if ev["at"] > text_pos:
-                        self.sse({"token": text[text_pos:ev["at"]]})
-                        text_pos = ev["at"]
-                    self.sse({ev["kind"]: ev["data"]})
-                    event_pos += 1
-                if len(text) > text_pos:
-                    self.sse({"token": text[text_pos:]})
-                    text_pos = len(text)
-                if len(reasoning) > reasoning_pos:
-                    self.sse({"reasoning": reasoning[reasoning_pos:]})
-                    reasoning_pos = len(reasoning)
+
+                def emit_until(pos):
+                    nonlocal text_pos
+                    if pos > text_pos:
+                        self.sse({"token": text[text_pos:pos]})
+                        text_pos = pos
+
+                # Рассуждения и события (step, tool, …) имеют позицию в тексте.
+                # Объединяем их в один timeline: <think> уходит ДО токенов, которые
+                # модель выдала после него, а не в конце всего ответа.
+                events = snap["events"]
+                reasons = snap["reasoning_events"]
+                while event_pos < len(events) or reason_pos < len(reasons):
+                    ev_at = events[event_pos]["at"] if event_pos < len(events) else float("inf")
+                    rs_at = reasons[reason_pos]["at"] if reason_pos < len(reasons) else float("inf")
+                    if ev_at <= rs_at:
+                        emit_until(ev_at)
+                        ev = events[event_pos]
+                        self.sse({ev["kind"]: ev["data"]})
+                        event_pos += 1
+                    else:
+                        emit_until(rs_at)
+                        self.sse({"reasoning": reasons[reason_pos]["text"]})
+                        reason_pos += 1
+                emit_until(len(text))
                 if snap["status"] != "running":
                     if snap["error"]:
                         self.sse({"error": snap["error"]})
