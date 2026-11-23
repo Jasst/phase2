@@ -162,6 +162,16 @@ SPECS: Dict[str, dict] = {
 }
 
 
+# Потолки времени для веб-инструментов: зависший сетевой запрос раньше держал весь ход.
+WEB_SEARCH_TIMEOUT = 60.0
+WEB_FETCH_TIMEOUT = 45.0
+
+
+def _run_async(coro, timeout: float):
+    """Корутина веб-модуля из рабочего потока чата: свой цикл событий и потолок времени."""
+    return asyncio.run(asyncio.wait_for(coro, timeout))
+
+
 @dataclass
 class Outcome:
     ok: bool
@@ -319,18 +329,19 @@ class ChatTools:
                 return self._memory_search(args)
             if name == "memory_remember":
                 return self._memory_remember(args)
-            if name == "web_search":
-                return self._web_search(args)
-            if name == "web_fetch":
-                return self._web_fetch(args)
             if name in WORKSPACE_TOOLS and self.workspace is not None:
                 return self._workspace_tool(name, args)
             if name in self._mcp_specs and self._mcp_call is not None:
                 return self._run_mcp(name, args)
             return Outcome(False, f"Неизвестный инструмент: {name}", label="Инструмент", detail=name)
+        except TimeoutError:
+            return Outcome(False, f"Инструмент {name} не ответил вовремя. Попробуй другой запрос или инструмент.",
+                           label="Таймаут инструмента", detail="таймаут")
         except Exception as exc:                         # noqa: BLE001
-            return Outcome(False, f"Ошибка инструмента {name}: {exc}", label="Ошибка инструмента",
-                           detail=_clip(exc, 120))
+            # У части исключений текст пустой (TimeoutError и др.): тогда показываем тип.
+            text = str(exc) or type(exc).__name__
+            return Outcome(False, f"Ошибка инструмента {name}: {text}", label="Ошибка инструмента",
+                           detail=_clip(text, 120))
 
     # ---------- навыки, заметки, план ----------
 
@@ -505,7 +516,7 @@ class ChatTools:
         queries = [_str(q) for q in (queries or []) if _str(q)][:3]
         if not queries:
             return Outcome(False, "Пустой запрос.", label="Веб-поиск", detail="пустой запрос")
-        res = asyncio.run(self._web.search(queries, max_results=5))
+        res = _run_async(self._web.search(queries, max_results=5), WEB_SEARCH_TIMEOUT) or {}
         sources: List[dict] = []
         for s in (res.get("sources") or [])[:6]:
             url = _str(s.get("url"))
@@ -525,8 +536,12 @@ class ChatTools:
         if self._web is None:
             return Outcome(False, "Чтение страниц недоступно на сервере.", label="Страница", detail="нет модуля web")
         url = _str(args.get("url"))
-        host = urlparse(url).netloc or url
-        res = asyncio.run(self._web.fetch(url, max_chars=5000))
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return Outcome(False, "Адрес должен начинаться с http:// или https:// и содержать домен.",
+                           label="Страница", detail="неверный адрес")
+        host = parsed.netloc
+        res = _run_async(self._web.fetch(url, max_chars=5000), WEB_FETCH_TIMEOUT) or {}
         if res.get("status") != "ok":
             return Outcome(False, f"Не удалось открыть страницу: {res.get('message', 'ошибка')}",
                            label=f"Страница: {_clip(host, 40)}", detail=_clip(res.get("message"), 120))

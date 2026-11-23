@@ -7,6 +7,7 @@
 
 Оба говорят по OpenAI-совместимому API: /v1/models и /v1/chat/completions со стримингом.
 """
+import http.client
 import json
 import os
 import subprocess
@@ -63,6 +64,15 @@ def _error_detail(exc):
     except (ValueError, AttributeError):
         pass
     return body.strip()[:300] or str(exc.reason)
+
+
+_OVERFLOW_MARKERS = ("context", "too long", "exceed", "n_ctx", "token")
+
+
+def _is_overflow(detail: str) -> bool:
+    """400 из-за переполнения контекста — не признак того, что сервер не умеет function calling."""
+    low = (detail or "").lower()
+    return any(marker in low for marker in _OVERFLOW_MARKERS)
 
 
 class ThinkSplitter:
@@ -123,48 +133,62 @@ class OpenAICompat:
         try:
             resp = urllib.request.urlopen(req, timeout=600)
         except urllib.error.HTTPError as exc:        # сервер ответил, но с ошибкой
-            if exc.code == 400 and tools:
+            detail = _error_detail(exc)
+            # 400 из-за переполнения контекста не означает «нет tools»: откат на текстовый
+            # протокол тогда только скрыл бы настоящую причину.
+            if exc.code == 400 and tools and not _is_overflow(detail):
                 # Флаг вместо on_delta: слушатель потока ждёт только токены и
                 # native_tool_calls, а лишнее событие ломало бы подписчиков.
                 self.last_native_unsupported = True
                 return self.stream(model, messages, on_delta, cancelled,
                                    temperature, max_tokens, tools=None)
-            raise BackendError(f"{self.name} ответил ошибкой {exc.code}: {_error_detail(exc)}") from exc
+            raise BackendError(f"{self.name} ответил ошибкой {exc.code}: {detail}") from exc
         except OSError as exc:                       # сервер не отвечает вовсе
             raise BackendError(f"нет связи с LLM ({self.name}): {exc}") from exc
         splitter = ThinkSplitter()
         calls: Dict[int, dict] = {}
-        with resp:
-            for raw in resp:
-                if cancelled():
-                    break
-                line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    ev = json.loads(data)
-                except ValueError:
-                    continue
-                choice = (ev.get("choices") or [{}])[0]
-                delta = choice.get("delta") or {}
-                if delta.get("reasoning_content"):
-                    on_delta("reasoning", delta["reasoning_content"])
-                if delta.get("content"):
-                    for kind, text in splitter.feed(delta["content"]):
-                        on_delta(kind, text)
-                for tc in (delta.get("tool_calls") or []):
-                    i = int(tc.get("index") or 0)
-                    cur = calls.setdefault(i, {"id": "", "name": "", "arguments": ""})
-                    if tc.get("id"):
-                        cur["id"] = tc["id"]
-                    fn = tc.get("function") or {}
-                    if fn.get("name"):
-                        cur["name"] += fn["name"]
-                    if fn.get("arguments"):
-                        cur["arguments"] += fn["arguments"]
+        try:
+            with resp:
+                for raw in resp:
+                    if cancelled():
+                        break
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        ev = json.loads(data)
+                    except ValueError:
+                        continue
+                    choice = (ev.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    if delta.get("reasoning_content"):
+                        on_delta("reasoning", delta["reasoning_content"])
+                    if delta.get("content"):
+                        for kind, text in splitter.feed(delta["content"]):
+                            on_delta(kind, text)
+                    for tc in (delta.get("tool_calls") or []):
+                        i = int(tc.get("index") or 0)
+                        cur = calls.setdefault(i, {"id": "", "name": "", "arguments": ""})
+                        if tc.get("id"):
+                            cur["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        name_part = fn.get("name") or ""
+                        # Одни серверы шлют имя целиком, другие кусками: полный повтор не склеиваем.
+                        if name_part and not cur["name"]:
+                            cur["name"] = name_part
+                        elif name_part and name_part != cur["name"]:
+                            cur["name"] += name_part
+                        if fn.get("arguments"):
+                            cur["arguments"] += fn["arguments"]
+        except (OSError, http.client.HTTPException) as exc:
+            # Обрыв или таймаут посреди ответа. Уже показанный текст остаётся у пользователя,
+            # а ход получает ошибку модели, а не необработанное исключение.
+            for kind, text in splitter.flush():
+                on_delta(kind, text)
+            raise BackendError(f"обрыв ответа от {self.name}: {exc}") from exc
         for kind, text in splitter.flush():
             on_delta(kind, text)
         if calls:

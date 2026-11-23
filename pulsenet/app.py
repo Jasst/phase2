@@ -25,8 +25,9 @@ from .mcp_client import MCPClient, MemoryUnavailable, RemoteMemory
 from .memory_service import build_encoder
 from .triplex import TriplexMemory, make_extractor, openai_chat_caller
 from .triplex import sleep
-from .toolcalls import (COMMANDS, MAX_CALLS_PER_STEP, ToolCallFilter, agent_limits,
-                         compact_model_text, parse_calls, parse_command, tool_result_block)
+from .toolcalls import (COMMANDS, MAX_CALLS_PER_STEP, ToolCallFilter, agent_limits, find_bare_call,
+                         find_bare_call_span, compact_model_text, parse_calls, parse_command,
+                         tool_result_block)
 from .tools import SEQUENTIAL_TOOLS, SUBAGENT_DENY, ChatTools, Outcome, catalog, instructions
 from .unified_mcp.store import IdentityStore
 from .tts import SileroTTS
@@ -38,6 +39,12 @@ LLM_RETRIES = 2                 # повторы при сбое соедине�
 LLM_RETRY_DELAY = 1.5           # сек, умножается на номер попытки
 MEMORY_RETRIES = 12          # индексация ждёт недоступный MCP: 12 попыток
 MEMORY_RETRY_SECONDS = 5.0
+# Пороги агентного цикла: три раунда подряд с ошибками инструментов или два раунда подряд
+# без новых выполнений (одни повторы) — дальше бюджет не тратим, отвечаем по собранному.
+FAIL_STREAK_LIMIT = 3
+IDLE_ROUNDS_LIMIT = 2
+# Раунды подряд, где все вызовы не разобраны (нет name/arguments): отдельная причина останова.
+BAD_ROUNDS_LIMIT = 2
 
 # Персона явно сообщает модели про инструменты. Без неё локальная модель отвечает
 # «я текстовая нейросеть и не могу отправить картинку», хотя image_generate подключён.
@@ -116,6 +123,40 @@ def _args_preview(args: dict, limit: int = 140) -> str:
     return _preview(raw, limit)
 
 
+def _msg_size(msg: dict) -> int:
+    return len(str(msg.get("content") or ""))
+
+
+def _fit_messages(messages: List[dict], limit: int) -> List[str]:
+    """Держит запрос в бюджете символов (AGENT_CONTEXT_MAX_CHARS) перед каждым запросом к модели.
+
+    Раньше бюджет проверялся один раз до первого запроса, а результаты инструментов копились
+    до конца хода: на длинном ходе запрос переполнял контекст модели, и ход падал.
+    Порядок: сначала ужимаем старые результаты инструментов (два последних сообщения не трогаем),
+    затем выбрасываем самые старые реплики целыми группами, чтобы не осталось tool-ответов
+    без своего вызова. Системное сообщение (индекс 0) не трогаем. Возвращает пояснения для трассы.
+    """
+    notes: List[str] = []
+    size = sum(_msg_size(m) for m in messages)
+    if size <= limit:
+        return notes
+    for m in messages[1:-2]:
+        if size <= limit:
+            break
+        body = str(m.get("content") or "")
+        if m.get("role") == "user" and "<tool_result" in body and len(body) > 400:
+            short = body[:300] + "\n…(старый результат сокращён)"
+            size -= len(body) - len(short)
+            m["content"] = short
+            notes.append("старые результаты инструментов сокращены")
+    while size > limit and len(messages) > 2:
+        size -= _msg_size(messages.pop(1))
+        while len(messages) > 2 and messages[1].get("role") == "tool":
+            size -= _msg_size(messages.pop(1))
+        notes.append("самая старая реплика убрана из запроса")
+    return notes
+
+
 def _parse_json_loose(raw: str) -> dict:
     """Достать JSON-объект из ответа модели: модели любят оборачивать его в ```json."""
     text = str(raw or "").strip()
@@ -165,7 +206,8 @@ class App:
         # Объект не подключается до первого вызова, поэтому его можно создавать всегда.
         self._mcp = MCPClient(
             (self.env.get("PULSENET_MCP_URL") or "http://127.0.0.1:8010/mcp").strip(),
-            (self.env.get("PULSENET_CHAT_MCP_TOKEN") or "").strip())
+            (self.env.get("PULSENET_CHAT_MCP_TOKEN") or "").strip(),
+            cooldown=float(self.limits["mcp_cooldown"]))
         self.mcp_tools_enabled = (bool(self._mcp.token) and
                                   self.env.get("PULSENET_CHAT_TOOLS", "1") != "0")
         self._mcp_specs_cache: Optional[Dict[str, dict]] = None
@@ -258,11 +300,13 @@ class App:
         if self._mcp_specs_cache is not None:
             return self._mcp_specs_cache
         specs: Dict[str, dict] = {}
+        discovered_ok = True
         try:
             discovered = self._mcp.list_tools()
         except Exception as exc:                  # noqa: BLE001 — сервер может быть выключен
             self.log_error("обнаружение MCP-инструментов", exc)
             discovered = []
+            discovered_ok = False
         # image_generate — ядро: доступен даже если list_tools не удался.
         from .tools import SPECS  # локальный импорт, чтобы не было цикла
         specs["image_generate"] = {"mcp_name": "image_generate",
@@ -290,7 +334,8 @@ class App:
             shown = "mcp__" + n if n in local else n
             specs[shown] = {"mcp_name": n, "description": (t.get("description") or "")[:300],
                             "parameters": t.get("inputSchema") or {"type": "object", "properties": {}}}
-        self._mcp_specs_cache = specs
+        if discovered_ok:                         # при сбое повторим в следующем ходе, а не навсегда
+            self._mcp_specs_cache = specs
         return specs
 
     def _make_memory(self, data_dir: str) -> TriplexMemory:
@@ -454,7 +499,8 @@ class App:
         for rnd in range(lim["sub_rounds"] + 1):
             emit_sub_step("start", "running", f"Субагент · шаг {rnd + 1}",
                           f"подзадача: {_preview(task, 120)}")
-            flt = ToolCallFilter()
+            _fit_messages(messages, lim["context_max"])
+            flt = ToolCallFilter(allowed)
             visible: List[str] = []
 
             def tok(kind, text, flt=flt, visible=visible):
@@ -466,6 +512,12 @@ class App:
             visible.append(flt.finish())
             text = "".join(visible).strip()
             raw = flt.calls_raw[: lim["calls_per_step"]]
+            if not raw:
+                bare = find_bare_call(text, allowed)
+                if bare is not None:
+                    raw = [json.dumps({"name": bare["name"],
+                                       "arguments": bare.get("arguments") or {}},
+                                      ensure_ascii=False)]
             if not raw or rnd == lim["sub_rounds"] or cancelled():
                 emit_sub_step("end", "done", f"Субагент · шаг {rnd + 1}",
                               f"итог: {_preview(text, 140) or 'без текста'}")
@@ -474,7 +526,7 @@ class App:
             messages.append({"role": "assistant",
                              "content": text + "".join(f"<tool_call>{r}</tool_call>" for r in raw)})
             blocks: List[str] = []
-            for call in parse_calls(raw):
+            for call in parse_calls(raw, allowed):
                 name = call.get("name") or "?"
                 args = call.get("arguments") or {}
                 calls += 1
@@ -489,7 +541,11 @@ class App:
                                        "label": f"Нет доступа у субагента: {name}",
                                        "detail": "субагенту не разрешено", "preview": ""})
                 else:
-                    out = self._call_tool(tools, name, args, sub_delta, step=rnd + 1)
+                    try:
+                        out = self._call_tool(tools, name, args, sub_delta, step=rnd + 1)
+                    except Exception as exc:          # noqa: BLE001 — сбой инструмента не срывает субагента
+                        out = Outcome(False, f"Ошибка инструмента {name}: {exc}", label="Инструмент",
+                                      detail=_preview(str(exc), 120))
                 blocks.append(tool_result_block(name, out.text, lim["result_chars"]))
             messages.append({"role": "user", "content": "\n".join(blocks)})
             emit_sub_step("end", "done", f"Субагент · шаг {rnd + 1}",
@@ -649,8 +705,9 @@ class App:
         max_rounds = lim["max_rounds"]
         max_calls = lim["max_calls"]
         reflection = lim["reflection_budget"]
-        rounds = calls_used = failures = stuck = dup_stuck = 0
-        seen_calls: Dict[str, str] = {}
+        rounds = calls_used = failures = fail_streak = idle_rounds = bad_streak = 0
+        seen_calls: Dict[str, Outcome] = {}
+        shown_notes: set = set()          # пояснения о сокращении контекста — один раз за ход
         trace: List[str] = []
         stop_reason = "model_done"
         fit_notes: List[str] = []
@@ -696,6 +753,16 @@ class App:
             task, tools, names, requested, on_delta, is_cancelled, origin=message))
         names = tools.available(web=web, memory=self.memory_enabled)
         specs = tools.specs(names)
+        # Основной аргумент для теговых вызовов вида <tool>значение</tool>:
+        # берём первый обязательный параметр схемы (у MCP-инструментов — query).
+        primary: Dict[str, str] = {}
+        for _name, _spec in specs.items():
+            _params = _spec.get("parameters") or {}
+            _required = _params.get("required") or []
+            if _required:
+                primary[_name] = _required[0]
+            elif "query" in (_params.get("properties") or {}):
+                primary[_name] = "query"
         parts: List[str] = []
 
         def emit_text(text: str) -> None:
@@ -735,21 +802,22 @@ class App:
         content = user_text + ("\n\n" + note if note else "")
         messages.append({"role": "user", "content": content})
         # История — самое дешёвое, что можно убрать без потери текущего вопроса.
-        size = sum(len(str(m.get("content") or "")) for m in messages)
-        while size > lim["context_max"] and len(messages) > 2:
-            dropped = messages.pop(1)
-            size -= len(str(dropped.get("content") or ""))
-            fit_notes.append("самая старая реплика истории убрана из запроса")
+        fit_notes.extend(_fit_messages(messages, lim["context_max"]))
         for notice in fit_notes:
             emit_step(0, "note", "warning", "Контекст", notice)
 
         # Единственное место, где выбор модели меняется: явный model из запроса
         # (пользователь выбрал в интерфейсе) или стабильный default из настроек.
         target = self.resolve_model(model)
-        with self.backend_lock:
-            rel = self.backend.ensure(target) or target or "local"
-            if target:                   # пустой выбор не «залипает» как псевдомодель
-                self.active_model = rel  # экстрактор/индексация используют ту же модель, не грузят вторую
+        rel = target or "local"
+        ensure_error: Optional[Exception] = None
+        try:
+            with self.backend_lock:
+                rel = self.backend.ensure(target) or target or "local"
+                if target:                   # пустой выбор не «залипает» как псевдомодель
+                    self.active_model = rel  # экстрактор/индексация используют ту же модель, не грузят вторую
+        except Exception as exc:             # noqa: BLE001 — ход заканчивается текстом с причиной
+            ensure_error = exc
 
         # 3) агентный цикл: запрос → инструменты → реакт → инструменты → ... → ответ.
         # Нативный function calling — опция (TOOL_NATIVE=1). По умолчанию текстовый протокол:
@@ -769,7 +837,8 @@ class App:
             "failures": "Инструменты вернули несколько ошибок — отвечаю по собранным результатам.",
             "cancelled": "Ответ остановлен.",
             "llm_error": "Модель не ответила: проверь, что LM Studio или llama.cpp запущены и модель загружена.",
-            "model_done": "Модель завершила ход без текста — показываю собранные результаты.",
+            "bad_calls": "Вызовы инструментов не удалось разобрать — отвечаю по собранным результатам.",
+            "model_done": "Модель завершила ход — ответ готов.",
         }
 
         def make_sink(flt: ToolCallFilter, buf: List[str], native_buf: List[dict], flags: dict):
@@ -821,8 +890,8 @@ class App:
                         flags["native_unsupported"] = True
                     err = None
                     break
-                except llm.BackendError as exc:
-                    err = exc
+                except Exception as exc:          # noqa: BLE001 — сбой связи с моделью — её ошибка, не падение хода
+                    err = exc if isinstance(exc, llm.BackendError) else llm.BackendError(f"сбой модели: {exc}")
                     # Повторяем, только если пользователь ещё ничего не увидел.
                     if buf or native_buf or flt.calls_raw or is_cancelled() or attempt == LLM_RETRIES:
                         break
@@ -830,6 +899,11 @@ class App:
             return err
 
         while True:
+            if ensure_error is not None:
+                self.log_error("модель", ensure_error)
+                stop_reason = "llm_error"
+                emit_step(1, "end", "error", "Модель", str(ensure_error)[:300])
+                break
             if is_cancelled():
                 stop_reason = "cancelled"
                 break
@@ -837,17 +911,17 @@ class App:
             # Причина финала определяется ДО запроса к модели: последний вызов
             # всегда делается с явной просьбой дать текст, а не с выбрасыванием tool_call.
             force_stop = ""
-            if failures >= 4:
+            if fail_streak >= FAIL_STREAK_LIMIT:
                 force_stop = "failures"
-            elif dup_stuck >= 2:
-                # Дубли внутри одного шага — чистая трата бюджета: останавливаемся сразу.
+            elif bad_streak >= BAD_ROUNDS_LIMIT:
+                force_stop = "bad_calls"
+            elif idle_rounds >= IDLE_ROUNDS_LIMIT:
+                # Два раунда подряд модель лишь повторяла уже сделанные вызовы — прогресса нет.
                 force_stop = "no_progress"
             elif rounds >= max_rounds:
-                # Повтор одного и того же вызова из раунда в раунд не обрываем досрочно:
-                # модель может getDifferentText и закончить. Но причину останова уточняем.
-                force_stop = "no_progress" if stuck >= 2 else "round_limit"
+                force_stop = "round_limit"
             elif calls_used >= max_calls:
-                force_stop = "no_progress" if stuck >= 2 else "call_limit"
+                force_stop = "call_limit"
 
             if force_stop:
                 stop_reason = force_stop
@@ -857,7 +931,8 @@ class App:
                 final_messages = list(messages)
                 final_messages.append({"role": "user", "content":
                                        reason + " Ответь ТОЛЬКО текстом, без вызовов инструментов."})
-                flt = ToolCallFilter()
+                _fit_messages(final_messages, lim["context_max"])
+                flt = ToolCallFilter(names, primary)
                 buf: List[str] = []
                 native: List[dict] = []
                 flags: dict = {}
@@ -882,10 +957,15 @@ class App:
 
             current = rounds + 1
             started = time.monotonic()
+            for notice in dict.fromkeys(_fit_messages(messages, lim["context_max"])):
+                if notice in shown_notes:
+                    continue
+                shown_notes.add(notice)
+                emit_step(current, "note", "warning", "Контекст", notice)
             ctx_size = sum(len(str(m.get("content") or "")) for m in messages)
             emit_step(current, "start", "running", f"Шаг {current} · модель",
                       f"контекст ~{ctx_size} симв.; лимит генерации {lim['agent_max_tokens']} токенов")
-            flt = ToolCallFilter()
+            flt = ToolCallFilter(names, primary)
             step: List[str] = []
             native: List[dict] = []
             flags: dict = {}
@@ -915,7 +995,7 @@ class App:
                 emit_step(current, "note", "warning", "Смешанные вызовы",
                           "Модель выдала и native tool_calls, и <tool_call> — объединяем их")
                 for raw in flt.calls_raw:
-                    parsed = parse_calls([raw])[0]
+                    parsed = parse_calls([raw], names)[0]
                     native.append({"id": "call_" + uuid.uuid4().hex[:8],
                                    "name": parsed.get("name") or "?",
                                    "arguments": parsed.get("arguments") or {}})
@@ -931,10 +1011,35 @@ class App:
                 raw_calls = flt.calls_raw[:per_step]
 
             if not raw_calls:
-                stop_reason = "model_done"
-                emit_step(current, "end", "done", f"Шаг {current} · результаты",
-                          "инструменты не нужны — модель ответила текстом")
-                break
+                raw_step = "".join(step)
+                found = find_bare_call_span(raw_step, names)
+                if found is not None:
+                    # Голый или обёрнутый в ```json вызов — полноценный вызов инструмента.
+                    # Выполняем сразу: локальные модели часто не переходят на <tool_call>,
+                    # и лишний раунд «повтори в формате» тратил бюджет впустую.
+                    bare, start, end = found
+                    # Убираем JSON (и опустевший ```json-блок) из ответа и истории: в интерфейс
+                    # он уже ушёл потоком, но итоговый текст должен быть чистым.
+                    before = re.sub(r"```(?:json)?\s*$", "", raw_step[:start], flags=re.I)
+                    after = re.sub(r"^\s*```", "", raw_step[end:])
+                    cleaned = (before + after).strip()
+                    step[:] = [cleaned] if cleaned else []
+                    joined = "".join(parts)
+                    if joined.endswith(raw_step):
+                        tail = cleaned + ("\n\n" if cleaned and not cleaned.endswith("\n") else "")
+                        parts[:] = [joined[:-len(raw_step)] + tail]
+                    raw_calls = [json.dumps({"name": bare["name"],
+                                             "arguments": bare.get("arguments") or {}},
+                                            ensure_ascii=False)]
+                    emit_step(current, "note", "warning", "Вызов без тегов",
+                              f"инструмент {bare['name']} выполнен: модель написала вызов без <tool_call>")
+                else:
+                    stop_reason = "model_done"
+                    reply = raw_step.strip()
+                    emit_step(current, "end", "done", f"Шаг {current} · результаты",
+                              "инструменты не нужны — модель ответила текстом" if reply
+                              else "инструменты не нужны — модель не дала текста")
+                    break
 
             rounds = current
             assistant = {"role": "assistant",
@@ -953,7 +1058,7 @@ class App:
             # 3) результаты возвращаются модели в исходном порядке (в т.ч. для native tool_call_id).
             items: List[dict] = []
             batch_sigs: Dict[str, int] = {}
-            for idx, call in enumerate(parse_calls(raw_calls)):
+            for idx, call in enumerate(parse_calls(raw_calls, names)):
                 name = call.get("name") or "?"
                 args = call.get("arguments") or {}
                 if calls_used >= max_calls:
@@ -966,22 +1071,23 @@ class App:
                 signature = name + ":" + json.dumps(args, sort_keys=True, ensure_ascii=False)
                 calls_used += 1
                 if signature in seen_calls:
-                    # Повтор того же вывода: не перевызываем дорогой инструмент (особенно генерацию).
-                    stuck += 1
-                    out = Outcome(True, seen_calls[signature], label=tools.describe(name, args),
+                    # Повтор того же вызова: не перевызываем дорогой инструмент (особенно генерацию).
+                    # Исход переносим целиком, включая ok: ошибка из кэша остаётся ошибкой.
+                    prev = seen_calls[signature]
+                    out = Outcome(prev.ok, prev.text, label=tools.describe(name, args),
                                   detail="результат из кэша")
-                    on_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "done",
+                    on_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name,
+                                      "status": "done" if out.ok else "error",
                                       "step": current, "label": out.label, "detail": out.detail})
                     items.append({"idx": idx, "name": name, "args": args, "out": out, "cache": True})
                 elif signature in batch_sigs:
-                    dup_stuck += 1
                     items.append({"idx": idx, "name": name, "args": args,
                                   "dup": batch_sigs[signature]})
                 elif call.get("error"):
                     out = Outcome(False, call["error"], label="Инструмент", detail=call["error"])
                     on_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "error",
                                       "step": current, "label": "Ошибка вызова", "detail": call["error"]})
-                    items.append({"idx": idx, "name": name, "args": args, "out": out})
+                    items.append({"idx": idx, "name": name, "args": args, "out": out, "bad": True})
                 elif name not in names:
                     out = Outcome(False, f"Инструмент {name} недоступен. Доступны: {', '.join(names) or 'нет'}.",
                                   label="Инструмент", detail=name)
@@ -994,24 +1100,27 @@ class App:
 
             to_run = [it for it in items if it.get("run")]
             step_kw = {"step": current} if tool_accepts_step() else {}
+
+            def exec_item(it: dict) -> Outcome:
+                try:
+                    return self._call_tool(tools, it["name"], it["args"], on_delta, **step_kw)
+                except Exception as exc:          # noqa: BLE001 — сбой одного инструмента не роняет ход
+                    return Outcome(False, f"Ошибка инструмента {it['name']}: {exc}",
+                                   label="Инструмент", detail=_preview(str(exc), 120))
+
             if len(to_run) > 1 and not any(it["name"] in SEQUENTIAL_TOOLS for it in to_run):
                 with ThreadPoolExecutor(max_workers=min(len(to_run), lim["parallel"])) as pool:
-                    futures = [pool.submit(self._call_tool, tools, it["name"], it["args"], on_delta,
-                                           **step_kw) for it in to_run]
+                    futures = [pool.submit(exec_item, it) for it in to_run]
                     for it, fut in zip(to_run, futures):
-                        try:
-                            it["out"] = fut.result()
-                        except Exception as exc:          # noqa: BLE001 — инструмент не роняет ход
-                            it["out"] = Outcome(False, f"Ошибка инструмента {it['name']}: {exc}",
-                                                label="Инструмент", detail=_preview(str(exc), 120))
+                        it["out"] = fut.result()
             else:
                 for it in to_run:
-                    it["out"] = self._call_tool(tools, it["name"], it["args"], on_delta, **step_kw)
+                    it["out"] = exec_item(it)
             for it in items:
                 if "dup" in it:
                     it["out"] = items[it["dup"]]["out"]
                 if it.get("run"):
-                    seen_calls[it["sig"]] = it["out"].text
+                    seen_calls[it["sig"]] = it["out"]
 
             blocks: List[str] = []
             native_msgs: List[dict] = []
@@ -1046,24 +1155,30 @@ class App:
                     native_msgs.append({"role": "tool", "tool_call_id": native[idx].get("id") or "",
                                         "content": body})
 
+            # Прогресс: раунд без новых выполнений (одни повторы и кэш) — холостой.
+            idle_rounds = 0 if any(it.get("run") for it in items) else idle_rounds + 1
+            bad_streak = bad_streak + 1 if items and all(it.get("bad") for it in items) else 0
+            fail_streak = fail_streak + 1 if had_error else 0
+            hint = ""
             if had_error and reflection > 0:
                 reflection -= 1
-                messages.append({"role": "system", "content": (
-                    "Инструмент вернул ошибку. Измени аргументы, выбери другой инструмент "
-                    "или ответь по уже собранным данным — не выдумывай результат.")})
+                hint = ("Инструмент вернул ошибку. Измени аргументы, выбери другой инструмент "
+                        "или ответь по уже собранным данным — не выдумывай результат.")
             next_is_final = (rounds >= max_rounds or calls_used >= max_calls or
-                             failures >= 4 or dup_stuck >= 2)
+                             fail_streak >= FAIL_STREAK_LIMIT or idle_rounds >= IDLE_ROUNDS_LIMIT or
+                             bad_streak >= BAD_ROUNDS_LIMIT)
             final_hint = ("Следующий ответ должен быть итоговым: ответь текстом по собранным "
                           "результатам, без новых вызовов инструментов.")
+            tail = "\n\n".join(x for x in (hint, final_hint if next_is_final else "") if x)
+            # Подсказки — сообщением пользователя, а не system: шаблоны llama.cpp/Jinja
+            # отклоняют system посреди диалога, и ход падал с HTTP 400/500.
             if native_mode:
                 messages.extend(native_msgs)          # по одному на каждый tool_call — без дыр
-                if next_is_final:
-                    messages.append({"role": "user", "content": final_hint})
+                if tail:
+                    messages.append({"role": "user", "content": tail})
             else:
-                last = "\n".join(blocks)
-                if next_is_final:
-                    last += "\n\n" + final_hint
-                messages.append({"role": "user", "content": last})
+                body = "\n".join(blocks)
+                messages.append({"role": "user", "content": "\n\n".join(x for x in (body, tail) if x)})
 
             emit_step(current, "end", "error" if had_error else "done", f"Шаг {current} · результаты",
                       f"вызовов: {len(items)}, ошибок: {failures}, символов результата: "
@@ -1074,14 +1189,22 @@ class App:
                 emit_step(current, "note", "warning", "Бюджет шагов",
                           "дальше только финальный текстовый ответ — новые вызовы не исполняются")
 
-        emit_trace("done", stop_reason, FINAL_REASONS.get(stop_reason, "Ход завершён."))
         answer = "".join(parts).strip()
+        if stop_reason == "model_done":
+            # Причина в трассе должна совпадать с реальным ответом: раньше при любом
+            # нормальном финале писалось «без текста», хотя текст уже был показан.
+            reason = ("Модель ответила текстом." if answer
+                      else "Модель завершила ход без текста — показываю собранные результаты.")
+        else:
+            reason = FINAL_REASONS.get(stop_reason, "Ход завершён.")
+        emit_trace("done", stop_reason, reason)
         if not answer:
             fallback = {"round_limit": "Достигнут лимит шагов — отвечаю по собранным данным.",
                         "call_limit": "Достигнут лимит вызовов инструментов — отвечаю по собранным данным.",
                         "failures": "Инструменты не справились — отвечаю по собранным данным.",
                         "no_progress": "Отвечаю по собранным данным.",
                         "cancelled": "Ответ остановлен.",
+                        "bad_calls": "Вызовы инструментов не удалось разобрать — отвечаю по собранным данным.",
                         "model_done": "Модель не дала итогового текста — показываю собранные результаты.",
                         "llm_error": "Модель не ответила: проверь, что LM Studio или llama.cpp запущены и модель загружена."}.get(stop_reason)
             if fallback:

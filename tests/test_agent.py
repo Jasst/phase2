@@ -297,11 +297,24 @@ def test_agent_loop_runs_tool_and_hides_call(tmp_path, monkeypatch):
 
 
 def test_agent_loop_stops_after_max_steps(tmp_path, monkeypatch):
-    call = '<tool_call>{"name": "memory_search", "arguments": {"query": "x"}}</tool_call>'
-    scripts = [[call] for _ in range(MAX_STEPS + 3)]
+    # Разные вызовы в каждом раунде: прогресс есть, останавливает только лимит раундов.
+    scripts = [['<tool_call>{"name": "memory_search", "arguments": {"query": "x%d"}}</tool_call>' % i]
+               for i in range(MAX_STEPS + 3)]
     app = _app(tmp_path, monkeypatch, scripts)
     _run(app, "вопрос")
     assert len(app.backend.seen) == MAX_STEPS + 1
+
+
+def test_agent_loop_stops_early_when_model_repeats_same_call(tmp_path, monkeypatch):
+    # Одинаковый вызов из раунда в раунд: результат берётся из кэша, прогресса нет.
+    # Два холостых раунда подряд — финальный ответ, а не лишние шаги модели.
+    call = '<tool_call>{"name": "memory_search", "arguments": {"query": "x"}}</tool_call>'
+    # Раунд 1 выполняет вызов, раунды 2 и 3 — повторы из кэша; финальный шаг получает текст.
+    scripts = [[call], [call], [call], ["Итог по собранному."]]
+    app = _app(tmp_path, monkeypatch, scripts)
+    answer, _, _ = _run(app, "вопрос")
+    assert len(app.backend.seen) < MAX_STEPS + 1
+    assert "Итог" in answer
 
 
 def test_unknown_tool_is_reported_to_model(tmp_path, monkeypatch):
