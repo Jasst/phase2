@@ -299,6 +299,34 @@ def _call_args(value) -> Optional[dict]:
     return value if isinstance(value, dict) else None
 
 
+def _xmlish_call(raw: str) -> Optional[dict]:
+    """Фолбэк для моделей, которые пишут <name>..</name><arguments>..</arguments>
+    внутри <tool_call> вместо JSON. Возвращает dict вызова или None."""
+    text = str(raw or "").strip()
+    if "<" not in text or ">" not in text:
+        return None
+
+    def grab(keys: Tuple[str, ...]) -> Optional[str]:
+        for key in keys:
+            m = re.search(rf"<\s*{re.escape(key)}\s*>(.*?)</\s*{re.escape(key)}\s*>", text, re.S | re.I)
+            if m:
+                return m.group(1).strip()
+        return None
+
+    name = grab(_NAME_KEYS)
+    if not name:
+        return None
+    arg_text = grab(_ARG_KEYS)
+    if arg_text is None:
+        # Тело похоже на XML-вызов с именем, но без блока аргументов — считаем пустым объектом.
+        return {"name": name, "arguments": {}}
+    args = _loose_json(arg_text)
+    if args is None:
+        # Не JSON — оставляем строку как есть; дальше _call_args/валидация решит.
+        return {"name": name, "arguments": arg_text}
+    return {"name": name, "arguments": args}
+
+
 _CALL_EXAMPLE = '<tool_call>{"name": "web_search", "arguments": {"queries": ["запрос"]}}</tool_call>'
 
 
@@ -317,6 +345,9 @@ def parse_calls(raw_bodies: List[str], known: Optional[Iterable[str]] = None) ->
     calls: List[dict] = []
     for raw in raw_bodies:
         obj = _load_call_body(raw)
+        xmlish = _xmlish_call(raw)
+        if not isinstance(obj, dict):
+            obj = xmlish
         if not isinstance(obj, dict):
             calls.append({"name": "", "arguments": {}, "error": _format_error("некорректный JSON в <tool_call>", raw)})
             continue
@@ -325,6 +356,11 @@ def parse_calls(raw_bodies: List[str], known: Optional[Iterable[str]] = None) ->
                 obj = obj[wrapper]
         name = next((obj[k].strip() for k in _NAME_KEYS
                      if isinstance(obj.get(k), str) and obj[k].strip()), "")
+        # _load_call_body может принять XML-подобный <name>...</name> как валидный JSON-объект
+        # без name/arguments. В этом случае используем XML-фолбэк целиком.
+        if not name and isinstance(xmlish, dict):
+            obj = xmlish
+            name = str(xmlish.get("name") or "").strip()
         type_alias = False
         if not name and isinstance(obj.get("type"), str) and obj["type"].strip() in known_set:
             name = obj["type"].strip()

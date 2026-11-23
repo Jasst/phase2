@@ -348,6 +348,15 @@ def test_parse_error_shows_what_model_wrote_and_example():
     assert "курс доллара" in err and "<tool_call>" in err
 
 
+def test_xmlish_tool_call_body_is_accepted():
+    from pulsenet.toolcalls import parse_calls as pc
+    known = ["skill_list", "web_search"]
+    assert pc(['<name>skill_list</name> <arguments>{}</arguments>'], known)[0] == \
+        {"name": "skill_list", "arguments": {}}
+    assert pc(['<tool_name>web_search</tool_name><arguments>{"queries":["x"]}</arguments>'], known)[0] == \
+        {"name": "web_search", "arguments": {"queries": ["x"]}}
+
+
 def test_repeated_bad_calls_stop_with_own_reason(tmp_path):
     bad = '<tool_call>{"query": "курс"}</tool_call>'
     app = _app(tmp_path, [[bad], [bad], ["ответ по данным."]])
